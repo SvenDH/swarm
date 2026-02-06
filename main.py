@@ -14,28 +14,25 @@ For graph work, import `runtime` and use only:
 DSL command format:
 - object DSL:
   x, y, z, u, v = runtime.Var.many("x y z u v")
-  runtime.Match((x, x, y), (y, z, u), where=[x.kind == "person", runtime.Edge(1).weight >= 0.5], limit=100)
-  runtime.Rewrite(
-      lhs=[(x, x, y), (y, z, u)],
-      rhs=[(x, v, u), (y, v, z), (v, v, u)],
+  runtime.select((x, x, y), (y, z, u)).where(x.kind == "person", runtime.Edge(1).weight >= 0.5)
+  runtime.select((x, x, y), (y, z, u)).update(
+      [(x, v, u), (y, v, z), (v, v, u)],
       mode="all",
       limit=100,
   )
 
 Examples:
 - seed graph data (empty LHS):
-  runtime.exec("demo", runtime.Rewrite(
-      lhs=[],
-      rhs=[runtime.Term("a", "a", "b"), runtime.Term("b", "c", "d"), runtime.Term("a", "b", "c", rel="friend")]
+  runtime.exec("demo", runtime.select().update(
+      [runtime.Term("a", "a", "b"), runtime.Term("b", "c", "d"), runtime.Term("a", "b", "c", rel="friend")]
   ))
 - run query:
   x, y, z, u = runtime.Var.many("x y z u")
-  runtime.exec("demo", runtime.Match((x, x, y), (y, z, u)))
+  runtime.exec("demo", runtime.select((x, x, y), (y, z, u)))
 - run rewrite:
   x, y, z, u, v = runtime.Var.many("x y z u v")
-  runtime.exec("demo", runtime.Rewrite(
-      lhs=[(x, x, y), (y, z, u)],
-      rhs=[(x, v, u), (y, v, z), (v, v, u)],
+  runtime.exec("demo", runtime.select((x, x, y), (y, z, u)).update(
+      [(x, v, u), (y, v, z), (v, v, u)],
       mode="all",
       limit=100,
   ))
@@ -43,7 +40,6 @@ Examples:
 Rules:
 - Use hyperedges (not binary-only edges).
 - In patterns, strings/Var are variables. Use runtime.Const("node_id") for literal node ids.
-- Print structured results with `json.dumps(..., indent=2)` when returning graph data.
 """
 
 
