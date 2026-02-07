@@ -2,7 +2,7 @@
 
 Single API function:
 
-- `runtime.exec(command)` for the default graph
+- `runtime.exec(command[, command2, ...])` for the default graph
 
 It executes an object-based DSL command and returns the result.
 
@@ -17,6 +17,7 @@ Core objects:
 - `runtime.node("id", **props)` for node metadata edges
 - `runtime.ns("name")` namespace handle
 - `runtime.match(...)`
+- `field.similar(query, min_score=0.0)` for embedding similarity in `where(...)`
 
 Rewrite is expressed as `match(...).rewrite(...)` or top-level `rewrite(..., to=[...])`.
 
@@ -31,8 +32,14 @@ runtime.exec(runtime.rewrite(to=[
     runtime.edge("a", "a", "b"),
     runtime.edge("b", "c", "d", rel="r2"),
     runtime.edge("a", "b", "c", rel="friend", weight=0.8),
-    runtime.node("a", kind="person"),
+    runtime.node("a", kind="person", embedding=[0.9, 0.1, 0.0]),
 ]))
+
+# Atomic batch (equivalent to exec([cmd1, cmd2, ...]))
+batch = runtime.exec(
+    runtime.rewrite(to=[runtime.edge("u", "v", rel="seed")]),
+    runtime.match(("seed", ("u", "v"))),
+)
 
 x, y, z, u = runtime.vars("x y z u")
 
@@ -53,6 +60,45 @@ r = runtime.exec(
 )
 print(json.dumps(r, indent=2))
 ```
+
+## Optional Vector Embeddings In `where(...)`
+
+Store embeddings on either nodes or edges using the reserved `embedding` property.
+
+```python
+runtime.exec(runtime.rewrite(to=[
+    runtime.node("alice", kind="person", embedding=[0.9, 0.1, 0.0]),
+    runtime.node("bob", kind="person", embedding=[0.85, 0.15, 0.0]),
+    runtime.edge("alice", "bob", rel="friend", embedding=[0.8, 0.2, 0.0]),
+]))
+```
+
+Search:
+
+```python
+q = [1.0, 0.0, 0.0]
+
+# Edge embedding similarity
+x, y = runtime.vars("x y")
+near_edges = runtime.exec(
+    runtime.match(("friend", (x, y)), mode="all", limit=5).where(
+        runtime.on(1).embedding.similar(q, min_score=0.75)
+    )
+)
+
+# Namespace-scoped node embedding similarity
+g1 = runtime.ns("g1")
+u, v = runtime.vars("u v")
+g1_hits = runtime.exec(
+    g1.match(("friend", (u, v)), mode="all", limit=5).where(
+        u.embedding.similar(q, min_score=0.7)
+    )
+)
+```
+
+Environment notes:
+- If `sqlite-vec` is available (`import sqlite_vec`) or `SQLITE_VEC_PATH` points to the extension, runtime uses `vec_distance_cosine`.
+- Otherwise it falls back to a deterministic Python cosine function in SQLite.
 
 ## Modeling Different Graph Types
 
@@ -189,6 +235,31 @@ derived = runtime.exec(
 )
 ```
 
+### Bayesian Network Inference (Rule-Based)
+
+```python
+rain, sprinkler, wet = runtime.vars("rain sprinkler wet")
+runtime.exec(runtime.rewrite(to=[
+    runtime.edge("T", "T", "T", rel="cpt_wetgrass", p=0.99),
+    runtime.edge("T", "F", "T", rel="cpt_wetgrass", p=0.90),
+    runtime.edge("F", "T", "T", rel="cpt_wetgrass", p=0.80),
+    runtime.edge("F", "F", "F", rel="cpt_wetgrass", p=1.00),
+    runtime.edge("Rain", "T", rel="evidence"),
+    runtime.edge("Sprinkler", "F", rel="evidence"),
+]))
+
+posterior = runtime.exec(
+    runtime.match(
+        ("evidence", ("Rain", rain)),
+        ("evidence", ("Sprinkler", sprinkler)),
+        ("cpt_wetgrass", (rain, sprinkler, wet)),
+    ).where(runtime.on(3).p >= 0.8).rewrite(
+        [runtime.edge("WetGrass", wet, rel="belief", source="cpt")],
+        mode="first",
+    )
+)
+```
+
 ### Program Execution / State Transition
 
 ```python
@@ -209,9 +280,29 @@ step1 = runtime.exec(
 )
 ```
 
+### Program Tree Operators
+
+RHS node/data values can use expression operators built from bound vars:
+
+```python
+a, b, out = runtime.vars("a b out")
+runtime.exec(runtime.rewrite(to=[runtime.edge("2", "3", "sum", rel="add")]))
+
+step = runtime.exec(
+    runtime.match(("add", (a, b, out))).rewrite(
+        [runtime.node(out, value=a + b, diff=a - b, prod=a * b, quo=b // a)],
+        mode="first",
+    )
+)
+```
+
+Supported expression operators:
+- Arithmetic: `+`, `-`, `*`, `/`, `//`, `%`, `**`, unary `+`/`-`
+- String: `.concat(...)`, `.lower()`, `.upper()`, `.strip()`, `.replace(old,new)`, `.strlen()`
+
 ## Result Interop
 
-`runtime.exec(...)` returns a list of rewrite/match results with:
+`runtime.exec(...)` returns a `runtime.Result` (list-compatible) with:
 - `bindings`: variable -> node id
 - `hyperedges`: rewritten/matched edges for that result
 
@@ -220,21 +311,66 @@ Use helper conversions:
 ```python
 out = runtime.exec(runtime.match(("friend", (x, y)), mode="all", limit=100))
 
-# list[dict] for normal Python processing
-records = [row["bindings"] for row in out]
+# Map rows
+pairs = out.map(lambda row: (row["bindings"]["x"], row["bindings"]["y"]))
+
+# list[dict] from bindings or edge properties
+records = out.bindings("x", "y")
+weights = out.edge_data("weight")
 
 # pandas DataFrame
 import pandas as pd
 df = pd.DataFrame(records)
+df_edge = pd.DataFrame(weights)
+df_rows = pd.DataFrame(out.rows())
 
 # numpy array (column order is explicit here)
 import numpy as np
-arr = np.array([[r.get("x"), r.get("y")] for r in records], dtype=object)
+arr = np.array([[r["x"], r["y"]] for r in records], dtype=object)
 
 # matplotlib (counts per value in x)
 import matplotlib.pyplot as plt
 df["x"].value_counts().plot(kind="bar")
 plt.show()
+```
+
+Most useful `Result` helpers:
+- `out.first()`
+- `out.bindings(...)`
+- `out.edge_data(...)`
+- `out.rows(...)`
+
+## GraphRAG Example
+
+Build:
+
+```python
+chunk, ent, nbr = runtime.vars("chunk ent nbr")
+runtime.exec(runtime.rewrite(to=[
+    runtime.node("chunk:1", text="Alice works at OpenAI in SF", embedding=[0.95, 0.05, 0.0]),
+    runtime.node("chunk:2", text="Bob lives in NYC", embedding=[0.10, 0.90, 0.0]),
+    runtime.node("Alice", kind="entity"),
+    runtime.node("OpenAI", kind="entity"),
+    runtime.edge("chunk:1", "Alice", rel="mentions"),
+    runtime.edge("chunk:1", "OpenAI", rel="mentions"),
+    runtime.edge("Alice", "OpenAI", rel="related", weight=0.9),
+]))
+```
+
+Query (semantic retrieval + expansion):
+
+```python
+q = [1.0, 0.0, 0.0]
+hits = runtime.exec(
+    runtime.match(("mentions", (chunk, ent)), mode="all", limit=20).where(
+        chunk.embedding.similar(q, min_score=0.75)
+    )
+)
+expanded = runtime.exec(
+    runtime.match(("related", (ent, nbr)), mode="all", limit=20).where(
+        runtime.on(1).weight >= 0.7
+    )
+)
 ```
 
 Optional dependencies:

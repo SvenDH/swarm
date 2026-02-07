@@ -233,6 +233,152 @@ class RuntimeTests(unittest.TestCase):
         out = self.engine.run(cmd)
         self.assertEqual(len(out), 1)
 
+    def test_execution_ops_arithmetic(self) -> None:
+        a, b, out = runtime.vars("a b out")
+        self.engine.run(runtime.rewrite(to=[runtime.edge("2", "3", "sum", rel="add")]))
+
+        step = self.engine.run(
+            runtime.match(("add", (a, b, out))).rewrite(
+                [runtime.node(out, value=a + b, diff=a - b, prod=a * b, quo=b // a)],
+                mode="first",
+            )
+        )
+        self.assertEqual(len(step), 1)
+        data = step[0]["hyperedges"][0]["data"]
+        self.assertEqual(data["value"], 5)
+        self.assertEqual(data["diff"], -1)
+        self.assertEqual(data["prod"], 6)
+        self.assertEqual(data["quo"], 1)
+
+    def test_execution_ops_strings(self) -> None:
+        a, b, out = runtime.vars("a b out")
+        self.engine.run(runtime.rewrite(to=[runtime.edge(" Hello ", "world", "msg", rel="concat")]))
+
+        step = self.engine.run(
+            runtime.match(("concat", (a, b, out))).rewrite(
+                [runtime.node(out, text=a.strip().concat("-", b.upper()), n=a.concat(b).strlen())],
+                mode="first",
+            )
+        )
+        self.assertEqual(len(step), 1)
+        data = step[0]["hyperedges"][0]["data"]
+        self.assertEqual(data["text"], "Hello-WORLD")
+        self.assertEqual(data["n"], 12)
+
+    def test_run_many_commits_all_commands(self) -> None:
+        x, y = runtime.vars("x y")
+        out = self.engine.run(
+            [runtime.rewrite(to=[runtime.edge("a", "b", rel="friend")]), runtime.match(("friend", (x, y)))]
+        )
+        self.assertEqual(len(out), 2)
+        self.assertEqual(len(out[1]), 1)
+        self.assertEqual(out[1][0]["bindings"], {"x": "a", "y": "b"})
+
+    def test_run_many_rolls_back_on_failure(self) -> None:
+        x, y = runtime.vars("x y")
+        with self.assertRaises(ValueError):
+            self.engine.run(
+                [
+                    runtime.rewrite(to=[runtime.edge("a", "b", rel="friend")]),
+                    runtime.match(("friend", (x, y))).rewrite([(x, y)], mode="bad"),
+                ]
+            )
+
+        out = self.engine.run(runtime.match(("friend", (x, y))))
+        self.assertEqual(out, [])
+
+    def test_module_exec_varargs_runs_atomically(self) -> None:
+        x, y = runtime.vars("x y")
+        prev = runtime._ENGINE
+        runtime._ENGINE = self.engine
+        try:
+            out = runtime.exec(
+                runtime.rewrite(to=[runtime.edge("a", "b", rel="friend")]),
+                runtime.match(("friend", (x, y))),
+            )
+        finally:
+            runtime._ENGINE = prev
+        self.assertEqual(len(out), 2)
+        self.assertEqual(out[1][0]["bindings"], {"x": "a", "y": "b"})
+
+    def test_result_map_and_select_helpers(self) -> None:
+        x, y = runtime.vars("x y")
+        self.engine.run(
+            runtime.rewrite(
+                to=[
+                    runtime.edge("a", "b", rel="friend", weight=0.9),
+                    runtime.edge("b", "c", rel="friend", weight=0.7),
+                ]
+            )
+        )
+        out = self.engine.run(runtime.match(("friend", (x, y)), mode="all", limit=10))
+
+        pairs = out.map(lambda row: (row["bindings"]["x"], row["bindings"]["y"]))
+        self.assertIn(("a", "b"), pairs)
+        self.assertIn(("b", "c"), pairs)
+
+        bindings = out.bindings("x", "y")
+        self.assertIn({"x": "a", "y": "b"}, bindings)
+        self.assertIn({"x": "b", "y": "c"}, bindings)
+
+        props = out.edge_data("weight")
+        self.assertIn({"weight": 0.9}, props)
+        self.assertIn({"weight": 0.7}, props)
+
+        self.assertEqual(out.first()["bindings"]["x"], "a")
+
+        bindings2 = out.bindings("x", "y")
+        self.assertEqual(bindings, bindings2)
+
+        props2 = out.edge_data("weight")
+        self.assertEqual(props, props2)
+
+    def test_where_similarity_filters_edges_and_nodes(self) -> None:
+        x, y = runtime.vars("x y")
+        self.engine.run(
+            runtime.rewrite(
+                to=[
+                    runtime.node("a", kind="person", embedding=[1.0, 0.0, 0.0]),
+                    runtime.node("b", kind="person", embedding=[0.0, 1.0, 0.0]),
+                    runtime.node("c", kind="person", embedding=[0.8, 0.2, 0.0]),
+                    runtime.edge("a", "b", rel="friend", embedding=[0.95, 0.05, 0.0]),
+                    runtime.edge("c", "b", rel="friend", embedding=[0.1, 0.9, 0.0]),
+                ]
+            )
+        )
+        q = [1.0, 0.0, 0.0]
+        out = self.engine.run(
+            runtime.match(("friend", (x, y)), mode="all", limit=10).where(
+                runtime.on(1).embedding.similar(q, min_score=0.8),
+                x.embedding.similar(q, min_score=0.7),
+            )
+        )
+        self.assertEqual(len(out), 1)
+        self.assertEqual(out[0]["bindings"], {"x": "a", "y": "b"})
+
+    def test_namespace_where_similarity(self) -> None:
+        g1, g2 = runtime.ns("g1"), runtime.ns("g2")
+        x, y = runtime.vars("x y")
+        self.engine.run(
+            runtime.rewrite(
+                to=[
+                    g1.node("a", embedding=[1.0, 0.0]),
+                    g2.node("a", embedding=[0.0, 1.0]),
+                    g1.edge("a", "b", rel="friend", embedding=[1.0, 0.0]),
+                    g2.edge("a", "b", rel="friend", embedding=[0.0, 1.0]),
+                ]
+            )
+        )
+        q = [1.0, 0.0]
+        out = self.engine.run(
+            g1.match(("friend", (x, y)), mode="all", limit=10).where(
+                runtime.on(1).embedding.similar(q, min_score=0.8),
+                x.embedding.similar(q, min_score=0.8),
+            )
+        )
+        self.assertEqual(len(out), 1)
+        self.assertTrue(all(v.startswith("g1:") for v in out[0]["bindings"].values()))
+
 
 if __name__ == "__main__":
     unittest.main()
