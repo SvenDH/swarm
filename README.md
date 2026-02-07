@@ -18,6 +18,8 @@ Core objects:
 - `runtime.ns("name")` namespace handle
 - `runtime.match(...)`
 - `field.similar(query, min_score=0.0)` for embedding similarity in `where(...)`
+- `runtime.exec(..., temp=True)` for ephemeral in-memory execution
+- `runtime.edge(..., temp=True)` / `runtime.node(..., temp=True)` for inline virtual seed terms
 
 Rewrite is expressed as `match(...).rewrite(...)` or top-level `rewrite(..., to=[...])`.
 
@@ -54,16 +56,71 @@ x, y, z, u, v = runtime.vars("x y z u v")
 r = runtime.exec(
     runtime.match((x, x, y), (y, z, u)).rewrite(
         [(x, v, u), (y, v, z), (v, v, u)],
-        mode="first",
         limit=100,
     ),
 )
 print(json.dumps(r, indent=2))
 ```
 
+## In-Memory Subgraphs (Virtual Queries / Execution)
+
+Use inline `temp=True` edges/nodes in `runtime.exec(...)` to inject virtual terms for a command.
+These temp terms are overlay-only and rolled back after returning results.
+
+```python
+x, y = runtime.vars("x y")
+virtual = runtime.exec(
+    runtime.match(("friend", (x, y)), limit=10).where(
+        x.kind == "person", runtime.on(1).weight >= 0.8
+    ),
+    runtime.edge("a", "b", rel="friend", weight=0.9, temp=True),
+    runtime.node("a", kind="person", temp=True),
+)
+```
+
+Virtual program step:
+
+```python
+pc, nxt = runtime.vars("pc nxt")
+step = runtime.exec(
+    runtime.match(
+        ("state", (runtime.const("m1"), pc)),
+        ("step", (pc, nxt)),
+    ).rewrite([runtime.edge(runtime.const("m1"), nxt, rel="state")]),
+    runtime.edge("m1", "n0", rel="state", temp=True),
+    runtime.edge("n0", "n1", rel="step", temp=True),
+)
+```
+
+`temp=True` inline terms are always ephemeral (result-only):
+
+```python
+runtime.exec(
+    runtime.match(("friend", (x, y))).rewrite([runtime.edge(x, y, rel="friend2")]),
+    runtime.edge("a", "b", rel="friend", temp=True),
+)
+```
+
+Ephemeral in-memory program state (single call):
+
+```python
+pc, nxt, x, y = runtime.vars("pc nxt x y")
+out = runtime.exec(
+    runtime.rewrite(to=[
+        runtime.edge("m1", "n0", rel="state"),
+        runtime.edge("n0", "n1", rel="step"),
+    ]),
+    runtime.match(("state", ("m1", pc)), ("step", (pc, nxt))).rewrite(
+        [runtime.edge("m1", nxt, rel="state")],
+    ),
+    runtime.match(("state", (x, y))),
+    temp=True,
+)
+```
+
 ## Optional Vector Embeddings In `where(...)`
 
-Store embeddings on either nodes or edges using the reserved `embedding` property.
+Store embeddings on either nodes or edges using the first-class `embedding=` field.
 
 ```python
 runtime.exec(runtime.rewrite(to=[
@@ -81,7 +138,7 @@ q = [1.0, 0.0, 0.0]
 # Edge embedding similarity
 x, y = runtime.vars("x y")
 near_edges = runtime.exec(
-    runtime.match(("friend", (x, y)), mode="all", limit=5).where(
+    runtime.match(("friend", (x, y)), limit=5).where(
         runtime.on(1).embedding.similar(q, min_score=0.75)
     )
 )
@@ -90,15 +147,14 @@ near_edges = runtime.exec(
 g1 = runtime.ns("g1")
 u, v = runtime.vars("u v")
 g1_hits = runtime.exec(
-    g1.match(("friend", (u, v)), mode="all", limit=5).where(
+    g1.match(("friend", (u, v)), limit=5).where(
         u.embedding.similar(q, min_score=0.7)
     )
 )
 ```
 
 Environment notes:
-- If `sqlite-vec` is available (`import sqlite_vec`) or `SQLITE_VEC_PATH` points to the extension, runtime uses `vec_distance_cosine`.
-- Otherwise it falls back to a deterministic Python cosine function in SQLite.
+- `sqlite-vec` is required and used directly via `vec_distance_cosine`.
 
 ## Modeling Different Graph Types
 
@@ -117,7 +173,7 @@ runtime.node("src", kind="entity", label="Person")
 runtime.edge("a", "b", "c", rel="event", ts=1700000000)
 ```
 
-### Segregating Different Graphs (Namespace Prefixes)
+### Segregating Different Graphs (Namespaces)
 
 Use a namespace handle so one DB can host many logical graphs safely.
 
@@ -125,10 +181,10 @@ Use a namespace handle so one DB can host many logical graphs safely.
 g1 = runtime.ns("g1")
 g2 = runtime.ns("g2")
 
-runtime.exec(runtime.rewrite(to=[
-    g1.edge("alice", "bob", rel="friend"),
-    g2.edge("alice", "bob", rel="friend"),
-]))
+runtime.exec(
+    g1.rewrite(to=[g1.edge("alice", "bob", rel="friend")]),
+    g2.rewrite(to=[g2.edge("alice", "bob", rel="friend")]),
+)
 ```
 
 Namespace-aware matching/rewrite:
@@ -137,11 +193,11 @@ Namespace-aware matching/rewrite:
 x, y = runtime.vars("x y")
 g1 = runtime.ns("g1")
 
-# only matches nodes whose ids start with "g1:"
-g1_matches = runtime.exec(g1.match(("friend", (x, y)), mode="all", limit=100))
+# only matches rows stored in namespace "g1"
+g1_matches = runtime.exec(g1.match(("friend", (x, y)), limit=100))
 ```
 
-When namespace is set on a rewrite, fresh variables are created in that namespace automatically.
+Namespaces are stored in a dedicated SQL column, so node ids can be reused across namespaces.
 
 ### Knowledge Graph (KG)
 
@@ -229,7 +285,6 @@ x, y, z = runtime.vars("x y z")
 derived = runtime.exec(
     runtime.match(("friend", (x, y)), ("friend", (y, z))).rewrite(
         [runtime.edge(x, z, rel="friend2", rule="two_hop")],
-        mode="all",
         limit=1000,
     )
 )
@@ -255,7 +310,6 @@ posterior = runtime.exec(
         ("cpt_wetgrass", (rain, sprinkler, wet)),
     ).where(runtime.on(3).p >= 0.8).rewrite(
         [runtime.edge("WetGrass", wet, rel="belief", source="cpt")],
-        mode="first",
     )
 )
 ```
@@ -275,7 +329,6 @@ runtime.exec(runtime.rewrite(to=[
 step1 = runtime.exec(
     runtime.match(("state", ("m1", pc)), ("step", (pc, nxt))).rewrite(
         [runtime.edge("m1", nxt, rel="state")],
-        mode="first",
     )
 )
 ```
@@ -291,7 +344,6 @@ runtime.exec(runtime.rewrite(to=[runtime.edge("2", "3", "sum", rel="add")]))
 step = runtime.exec(
     runtime.match(("add", (a, b, out))).rewrite(
         [runtime.node(out, value=a + b, diff=a - b, prod=a * b, quo=b // a)],
-        mode="first",
     )
 )
 ```
@@ -309,7 +361,7 @@ Supported expression operators:
 Use helper conversions:
 
 ```python
-out = runtime.exec(runtime.match(("friend", (x, y)), mode="all", limit=100))
+out = runtime.exec(runtime.match(("friend", (x, y)), limit=100))
 
 # Map rows
 pairs = out.map(lambda row: (row["bindings"]["x"], row["bindings"]["y"]))
@@ -362,12 +414,12 @@ Query (semantic retrieval + expansion):
 ```python
 q = [1.0, 0.0, 0.0]
 hits = runtime.exec(
-    runtime.match(("mentions", (chunk, ent)), mode="all", limit=20).where(
+    runtime.match(("mentions", (chunk, ent)), limit=20).where(
         chunk.embedding.similar(q, min_score=0.75)
     )
 )
 expanded = runtime.exec(
-    runtime.match(("related", (ent, nbr)), mode="all", limit=20).where(
+    runtime.match(("related", (ent, nbr)), limit=20).where(
         runtime.on(1).weight >= 0.7
     )
 )
