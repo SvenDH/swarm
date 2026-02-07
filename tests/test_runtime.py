@@ -158,6 +158,72 @@ class RuntimeTests(unittest.TestCase):
         out = self.engine.run(runtime.match((x, x, y), ("r2", (y, z, u)), limit=4, mode="all"))
         self.assertEqual(len(out), 4)
 
+    def test_namespace_match_isolated(self) -> None:
+        x, y, z, u = runtime.vars("x y z u")
+        g1, g2 = runtime.ns("g1"), runtime.ns("g2")
+        g1a, g1b, g1c, g1d = [g1.id(n) for n in ("a", "b", "c", "d")]
+        g2a, g2b, g2c, g2d = [g2.id(n) for n in ("a", "b", "c", "d")]
+        self.engine.run(
+            runtime.rewrite(
+                to=[
+                    runtime.edge(g1a, g1a, g1b),
+                    runtime.edge(g1b, g1c, g1d, rel="r2"),
+                    runtime.edge(g2a, g2a, g2b),
+                    runtime.edge(g2b, g2c, g2d, rel="r2"),
+                ]
+            )
+        )
+
+        out = self.engine.run(g1.match((x, x, y), ("r2", (y, z, u)), mode="all", limit=10))
+        self.assertEqual(len(out), 1)
+        self.assertTrue(all(v.startswith("g1:") for v in out[0]["bindings"].values()))
+
+    def test_namespace_rewrite_scopes_fresh_nodes(self) -> None:
+        x, y, z, u, v = runtime.vars("x y z u v")
+        g1 = runtime.ns("g1")
+        a, b, c, d = [g1.id(n) for n in ("a", "b", "c", "d")]
+        self.engine.run(runtime.rewrite(to=[runtime.edge(a, a, b), runtime.edge(b, c, d, rel="r2")]))
+
+        out = self.engine.run(g1.match((x, x, y), ("r2", (y, z, u))).rewrite([(x, v, u)], mode="first"))
+        self.assertEqual(len(out), 1)
+        self.assertIn("v", out[0]["bindings"])
+        self.assertTrue(out[0]["bindings"]["v"].startswith("g1:"))
+
+    def test_namespace_match_method(self) -> None:
+        x, y, z, u = runtime.vars("x y z u")
+        g1 = runtime.ns("g1")
+        a, b, c, d = [g1.id(n) for n in ("a", "b", "c", "d")]
+        self.engine.run(runtime.rewrite(to=[runtime.edge(a, a, b), runtime.edge(b, c, d, rel="r2")]))
+
+        out = self.engine.run(g1.match((x, x, y), ("r2", (y, z, u))))
+        self.assertEqual(len(out), 1)
+        self.assertTrue(all(v.startswith("g1:") for v in out[0]["bindings"].values()))
+
+    def test_namespace_handle_and_function_style_helpers(self) -> None:
+        x, y, z, u = runtime.vars("x y z u")
+        g1 = runtime.ns("g1")
+        self.engine.run(
+            g1.rewrite(
+                to=[
+                    g1.edge("a", "a", "b", tag="lhs"),
+                    g1.edge("b", "c", "d", rel="r2", tag="rhs"),
+                    g1.node("a", kind="entity"),
+                ]
+            )
+        )
+
+        out = self.engine.run(g1.match((x, x, y), ("r2", (y, z, u))).where(runtime.on(1).tag == "lhs", x.kind == "entity"))
+        self.assertEqual(len(out), 1)
+        self.assertTrue(all(v.startswith("g1:") for v in out[0]["bindings"].values()))
+
+        out2 = self.engine.run(g1.match(("r2", (runtime.const("b"), z, u)), mode="all", limit=10))
+        self.assertEqual(len(out2), 1)
+        self.assertEqual(out2[0]["bindings"]["z"], "g1:c")
+
+    def test_namespace_validation(self) -> None:
+        with self.assertRaises(ValueError):
+            runtime.ns("bad:name")
+
     def test_friendly_api_aliases(self) -> None:
         x, y, z, u = runtime.vars("x y z u")
         self.engine.run(runtime.rewrite(to=[runtime.edge("a", "a", "b"), runtime.edge("b", "c", "d", rel="r2")]))

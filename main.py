@@ -8,55 +8,87 @@ from smolagents import CodeAgent, LiteLLMModel
 
 
 GRAPH_CODE_INSTRUCTIONS = """
-For graph work, import `runtime` and use only:
-- runtime.exec(command)  # default graph
+For graph work, use:
+- runtime.exec(command)
+- runtime.match(...).where(...).rewrite(...)
+- runtime.edge(...), runtime.node(...), runtime.vars(...)
+- runtime.ns("name") for namespace-scoped ids/match/rewrite
 
-DSL command format:
-- object DSL:
+Core DSL:
+- Variables:
   x, y, z, u, v = runtime.vars("x y z u v")
-  runtime.match((x, x, y), (y, z, u)).where(x.kind == "person", runtime.Edge(1).weight >= 0.5)
+- Match:
+  runtime.match(("friend", (x, y))).where(x.kind == "person", runtime.on(1).weight >= 0.5)
+- Rewrite:
   runtime.match((x, x, y), (y, z, u)).rewrite(
-      [(x, v, u), (y, v, z), (v, v, u)],
+      [runtime.edge(x, v, u), runtime.edge(y, v, z), runtime.edge(v, v, u)],
       mode="all",
       limit=100,
   )
 
-Examples:
-- seed graph data (empty LHS):
-  runtime.exec(runtime.rewrite(to=[
-      runtime.edge("a", "a", "b"),
-      runtime.edge("b", "c", "d"),
-      runtime.edge("a", "b", "c", rel="friend"),
-  ]))
-- run query:
-  x, y, z, u = runtime.vars("x y z u")
-  runtime.exec(runtime.match((x, x, y), (y, z, u)))
-- run rewrite:
-  x, y, z, u, v = runtime.vars("x y z u v")
-  runtime.exec(runtime.match((x, x, y), (y, z, u)).rewrite(
-      [(x, v, u), (y, v, z), (v, v, u)],
-      mode="all",
-      limit=100,
-  ))
+Seeding data (empty LHS rewrite):
+runtime.exec(runtime.rewrite(to=[
+    runtime.edge("alice", "bob", rel="friend", weight=0.9),
+    runtime.edge("bob", "carol", rel="friend", weight=0.8),
+    runtime.node("alice", kind="person", age=34),
+    runtime.node("bob", kind="person", age=29),
+]))
+
+Search/filter example:
+x, y = runtime.vars("x y")
+out = runtime.exec(
+    runtime.match(("friend", (x, y))).where(
+        x.kind == "person",
+        runtime.on(1).weight >= 0.8,
+    )
+)
+records = [row["bindings"] for row in out]
+
+Inference example (2-hop friend closure):
+x, y, z = runtime.vars("x y z")
+runtime.exec(
+    runtime.match(("friend", (x, y)), ("friend", (y, z))).rewrite(
+        [runtime.edge(x, z, rel="friend2", rule="two_hop")],
+        mode="all",
+        limit=1000,
+    )
+)
+
+Program execution example (state transition):
+pc, nxt = runtime.vars("pc nxt")
+runtime.exec(runtime.rewrite(to=[
+    runtime.edge("m1", "n0", rel="state"),
+    runtime.edge("n0", "n1", rel="step"),
+]))
+runtime.exec(
+    runtime.match(("state", ("m1", pc)), ("step", (pc, nxt))).rewrite(
+        [runtime.edge("m1", nxt, rel="state")],
+        mode="first",
+    )
+)
+
+Interop examples:
+- pandas:
+  import pandas as pd
+  df = pd.DataFrame([row["bindings"] for row in out])
+  print(df.head())
+- numpy:
+  import numpy as np
+  arr = np.array([[row["bindings"].get("x"), row["bindings"].get("y")] for row in out], dtype=object)
+- matplotlib:
+  import matplotlib.pyplot as plt
+  df["x"].value_counts().plot(kind="bar")
+  plt.show()
+
+Namespace isolation (single DB, multiple logical graphs):
+- g1 = runtime.ns("g1")
+- Use g1.id("alice"), g1.edge(...), g1.node(...), g1.match(...), g1.rewrite(...)
 
 Rules:
-- Use hyperedges (not binary-only edges).
-- In patterns, strings/Var are variables. Use runtime.Const("node_id") for literal node ids.
-- Node property filters (like x.kind == "person") read unary node-meta edges: runtime.node("node_id", kind="person").
-- General modeling recipe:
-  - Put structural links in edges: runtime.edge(src, dst, rel="...").
-  - Put node attributes in unary node edges: runtime.node(id, ...).
-  - Put edge attributes in edge properties: runtime.edge(..., weight=..., confidence=...).
-- Common graph conventions:
-  - KG: runtime.edge(head, tail, rel="predicate"), runtime.node(entity, label="Type")
-  - Bayesian: runtime.edge(parent, child, rel="parent"), runtime.node(var, kind="bayes", states=[...], cpt={...})
-  - Causal: runtime.edge(cause, effect, rel="causes", strength=..., sign=...)
-  - AST/program graph: runtime.edge(parent, child, rel="child", slot="body", idx=0), runtime.node(n, kind="ast", type="If")
-  - Factor/hypergraph: runtime.edge(v1, v2, v3, rel="factor", fn="phi_name")
-- Workflow patterns:
-  - Search/filter: runtime.match(...).where(...), use Edge(i).prop and node props (x.kind, y.label, etc.)
-  - Inference: runtime.match(lhs...).rewrite([derived_edges...], mode="all", limit=...)
-  - Program execution: model state/control as edges, then use mode="first" rewrite steps for single-step execution
+- Hyperedges are native (any arity).
+- In patterns: strings/Var are variables; use runtime.const("id") for literal node ids.
+- Node properties come from unary node meta edges: runtime.node("id", ...).
+- Keep rewrites bounded with mode/limit.
 """
 
 
@@ -82,7 +114,14 @@ def build_agent() -> CodeAgent:
         "tools": [],
         "model": model,
         "max_steps": max_steps,
-        "additional_authorized_imports": ["json", "runtime"],
+        "additional_authorized_imports": [
+            "json",
+            "runtime",
+            "pandas",
+            "numpy",
+            "matplotlib",
+            "matplotlib.pyplot",
+        ],
     }
     try:
         return CodeAgent(executor_type="local", **common_kwargs)

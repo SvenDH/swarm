@@ -1,12 +1,13 @@
 from __future__ import annotations
+
 import json
 import sqlite3
 import uuid
-import warnings
 from dataclasses import dataclass, replace
 from typing import Any
 
 OPS = {"=", "!=", ">", ">=", "<", "<=", "LIKE", "IN"}
+
 
 @dataclass(frozen=True)
 class Pred:
@@ -16,79 +17,82 @@ class Pred:
     op: str
     value: Any
 
+
 @dataclass(frozen=True)
 class Field:
     target: str
     ref: str
     path: str
+
     def __getattr__(self, prop: str) -> Field:
         if prop.startswith("_"):
             raise AttributeError(prop)
         return Field(self.target, self.ref, f"{self.path}.{prop}")
+
     def __getitem__(self, prop: Any) -> Field:
         return Field(self.target, self.ref, f"{self.path}.{prop}")
+
     def _pred(self, op: str, value: Any) -> Pred:
         return Pred(self.target, self.ref, self.path, op, value)
-    def __eq__(self, value: Any) -> Pred:  # type: ignore[override]
-        return self._pred("=", value)
-    def __ne__(self, value: Any) -> Pred:  # type: ignore[override]
-        return self._pred("!=", value)
-    def __gt__(self, value: Any) -> Pred:
-        return self._pred(">", value)
-    def __ge__(self, value: Any) -> Pred:
-        return self._pred(">=", value)
-    def __lt__(self, value: Any) -> Pred:
-        return self._pred("<", value)
-    def __le__(self, value: Any) -> Pred:
-        return self._pred("<=", value)
+
     def in_(self, values: list[Any] | tuple[Any, ...] | set[Any]) -> Pred:
         return self._pred("IN", list(values))
+
     def contains(self, value: Any) -> Pred:
         return self._pred("LIKE", f"%{value}%")
+
     def startswith(self, value: Any) -> Pred:
         return self._pred("LIKE", f"{value}%")
+
     def endswith(self, value: Any) -> Pred:
         return self._pred("LIKE", f"%{value}")
+
+
+def _cmp(op: str):
+    return lambda self, value: self._pred(op, value)
+
+
+for _name, _op in (
+    ("__eq__", "="),
+    ("__ne__", "!="),
+    ("__gt__", ">"),
+    ("__ge__", ">="),
+    ("__lt__", "<"),
+    ("__le__", "<="),
+):
+    setattr(Field, _name, _cmp(_op))
+
 
 @dataclass(frozen=True)
 class Var:
     name: str
+
     def __getattr__(self, prop: str) -> Field:
         if prop.startswith("_"):
             raise AttributeError(prop)
         return Field("node", self.name, prop)
+
     def __getitem__(self, prop: Any) -> Field:
         return Field("node", self.name, str(prop))
-    @classmethod
-    def many(cls, names: str | list[str] | tuple[str, ...]) -> tuple[Var, ...]:
-        raw = names.replace(",", " ").split() if isinstance(names, str) else [str(x) for x in names]
-        return tuple(cls(name) for name in raw if name)
+
 
 @dataclass(frozen=True)
 class Edge:
     index: int
+
     def __getattr__(self, prop: str) -> Field:
         if prop.startswith("_"):
             raise AttributeError(prop)
         return Field("edge", str(self.index), prop)
+
     def __getitem__(self, prop: Any) -> Field:
         return Field("edge", str(self.index), str(prop))
+
 
 @dataclass(frozen=True)
 class Const:
     value: str
 
-@dataclass(frozen=True)
-class Term:
-    nodes: tuple[Any, ...]
-    relation: str = "_"
-    data: dict[str, Any] | None = None
-    def __init__(self, *nodes: Any, rel: str = "_", data: dict[str, Any] | None = None) -> None:
-        if not nodes:
-            raise ValueError("term requires at least one node")
-        object.__setattr__(self, "nodes", tuple(nodes))
-        object.__setattr__(self, "relation", str(rel))
-        object.__setattr__(self, "data", dict(data or {}))
 
 @dataclass(frozen=True)
 class Command:
@@ -98,30 +102,55 @@ class Command:
     rhs: tuple[Any, ...] | None = None
     mode: str = "first"
     rewrite_limit: int | None = None
-    
+    namespace: str | None = None
+
     def where(self, *predicates: Any) -> Command:
-        # Immutable chain API.
         return replace(self, where_clauses=self.where_clauses + tuple(predicates))
-    
-    def update(self, rhs: list[Any] | tuple[Any, ...], *, mode: str = "first", limit: int | None = None) -> Command:
-        # Back-compat alias; prefer rewrite().
+
+    def rewrite(self, *rhs: Any, mode: str = "first", limit: int | None = None) -> Command:
+        terms = rhs[0] if len(rhs) == 1 and isinstance(rhs[0], (list, tuple)) else rhs
         return replace(
             self,
-            rhs=tuple(rhs),
+            rhs=tuple(terms),
             mode=str(mode),
             rewrite_limit=None if limit is None else int(limit),
         )
 
-    def rewrite(self, *rhs: Any, mode: str = "first", limit: int | None = None) -> Command:
-        # Friendlier alias: match(...).rewrite(term1, term2, ...)
-        terms = rhs[0] if len(rhs) == 1 and isinstance(rhs[0], (list, tuple)) else rhs
-        return self.update(tuple(terms), mode=mode, limit=limit)
+
+@dataclass(frozen=True)
+class Namespace:
+    name: str
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "name", _normalize_ns(self.name))
+
+    def id(self, node_id: Any) -> str:
+        return _ns_node(self.name, node_id)
+
+    def edge(self, *nodes: Any, rel: str = "_", data: dict[str, Any] | None = None, **props: Any) -> dict[str, Any]:
+        return edge(*(self._tok(v) for v in nodes), rel=rel, data=data, **props)
+
+    def node(self, node_id: Any, data: dict[str, Any] | None = None, **props: Any) -> dict[str, Any]:
+        return node(self.id(node_id), data=data, **props)
+
+    def match(self, *lhs: Any, limit: int = 100, mode: str = "first") -> Command:
+        return replace(match(*lhs, limit=limit, mode=mode), namespace=self.name)
+
+    def rewrite(self, *lhs: Any, to: list[Any] | tuple[Any, ...], mode: str = "first", limit: int = 100) -> Command:
+        return self.match(*lhs).rewrite(to, mode=mode, limit=limit)
+
+    def _tok(self, token: Any) -> Any:
+        if isinstance(token, Var):
+            return token
+        if isinstance(token, Const):
+            return Const(_ns_node(self.name, token.value))
+        return _ns_node(self.name, token)
+
 
 class _Engine:
     def __init__(self, db_path: str = "graph.db") -> None:
         self.db = sqlite3.connect(db_path)
         self.db.row_factory = sqlite3.Row
-        # Favor rewrite throughput with durable-enough defaults for local workloads.
         self.db.execute("PRAGMA journal_mode = WAL")
         self.db.execute("PRAGMA synchronous = NORMAL")
         self.db.execute("PRAGMA temp_store = MEMORY")
@@ -146,16 +175,18 @@ class _Engine:
         mode = command.mode.lower()
         if mode not in {"first", "all", "random"}:
             raise ValueError("match mode must be 'first', 'all', or 'random'")
-        qlimit = 1 if mode == "random" else command.limit
-        lhs = [_as_term(t, pattern=True) for t in command.lhs]
-        filters = [_as_pred(pred) for pred in command.where_clauses]
-        sql_text, params, vars_sorted, edge_cols = self._compile_query(lhs, filters, qlimit, mode == "random")
-        
+        sql_text, params, vars_sorted, edge_cols = self._compile_query(
+            [_as_term(t, pattern=True) for t in command.lhs],
+            [_as_pred(pred) for pred in command.where_clauses],
+            1 if mode == "random" else command.limit,
+            mode == "random",
+            command.namespace,
+        )
         rows = self.db.execute(sql_text, params).fetchall()
         if not rows:
             return []
-        unique_edge_ids = list(dict.fromkeys(int(row[col]) for row in rows for col in edge_cols))
-        edge_by_id = self._fetch_edges(unique_edge_ids)
+        edge_ids = list(dict.fromkeys(int(row[col]) for row in rows for col in edge_cols))
+        edge_by_id = self._fetch_edges(edge_ids)
         return [
             {
                 "bindings": {v: str(row[f"v_{v}"]) for v in vars_sorted},
@@ -169,36 +200,40 @@ class _Engine:
         filters = [_as_pred(pred) for pred in command.where_clauses]
         rhs = [_as_term(t, pattern=bool(lhs)) for t in (command.rhs or ())]
         mode = command.mode.lower()
-        limit = command.limit if command.rhs is None or command.rewrite_limit is None else command.rewrite_limit
+        limit = command.limit if command.rewrite_limit is None else command.rewrite_limit
         if limit < 1:
             raise ValueError("limit must be >= 1")
         if mode not in {"first", "all", "random"}:
             raise ValueError("mode must be 'first', 'all', or 'random'")
 
-        # Single transaction for the full rewrite loop.
         self.db.execute("BEGIN IMMEDIATE")
         try:
             if not lhs:
-                rewritten = [self._emit_terms(rhs, {})] if rhs else []
+                out = [self._emit_terms(rhs, {}, command.namespace)] if rhs else []
                 self.db.commit()
-                return rewritten
+                return out
 
-            random_order = mode == "random"
-            sql_text, params, vars_sorted, edge_cols = self._compile_query(lhs, filters, limit, random_order)
+            sql_text, params, vars_sorted, edge_cols = self._compile_query(
+                lhs, filters, limit, mode == "random", command.namespace
+            )
             max_steps = limit if mode == "all" else 1
-            count = 0
-            rewritten: list[dict[str, Any]] = []
-            while count < max_steps:
+            out: list[dict[str, Any]] = []
+
+            while len(out) < max_steps:
                 row = self.db.execute(sql_text, params).fetchone()
                 if row is None:
                     break
-                rewritten.append(self._apply_row(row, vars_sorted, edge_cols, rhs))
-                count += 1
-            if mode == "all" and count == max_steps:
-                raise ValueError("rewrite reached limit; possible non-terminating rule")
+                edge_ids = [int(row[col]) for col in edge_cols]
+                if edge_ids:
+                    placeholders = ",".join(["?"] * len(edge_ids))
+                    self.db.execute(f"DELETE FROM hyperedges WHERE edge_id IN ({placeholders})", edge_ids)
+                env = {v: str(row[f"v_{v}"]) for v in vars_sorted}
+                out.append(self._emit_terms(rhs, env, command.namespace))
 
+            if mode == "all" and len(out) == max_steps:
+                raise ValueError("rewrite reached limit; possible non-terminating rule")
             self.db.commit()
-            return rewritten
+            return out
         except Exception:
             self.db.rollback()
             raise
@@ -209,9 +244,11 @@ class _Engine:
         filters: list[dict[str, Any]],
         limit: int,
         random_order: bool = False,
+        namespace: str | None = None,
     ) -> tuple[str, list[Any], list[str], list[str]]:
         if not lhs:
             raise ValueError("match requires at least one lhs term")
+
         joins: list[str] = []
         where: list[str] = []
         join_params: list[Any] = []
@@ -220,8 +257,9 @@ class _Engine:
         edge_aliases: list[str] = []
 
         for i, term in enumerate(lhs, 1):
-            edge_alias = f"h{i}"
-            edge_aliases.append(edge_alias)
+            alias = f"h{i}"
+            edge_aliases.append(alias)
+
             if i == 1:
                 joins.append("FROM hyperedges h1")
                 where.append("json_array_length(h1.nodes_json) = ?")
@@ -230,25 +268,25 @@ class _Engine:
                     where.append("h1.relation = ?")
                     where_params.append(term["relation"])
             else:
-                on = [f"json_array_length({edge_alias}.nodes_json) = ?"]
-                on.extend(f"{edge_alias}.edge_id <> h{k}.edge_id" for k in range(1, i))
+                on = [f"json_array_length({alias}.nodes_json) = ?"]
+                on.extend(f"{alias}.edge_id <> h{k}.edge_id" for k in range(1, i))
                 join_params.append(len(term["nodes"]))
                 if term["relation"] != "_":
-                    on.append(f"{edge_alias}.relation = ?")
+                    on.append(f"{alias}.relation = ?")
                     join_params.append(term["relation"])
-                joins.append(f"JOIN hyperedges {edge_alias} ON {' AND '.join(on)}")
+                joins.append(f"JOIN hyperedges {alias} ON {' AND '.join(on)}")
 
             for j, tok in enumerate(term["nodes"]):
-                col = f"json_extract({edge_alias}.nodes_json, '$[{j}]')"
+                col = f"json_extract({alias}.nodes_json, '$[{j}]')"
                 if tok["kind"] == "const":
                     where.append(f"{col} = ?")
-                    where_params.append(tok["value"])
-                if tok["kind"] == "var":
-                    prev = var_col.get(tok["value"])
-                    if prev is None:
-                        var_col[tok["value"]] = col
-                    else:
-                        where.append(f"{col} = {prev}")
+                    where_params.append(_ns_node(namespace, tok["value"]))
+                    continue
+                prev = var_col.get(tok["value"])
+                if prev is None:
+                    var_col[tok["value"]] = col
+                else:
+                    where.append(f"{col} = {prev}")
 
         for pred in filters:
             if pred["target"] == "node":
@@ -274,6 +312,10 @@ class _Engine:
             where_params.extend(values)
 
         vars_sorted = sorted(var_col)
+        if namespace:
+            where.extend(f"{var_col[v]} LIKE ?" for v in vars_sorted)
+            where_params.extend(f"{namespace}:%" for _ in vars_sorted)
+
         edge_cols = [f"e{i}" for i in range(1, len(lhs) + 1)]
         select = [f"h{i}.edge_id AS e{i}" for i in range(1, len(lhs) + 1)]
         select.extend(f"{var_col[v]} AS v_{v}" for v in vars_sorted)
@@ -297,36 +339,28 @@ class _Engine:
             return f"json_extract({json_col}, ?) IS NOT NULL", [path]
         return f"json_extract({json_col}, ?) {op} ?", [path, val]
 
-    def _apply_row(self, row: sqlite3.Row, vars_sorted: list[str], edge_cols: list[str], rhs: list[dict[str, Any]]) -> dict[str, Any]:
-        edge_ids = [int(row[col]) for col in edge_cols]
-        if edge_ids:
-            placeholders = ",".join(["?"] * len(edge_ids))
-            self.db.execute(f"DELETE FROM hyperedges WHERE edge_id IN ({placeholders})", edge_ids)
-        env = {v: str(row[f"v_{v}"]) for v in vars_sorted}
-        return self._emit_terms(rhs, env)
-
-    def _emit_terms(self, terms: list[dict[str, Any]], env: dict[str, str]) -> dict[str, Any]:
-        resolved_terms: list[tuple[str, list[str], dict[str, Any]]] = []
+    def _emit_terms(self, terms: list[dict[str, Any]], env: dict[str, str], namespace: str | None = None) -> dict[str, Any]:
+        resolved: list[tuple[str, list[str], dict[str, Any]]] = []
         for term in terms:
             node_ids: list[str] = []
             for tok in term["nodes"]:
                 if tok["kind"] == "const":
-                    node_ids.append(str(tok["value"]))
+                    node_ids.append(_ns_node(namespace, tok["value"]))
                     continue
                 name = str(tok["value"])
                 if name not in env:
-                    env[name] = f"n_{uuid.uuid4().hex[:12]}"
+                    env[name] = _ns_node(namespace, f"n_{uuid.uuid4().hex[:12]}")
                 node_ids.append(env[name])
-            resolved_terms.append((term["relation"], node_ids, term["data"]))
-        edge_ids = [self._insert_edge(relation, node_ids, data) for relation, node_ids, data in resolved_terms]
+            resolved.append((term["relation"], node_ids, term["data"]))
 
+        edge_ids = [self._insert_edge(rel, node_ids, data) for rel, node_ids, data in resolved]
         if not edge_ids:
             return {"bindings": dict(env), "hyperedges": []}
 
         edge_by_id = self._fetch_edges(edge_ids)
         return {
             "bindings": dict(env),
-            "hyperedges": [edge_by_id[edge_id] for edge_id in edge_ids if edge_id in edge_by_id],
+            "hyperedges": [edge_by_id[eid] for eid in edge_ids if eid in edge_by_id],
         }
 
     def _fetch_edges(self, edge_ids: list[int]) -> dict[int, dict[str, Any]]:
@@ -368,8 +402,10 @@ class _Engine:
 
 
 def _as_term(raw: Any, pattern: bool) -> dict[str, Any]:
-    if isinstance(raw, Term):
-        relation, nodes, data = raw.relation, list(raw.nodes), dict(raw.data or {})
+    if isinstance(raw, dict):
+        relation = str(raw.get("relation", "_"))
+        nodes = list(raw.get("nodes", ()))
+        data = dict(raw.get("data") or {})
     elif isinstance(raw, (tuple, list)):
         if len(raw) == 2 and isinstance(raw[0], str) and isinstance(raw[1], (tuple, list)):
             relation, nodes = str(raw[0]), list(raw[1])
@@ -377,7 +413,8 @@ def _as_term(raw: Any, pattern: bool) -> dict[str, Any]:
             relation, nodes = "_", list(raw)
         data = {}
     else:
-        raise ValueError("term must be Term/list/tuple")
+        raise ValueError("term must be dict/list/tuple")
+
     if not nodes:
         raise ValueError("term nodes must be non-empty")
     return {"relation": relation, "nodes": [_as_token(node, pattern) for node in nodes], "data": data}
@@ -398,83 +435,73 @@ def _as_token(tok: Any, pattern: bool) -> dict[str, str]:
 def _as_pred(item: Any) -> dict[str, Any]:
     if not isinstance(item, Pred):
         raise ValueError("where entries must be predicates built from Var/Edge fields")
-    pred = {"target": item.target.lower(), "ref": item.ref, "prop": item.prop, "op": item.op, "value": item.value}
+    pred = {
+        "target": item.target.lower(),
+        "ref": item.ref,
+        "prop": item.prop,
+        "op": item.op,
+        "value": item.value,
+    }
     if pred["target"] not in {"node", "edge"} or pred["op"] not in OPS:
         raise ValueError("invalid where predicate")
     return pred
 
 
-def match(
-    *lhs: Any,
-    where: tuple[Any, ...] | list[Any] | None = None,
-    limit: int = 100,
-    mode: str = "first",
-) -> Command:
-    return Command(
-        lhs=tuple(lhs),
-        where_clauses=tuple(where or ()),
-        limit=int(limit),
-        mode=str(mode).lower(),
-    )
+def match(*lhs: Any, limit: int = 100, mode: str = "first") -> Command:
+    return Command(lhs=tuple(lhs), where_clauses=(), limit=int(limit), mode=str(mode).lower(), namespace=None)
 
 
-def rewrite(
-    *lhs: Any,
-    to: list[Any] | tuple[Any, ...],
-    where: tuple[Any, ...] | list[Any] | None = None,
-    mode: str = "first",
-    limit: int = 100,
-) -> Command:
-    return match(*lhs, where=where).rewrite(to, mode=mode, limit=limit)
-
-
-def select(
-    *lhs: Any,
-    where: tuple[Any, ...] | list[Any] | None = None,
-    limit: int = 100,
-    mode: str = "first",
-) -> Command:
-    warnings.warn("runtime.select(...) is deprecated; use runtime.match(...)", DeprecationWarning, stacklevel=2)
-    return match(*lhs, where=where, limit=limit, mode=mode)
-
-
-def update(rhs: list[Any] | tuple[Any, ...], **kwargs: Any) -> Command:
-    warnings.warn("runtime.update(...) is deprecated; use runtime.rewrite(to=...)", DeprecationWarning, stacklevel=2)
-    return rewrite(to=rhs, **kwargs)
+def rewrite(*lhs: Any, to: list[Any] | tuple[Any, ...], mode: str = "first", limit: int = 100) -> Command:
+    return match(*lhs).rewrite(to, mode=mode, limit=limit)
 
 
 def vars(names: str | list[str] | tuple[str, ...]) -> tuple[Var, ...]:
-    return Var.many(names)
+    raw = names.replace(",", " ").split() if isinstance(names, str) else [str(x) for x in names]
+    return tuple(Var(name) for name in raw if name)
 
 
-def edge(*nodes: Any, rel: str = "_", data: dict[str, Any] | None = None, **props: Any) -> Term:
+def on(index: int) -> Edge:
+    return Edge(int(index))
+
+
+def const(value: Any) -> Const:
+    return Const(str(value))
+
+
+def edge(*nodes: Any, rel: str = "_", data: dict[str, Any] | None = None, **props: Any) -> dict[str, Any]:
+    if not nodes:
+        raise ValueError("term requires at least one node")
     payload = dict(data or {})
     payload.update(props)
-    return Term(*nodes, rel=rel, data=payload or None)
+    return {"relation": str(rel), "nodes": tuple(nodes), "data": payload}
 
 
-def node(node_id: Any, data: dict[str, Any] | None = None, **props: Any) -> Term:
-    payload = dict(data or {})
-    payload.update(props)
-    return Term(node_id, rel="__node__", data=payload or None)
+def node(node_id: Any, data: dict[str, Any] | None = None, **props: Any) -> dict[str, Any]:
+    return edge(node_id, rel="__node__", data=data, **props)
 
 
-__all__ = [
-    "Pred",
-    "Field",
-    "Var",
-    "Edge",
-    "Const",
-    "Term",
-    "Command",
-    "match",
-    "rewrite",
-    "vars",
-    "edge",
-    "node",
-    "exec",
-]
+def _ns_node(namespace: str | None, node_id: Any) -> str:
+    raw = str(node_id)
+    if not namespace:
+        return raw
+    prefix = f"{namespace}:"
+    return raw if raw.startswith(prefix) else f"{prefix}{raw}"
 
+
+def ns(name: str) -> Namespace:
+    return Namespace(name)
+
+
+def _normalize_ns(namespace: str) -> str:
+    value = str(namespace).strip()
+    if not value:
+        raise ValueError("namespace must be non-empty")
+    if ":" in value:
+        raise ValueError("invalid namespace; ':' is reserved")
+    return value
+
+
+__all__ = ["vars", "const", "on", "edge", "node", "ns", "match", "rewrite", "exec"]
 
 _ENGINE: _Engine | None = None
 

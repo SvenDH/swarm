@@ -10,12 +10,12 @@ It executes an object-based DSL command and returns the result.
 
 Core objects:
 
-- `runtime.Var("x")` or `runtime.Var.many("x y z")`
 - `runtime.vars("x y z")` (friendly alias)
-- `runtime.Const("node_id")`
-- `runtime.Edge(1)` for edge-property filters
+- `runtime.const("node_id")` for literal node ids in patterns
+- `runtime.on(1)` for edge-property filters
 - `runtime.edge(*nodes, rel="_", **props)` (friendly term builder)
 - `runtime.node("id", **props)` for node metadata edges
+- `runtime.ns("name")` namespace handle
 - `runtime.match(...)`
 
 Rewrite is expressed as `match(...).rewrite(...)` or top-level `rewrite(..., to=[...])`.
@@ -38,7 +38,7 @@ x, y, z, u = runtime.vars("x y z u")
 
 # Query
 m = runtime.exec(
-    runtime.match((x, x, y), (y, z, u)).where(x.kind == "person", runtime.Edge(1).weight >= 0.5),
+    runtime.match((x, x, y), (y, z, u)).where(x.kind == "person", runtime.on(1).weight >= 0.5),
 )
 print(json.dumps(m, indent=2))
 
@@ -70,6 +70,32 @@ runtime.node("src", kind="entity", label="Person")
 # n-ary relations
 runtime.edge("a", "b", "c", rel="event", ts=1700000000)
 ```
+
+### Segregating Different Graphs (Namespace Prefixes)
+
+Use a namespace handle so one DB can host many logical graphs safely.
+
+```python
+g1 = runtime.ns("g1")
+g2 = runtime.ns("g2")
+
+runtime.exec(runtime.rewrite(to=[
+    g1.edge("alice", "bob", rel="friend"),
+    g2.edge("alice", "bob", rel="friend"),
+]))
+```
+
+Namespace-aware matching/rewrite:
+
+```python
+x, y = runtime.vars("x y")
+g1 = runtime.ns("g1")
+
+# only matches nodes whose ids start with "g1:"
+g1_matches = runtime.exec(g1.match(("friend", (x, y)), mode="all", limit=100))
+```
+
+When namespace is set on a rewrite, fresh variables are created in that namespace automatically.
 
 ### Knowledge Graph (KG)
 
@@ -142,7 +168,7 @@ x, y = runtime.vars("x y")
 # find friend edges where source node is a Person
 out = runtime.exec(
     runtime.match(("friend", (x, y))).where(
-        runtime.Edge(1).weight >= 0.5,
+        runtime.on(1).weight >= 0.5,
         x.label == "Person",
     )
 )
@@ -183,10 +209,41 @@ step1 = runtime.exec(
 )
 ```
 
+## Result Interop
+
+`runtime.exec(...)` returns a list of rewrite/match results with:
+- `bindings`: variable -> node id
+- `hyperedges`: rewritten/matched edges for that result
+
+Use helper conversions:
+
+```python
+out = runtime.exec(runtime.match(("friend", (x, y)), mode="all", limit=100))
+
+# list[dict] for normal Python processing
+records = [row["bindings"] for row in out]
+
+# pandas DataFrame
+import pandas as pd
+df = pd.DataFrame(records)
+
+# numpy array (column order is explicit here)
+import numpy as np
+arr = np.array([[r.get("x"), r.get("y")] for r in records], dtype=object)
+
+# matplotlib (counts per value in x)
+import matplotlib.pyplot as plt
+df["x"].value_counts().plot(kind="bar")
+plt.show()
+```
+
+Optional dependencies:
+- `pip install pandas numpy matplotlib`
+
 ## Notes
 
 - `match(...).where(...)` is chainable.
 - Pattern strings and `Var` are variables.
-- Literal node ids in patterns use `Const("node_id")`.
+- Literal node ids in patterns use `runtime.const("node_id")`.
 - New RHS variables create fresh nodes.
 - Rewrites execute atomically in one SQLite transaction.
