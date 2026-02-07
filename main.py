@@ -23,7 +23,7 @@ DSL command format:
 
 Examples:
 - seed graph data (empty LHS):
-  runtime.exec("demo", runtime.select().update(
+  runtime.exec("demo", runtime.update(
       [runtime.Term("a", "a", "b"), runtime.Term("b", "c", "d"), runtime.Term("a", "b", "c", rel="friend")]
   ))
 - run query:

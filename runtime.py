@@ -207,6 +207,7 @@ class _Engine:
         # Compile pattern + predicates into one SQL statement used by match/rewrite.
         if not lhs:
             raise ValueError("match requires at least one lhs term")
+        
         planned = sorted(enumerate(lhs, start=1), key=lambda item: self._term_rank(item[1]), reverse=True)
         joins: list[str] = []
         where: list[str] = []
@@ -304,14 +305,25 @@ class _Engine:
     def _subgraph(self, graph_id: str, row: sqlite3.Row, vars_sorted: list[str], edge_cols: list[str]) -> dict[str, Any]:
         edge_ids = [int(row[c]) for c in edge_cols]
         placeholders = ",".join(["?"] * len(edge_ids))
-        edges = self.db.execute(
+        rows = self.db.execute(
             "SELECT edge_id, relation, nodes_json, data "
             f"FROM hyperedges WHERE graph_id=? AND edge_id IN ({placeholders})",
             [graph_id] + edge_ids,
         ).fetchall()
+        by_id = {int(r["edge_id"]): r for r in rows}
         return {
             "bindings": {v: str(row[f"v_{v}"]) for v in vars_sorted},
-            "hyperedges": [{"edge_id": int(e["edge_id"]), "relation": e["relation"], "nodes": json.loads(e["nodes_json"]), "data": json.loads(e["data"])} for e in edges],
+            # Preserve deterministic order based on e1/e2/... from the compiled match.
+            "hyperedges": [
+                {
+                    "edge_id": edge_id,
+                    "relation": by_id[edge_id]["relation"],
+                    "nodes": json.loads(by_id[edge_id]["nodes_json"]),
+                    "data": json.loads(by_id[edge_id]["data"]),
+                }
+                for edge_id in edge_ids
+                if edge_id in by_id
+            ],
         }
 
     def _apply_row(self, graph_id: str, row: sqlite3.Row, vars_sorted: list[str], edge_cols: list[str], rhs: list[dict[str, Any]]) -> dict[str, Any]:
@@ -338,6 +350,7 @@ class _Engine:
 
         if not edge_ids:
             return {"bindings": dict(env), "hyperedges": []}
+        
         placeholders = ",".join(["?"] * len(edge_ids))
         rows = self.db.execute(
             "SELECT edge_id, relation, nodes_json, data "
@@ -439,11 +452,12 @@ def _as_pred(item: Any) -> dict[str, Any]:
     return pred
 
 
+select = Command  # Alias for nicer DSL.
+update = lambda rhs, **kwargs: Command().update(rhs, **kwargs)  # Helper for update-only commands.
+
+
 _ENGINE = _Engine()
 
 
-select = Command  # Alias for nicer DSL.
-
-
-def exec(graph_id: str, command: Command) -> dict[str, Any]:  # noqa: A001
+def exec(graph_id: str, command: Command) -> list[dict[str, Any]]:  # noqa: A001
     return _ENGINE.run(graph_id, command)
