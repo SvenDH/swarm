@@ -111,22 +111,22 @@ class Command:
         object.__setattr__(self, "rhs", None)
         object.__setattr__(self, "mode", str(mode))
         object.__setattr__(self, "rewrite_limit", None)
+
+    def _clone(self, **changes: Any) -> Command:
+        out = Command(*self.lhs, where=self.where_clauses, limit=self.limit, mode=self.mode)
+        object.__setattr__(out, "rhs", self.rhs)
+        object.__setattr__(out, "rewrite_limit", self.rewrite_limit)
+        for k, v in changes.items():
+            object.__setattr__(out, k, v)
+        return out
     
     def where(self, *predicates: Any) -> Command:
         # Immutable chain API.
-        out = Command(*self.lhs, where=self.where_clauses + tuple(predicates), limit=self.limit, mode=self.mode)
-        object.__setattr__(out, "rhs", self.rhs)
-        object.__setattr__(out, "mode", self.mode)
-        object.__setattr__(out, "rewrite_limit", self.rewrite_limit)
-        return out
+        return self._clone(where_clauses=self.where_clauses + tuple(predicates))
     
     def update(self, rhs: list[Any] | tuple[Any, ...], *, mode: str = "first", limit: int | None = None) -> Command:
         # Rewrite is expressed as Match(lhs).update(rhs,...).
-        out = Command(*self.lhs, where=self.where_clauses, limit=self.limit, mode=self.mode)
-        object.__setattr__(out, "rhs", tuple(rhs))
-        object.__setattr__(out, "mode", str(mode))
-        object.__setattr__(out, "rewrite_limit", None if limit is None else int(limit))
-        return out
+        return self._clone(rhs=tuple(rhs), mode=str(mode), rewrite_limit=None if limit is None else int(limit))
 
 class _Engine:
     def __init__(self, db_path: str = "graphs.db") -> None:
@@ -181,7 +181,8 @@ class _Engine:
         if mode not in {"first", "random"}:
             raise ValueError("match mode must be 'first' or 'random'")
         qlimit = 1 if mode == "random" else command.limit
-        lhs, filters = self._compile_inputs(command)
+        lhs = [_as_term(t, pattern=True) for t in command.lhs]
+        filters = [_as_pred(pred) for pred in command.where_clauses]
         sql_text, params, vars_sorted, edge_cols = self._compile_query(
             graph_id,
             lhs,
@@ -192,41 +193,38 @@ class _Engine:
         rows = self.db.execute(sql_text, params).fetchall()
         if not rows:
             return []
-        unique_edge_ids = list(dict.fromkeys(eid for row in rows for eid in self._edge_ids_from_row(row, edge_cols)))
+        unique_edge_ids = list(dict.fromkeys(int(row[col]) for row in rows for col in edge_cols))
         edge_by_id = self._fetch_edges(graph_id, unique_edge_ids)
         return [
             {
                 "bindings": {v: str(row[f"v_{v}"]) for v in vars_sorted},
-                "hyperedges": [edge_by_id[eid] for eid in self._edge_ids_from_row(row, edge_cols) if eid in edge_by_id],
+                "hyperedges": [edge_by_id[eid] for eid in (int(row[col]) for col in edge_cols) if eid in edge_by_id],
             }
             for row in rows
         ]
 
     def _rewrite(self, graph_id: str, command: Command) -> list[dict[str, Any]]:
-        lhs, filters = self._compile_inputs(command)
+        lhs = [_as_term(t, pattern=True) for t in command.lhs]
+        filters = [_as_pred(pred) for pred in command.where_clauses]
         rhs = [_as_term(t, pattern=bool(lhs)) for t in (command.rhs or ())]
         mode = command.mode.lower()
-        limit = self._effective_limit(command)
+        limit = command.limit if command.rhs is None or command.rewrite_limit is None else command.rewrite_limit
+        if limit < 1:
+            raise ValueError("limit must be >= 1")
         if mode not in {"first", "all", "random"}:
             raise ValueError("mode must be 'first', 'all', or 'random'")
 
         # Single transaction for the full rewrite loop.
         self.db.execute("BEGIN IMMEDIATE")
         try:
-            self._ensure_graph(graph_id)
+            self.db.execute("INSERT OR IGNORE INTO graphs(id) VALUES (?)", (graph_id,))
             if not lhs:
                 rewritten = [self._emit_terms(graph_id, rhs, {})] if rhs else []
                 self.db.commit()
                 return rewritten
 
             random_order = mode == "random"
-            sql_text, params, vars_sorted, edge_cols = self._compile_query(
-                graph_id,
-                lhs,
-                filters,
-                limit,
-                random_order=random_order,
-            )
+            sql_text, params, vars_sorted, edge_cols = self._compile_query(graph_id, lhs, filters, limit, random_order)
             max_steps = limit if mode == "all" else 1
             count = 0
             rewritten: list[dict[str, Any]] = []
@@ -253,21 +251,18 @@ class _Engine:
         limit: int,
         random_order: bool = False,
     ) -> tuple[str, list[Any], list[str], list[str]]:
-        # Compile pattern + predicates into one SQL statement used by match/rewrite.
         if not lhs:
             raise ValueError("match requires at least one lhs term")
-        
-        planned = sorted(enumerate(lhs, start=1), key=lambda item: self._term_rank(item[1]), reverse=True)
         joins: list[str] = []
         where: list[str] = []
         join_params: list[Any] = []
         where_params: list[Any] = []
         var_col: dict[str, str] = {}
-        alias_by_orig: dict[int, str] = {}
+        edge_aliases: list[str] = []
 
-        for i, (orig_idx, term) in enumerate(planned, 1):
+        for i, term in enumerate(lhs, 1):
             edge_alias = f"h{i}"
-            alias_by_orig[orig_idx] = edge_alias
+            edge_aliases.append(edge_alias)
             if i == 1:
                 joins.append("FROM hyperedges h1")
                 where.extend(["h1.graph_id = ?", "h1.arity = ?"])
@@ -292,12 +287,12 @@ class _Engine:
                     join_params.append(tok["value"])
                 joins.append(f"JOIN edge_nodes {en} ON {' AND '.join(on)}")
                 col = f"{en}.node_id"
-                if tok["kind"] == "var" and tok["value"] in var_col:
-                    where.append(f"{col} = {var_col[tok['value']]}")
-                elif tok["kind"] == "var":
-                    var_col[tok["value"]] = col
-
-        edge_aliases = [alias_by_orig[i] for i in range(1, len(lhs) + 1)]
+                if tok["kind"] == "var":
+                    prev = var_col.get(tok["value"])
+                    if prev is None:
+                        var_col[tok["value"]] = col
+                    else:
+                        where.append(f"{col} = {prev}")
 
         for pred in filters:
             if pred["target"] == "node":
@@ -321,7 +316,7 @@ class _Engine:
 
         vars_sorted = sorted(var_col)
         edge_cols = [f"e{i}" for i in range(1, len(lhs) + 1)]
-        select = [f"{alias_by_orig[i]}.edge_id AS e{i}" for i in range(1, len(lhs) + 1)]
+        select = [f"h{i}.edge_id AS e{i}" for i in range(1, len(lhs) + 1)]
         select.extend(f"{var_col[v]} AS v_{v}" for v in vars_sorted)
         order = " ORDER BY RANDOM()" if random_order else ""
         sql_text = f"SELECT {', '.join(select)} {' '.join(joins)} WHERE {' AND '.join(where)}{order} LIMIT {int(limit)}"
@@ -343,15 +338,14 @@ class _Engine:
             return f"json_extract({json_col}, ?) IS NOT NULL", [path]
         return f"json_extract({json_col}, ?) {op} ?", [path, val]
 
-    @staticmethod
-    def _term_rank(term: dict[str, Any]) -> tuple[int, int, int]:
-        relation_fixed = 1 if term["relation"] != "_" else 0
-        const_count = sum(1 for tok in term["nodes"] if tok["kind"] == "const")
-        # Prefer selective terms first: fixed relation, more constants, then lower arity.
-        return relation_fixed, const_count, -len(term["nodes"])
-
     def _apply_row(self, graph_id: str, row: sqlite3.Row, vars_sorted: list[str], edge_cols: list[str], rhs: list[dict[str, Any]]) -> dict[str, Any]:
-        self._delete_edges(graph_id, self._edge_ids_from_row(row, edge_cols))
+        edge_ids = [int(row[col]) for col in edge_cols]
+        if edge_ids:
+            placeholders = ",".join(["?"] * len(edge_ids))
+            self.db.execute(
+                f"DELETE FROM hyperedges WHERE graph_id=? AND edge_id IN ({placeholders})",
+                [graph_id] + edge_ids,
+            )
         env = {v: str(row[f"v_{v}"]) for v in vars_sorted}
         return self._emit_terms(graph_id, rhs, env)
 
@@ -372,27 +366,12 @@ class _Engine:
             all_node_ids.extend(node_ids)
 
         self._ensure_nodes(graph_id, all_node_ids)
-        edge_ids: list[int] = []
-        edge_by_id: dict[int, dict[str, Any]] = {}
-        existing_ids: list[int] = []
-        for relation, node_ids, data in resolved_terms:
-            edge_id, inserted = self._insert_edge(graph_id, relation, node_ids, data)
-            edge_ids.append(edge_id)
-            if inserted:
-                edge_by_id[edge_id] = {
-                    "edge_id": edge_id,
-                    "relation": relation,
-                    "nodes": list(node_ids),
-                    "data": dict(data or {}),
-                }
-            else:
-                existing_ids.append(edge_id)
+        edge_ids = [self._insert_edge(graph_id, relation, node_ids, data) for relation, node_ids, data in resolved_terms]
 
         if not edge_ids:
             return {"bindings": dict(env), "hyperedges": []}
 
-        if existing_ids:
-            edge_by_id.update(self._fetch_edges(graph_id, existing_ids))
+        edge_by_id = self._fetch_edges(graph_id, edge_ids)
         return {
             "bindings": dict(env),
             "hyperedges": [edge_by_id[edge_id] for edge_id in edge_ids if edge_id in edge_by_id],
@@ -417,20 +396,7 @@ class _Engine:
             for row in rows
         }
 
-    def _delete_edges(self, graph_id: str, edge_ids: list[int]) -> None:
-        if not edge_ids:
-            return
-        placeholders = ",".join(["?"] * len(edge_ids))
-        self.db.execute(
-            f"DELETE FROM hyperedges WHERE graph_id=? AND edge_id IN ({placeholders})",
-            [graph_id] + edge_ids,
-        )
-
-    @staticmethod
-    def _edge_ids_from_row(row: sqlite3.Row, edge_cols: list[str]) -> list[int]:
-        return [int(row[col]) for col in edge_cols]
-
-    def _insert_edge(self, graph_id: str, relation: str, node_ids: list[str], data: dict[str, Any]) -> tuple[int, bool]:
+    def _insert_edge(self, graph_id: str, relation: str, node_ids: list[str], data: dict[str, Any]) -> int:
         nodes_json = json.dumps(node_ids, separators=(",", ":"))
         data_json = json.dumps(data or {}, separators=(",", ":"))
         cur = self.db.execute(
@@ -443,7 +409,7 @@ class _Engine:
                 "INSERT INTO edge_nodes(graph_id,edge_id,pos,node_id) VALUES (?,?,?,?)",
                 [(graph_id, edge_id, i, node_id) for i, node_id in enumerate(node_ids)],
             )
-            return edge_id, True
+            return edge_id
 
         row = self.db.execute(
             "SELECT edge_id FROM hyperedges WHERE graph_id=? AND relation=? AND nodes_json=?",
@@ -451,26 +417,12 @@ class _Engine:
         ).fetchone()
         if row is None:
             raise RuntimeError("failed to resolve edge id after upsert")
-        return int(row["edge_id"]), False
+        return int(row["edge_id"])
 
     def _ensure_nodes(self, graph_id: str, node_ids: list[str]) -> None:
         unique = list(dict.fromkeys(node_ids))
         if unique:
             self.db.executemany("INSERT OR IGNORE INTO nodes(graph_id,id,data) VALUES (?,?,'{}')", [(graph_id, node_id) for node_id in unique])
-
-    def _ensure_graph(self, graph_id: str) -> None:
-        self.db.execute("INSERT OR IGNORE INTO graphs(id) VALUES (?)", (graph_id,))
-
-    @staticmethod
-    def _effective_limit(command: Command) -> int:
-        limit = command.limit if command.rhs is None or command.rewrite_limit is None else command.rewrite_limit
-        if limit < 1:
-            raise ValueError("limit must be >= 1")
-        return limit
-
-    @staticmethod
-    def _compile_inputs(command: Command) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-        return [_as_term(t, pattern=True) for t in command.lhs], [_as_pred(pred) for pred in command.where_clauses]
 
 
 def _as_term(raw: Any, pattern: bool) -> dict[str, Any]:
