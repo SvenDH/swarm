@@ -10,7 +10,6 @@ from smolagents import CodeAgent, LiteLLMModel
 GRAPH_CODE_INSTRUCTIONS = """
 For graph work, import `runtime` and use only:
 - runtime.exec(command)  # default graph
-- runtime.exec(graph_id, command)
 
 DSL command format:
 - object DSL:
@@ -24,17 +23,17 @@ DSL command format:
 
 Examples:
 - seed graph data (empty LHS):
-  runtime.exec("demo", runtime.rewrite(to=[
+  runtime.exec(runtime.rewrite(to=[
       runtime.edge("a", "a", "b"),
       runtime.edge("b", "c", "d"),
       runtime.edge("a", "b", "c", rel="friend"),
   ]))
 - run query:
   x, y, z, u = runtime.vars("x y z u")
-  runtime.exec("demo", runtime.match((x, x, y), (y, z, u)))
+  runtime.exec(runtime.match((x, x, y), (y, z, u)))
 - run rewrite:
   x, y, z, u, v = runtime.vars("x y z u v")
-  runtime.exec("demo", runtime.match((x, x, y), (y, z, u)).rewrite(
+  runtime.exec(runtime.match((x, x, y), (y, z, u)).rewrite(
       [(x, v, u), (y, v, z), (v, v, u)],
       mode="all",
       limit=100,
@@ -54,6 +53,10 @@ Rules:
   - Causal: runtime.edge(cause, effect, rel="causes", strength=..., sign=...)
   - AST/program graph: runtime.edge(parent, child, rel="child", slot="body", idx=0), runtime.node(n, kind="ast", type="If")
   - Factor/hypergraph: runtime.edge(v1, v2, v3, rel="factor", fn="phi_name")
+- Workflow patterns:
+  - Search/filter: runtime.match(...).where(...), use Edge(i).prop and node props (x.kind, y.label, etc.)
+  - Inference: runtime.match(lhs...).rewrite([derived_edges...], mode="all", limit=...)
+  - Program execution: model state/control as edges, then use mode="first" rewrite steps for single-step execution
 """
 
 

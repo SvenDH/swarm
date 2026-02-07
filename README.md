@@ -3,7 +3,6 @@
 Single API function:
 
 - `runtime.exec(command)` for the default graph
-- `runtime.exec(graph_id, command)`
 
 It executes an object-based DSL command and returns the result.
 
@@ -28,7 +27,7 @@ import json
 import runtime
 
 # Seed graph: empty LHS rewrite
-runtime.exec("demo", runtime.rewrite(to=[
+runtime.exec(runtime.rewrite(to=[
     runtime.edge("a", "a", "b"),
     runtime.edge("b", "c", "d", rel="r2"),
     runtime.edge("a", "b", "c", rel="friend", weight=0.8),
@@ -39,7 +38,6 @@ x, y, z, u = runtime.vars("x y z u")
 
 # Query
 m = runtime.exec(
-    "demo",
     runtime.match((x, x, y), (y, z, u)).where(x.kind == "person", runtime.Edge(1).weight >= 0.5),
 )
 print(json.dumps(m, indent=2))
@@ -47,7 +45,6 @@ print(json.dumps(m, indent=2))
 # Rewrite
 x, y, z, u, v = runtime.vars("x y z u v")
 r = runtime.exec(
-    "demo",
     runtime.match((x, x, y), (y, z, u)).rewrite(
         [(x, v, u), (y, v, z), (v, v, u)],
         mode="first",
@@ -77,7 +74,7 @@ runtime.edge("a", "b", "c", rel="event", ts=1700000000)
 ### Knowledge Graph (KG)
 
 ```python
-runtime.exec("kg", runtime.rewrite(to=[
+runtime.exec(runtime.rewrite(to=[
     runtime.edge("alice", "openai", rel="works_at", source="hr"),
     runtime.edge("alice", "sf", rel="lives_in"),
     runtime.node("alice", label="Person"),
@@ -88,7 +85,7 @@ runtime.exec("kg", runtime.rewrite(to=[
 ### Bayesian Network
 
 ```python
-runtime.exec("bn", runtime.rewrite(to=[
+runtime.exec(runtime.rewrite(to=[
     runtime.edge("Rain", "WetGrass", rel="parent"),
     runtime.edge("Sprinkler", "WetGrass", rel="parent"),
     runtime.node("Rain", kind="bayes", states=["T", "F"], cpt={"T": 0.2, "F": 0.8}),
@@ -105,7 +102,7 @@ runtime.exec("bn", runtime.rewrite(to=[
 ### Causal Graph
 
 ```python
-runtime.exec("causal", runtime.rewrite(to=[
+runtime.exec(runtime.rewrite(to=[
     runtime.edge("Smoking", "Cancer", rel="causes", strength=0.7),
     runtime.edge("Tar", "Cancer", rel="mediates"),
     runtime.edge("Tax", "Smoking", rel="intervenes", effect="-"),
@@ -117,7 +114,7 @@ runtime.exec("causal", runtime.rewrite(to=[
 ### AST / Program Graph
 
 ```python
-runtime.exec("ast", runtime.rewrite(to=[
+runtime.exec(runtime.rewrite(to=[
     runtime.node("n_if", kind="ast", type="If"),
     runtime.node("n_cond", kind="ast", type="Compare"),
     runtime.node("n_then", kind="ast", type="Assign"),
@@ -129,10 +126,61 @@ runtime.exec("ast", runtime.rewrite(to=[
 ### Factor / Hypergraph Style
 
 ```python
-runtime.exec("factor", runtime.rewrite(to=[
+runtime.exec(runtime.rewrite(to=[
     runtime.edge("X1", "X2", "X3", rel="factor", fn="phi1"),
     runtime.edge("X2", "X4", rel="factor", fn="phi2"),
 ]))
+```
+
+## Common Workflows
+
+### Search / Filtering
+
+```python
+x, y = runtime.vars("x y")
+
+# find friend edges where source node is a Person
+out = runtime.exec(
+    runtime.match(("friend", (x, y))).where(
+        runtime.Edge(1).weight >= 0.5,
+        x.label == "Person",
+    )
+)
+```
+
+### Inference (Forward Rule Application)
+
+```python
+x, y, z = runtime.vars("x y z")
+
+# if friend(x,y) and friend(y,z), infer friend2(x,z)
+derived = runtime.exec(
+    runtime.match(("friend", (x, y)), ("friend", (y, z))).rewrite(
+        [runtime.edge(x, z, rel="friend2", rule="two_hop")],
+        mode="all",
+        limit=1000,
+    )
+)
+```
+
+### Program Execution / State Transition
+
+```python
+pc, nxt = runtime.vars("pc nxt")
+
+# state(machine, pc) + step(pc,nxt) -> state(machine, nxt)
+runtime.exec(runtime.rewrite(to=[
+    runtime.edge("m1", "n0", rel="state"),
+    runtime.edge("n0", "n1", rel="step"),
+    runtime.edge("n1", "n2", rel="step"),
+]))
+
+step1 = runtime.exec(
+    runtime.match(("state", ("m1", pc)), ("step", (pc, nxt))).rewrite(
+        [runtime.edge("m1", nxt, rel="state")],
+        mode="first",
+    )
+)
 ```
 
 ## Notes

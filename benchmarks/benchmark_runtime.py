@@ -21,24 +21,24 @@ def build_seed_terms(pairs: int) -> list[runtime.Term]:
     return terms
 
 
-def seed(engine: runtime._Engine, graph_id: str, pairs: int) -> float:
+def seed(engine: runtime._Engine, pairs: int) -> float:
     t0 = time.perf_counter()
-    engine.run(graph_id, runtime.rewrite(to=build_seed_terms(pairs)))
+    engine.run(runtime.rewrite(to=build_seed_terms(pairs)))
     return time.perf_counter() - t0
 
 
-def bench_match(engine: runtime._Engine, graph_id: str, pairs: int, runs: int) -> dict[str, float]:
+def bench_match(engine: runtime._Engine, pairs: int, runs: int) -> dict[str, float]:
     x, y, z, u = runtime.vars("x y z u")
     cmd = runtime.match((x, x, y), ("r2", (y, z, u)), limit=pairs)
 
     # Warmup
     for _ in range(3):
-        engine.run(graph_id, cmd)
+        engine.run(cmd)
 
     total = 0
     t0 = time.perf_counter()
     for _ in range(runs):
-        out = engine.run(graph_id, cmd)
+        out = engine.run(cmd)
         total += len(out)
     dt = time.perf_counter() - t0
     return {
@@ -61,13 +61,14 @@ def bench_rewrite(engine: runtime._Engine, pairs: int, runs: int) -> dict[str, f
     rewrite_count = 0
     seed_seconds = 0.0
     rewrite_seconds = 0.0
-    for i in range(runs):
-        gid = f"rw_{i}"
+    for _ in range(runs):
+        engine.db.execute("DELETE FROM hyperedges")
+        engine.db.commit()
         t_seed = time.perf_counter()
-        seed(engine, gid, pairs)
+        seed(engine, pairs)
         seed_seconds += time.perf_counter() - t_seed
         t_rewrite = time.perf_counter()
-        out = engine.run(gid, cmd)
+        out = engine.run(cmd)
         rewrite_seconds += time.perf_counter() - t_rewrite
         rewrite_count += len(out)
     total_seconds = seed_seconds + rewrite_seconds
@@ -107,9 +108,8 @@ def _run_trial(pairs: int, match_runs: int, rewrite_runs: int) -> dict[str, obje
     os.close(fd)
     try:
         engine = runtime._Engine(db_path)
-        g_match = "match_graph"
-        seed_seconds = seed(engine, g_match, pairs)
-        match = bench_match(engine, g_match, pairs, match_runs)
+        seed_seconds = seed(engine, pairs)
+        match = bench_match(engine, pairs, match_runs)
         rewrite = bench_rewrite(engine, pairs, rewrite_runs)
         return {
             "pairs": pairs,
@@ -125,9 +125,9 @@ def _run_trial(pairs: int, match_runs: int, rewrite_runs: int) -> dict[str, obje
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Micro-benchmark for runtime hypergraph operations")
-    parser.add_argument("--pairs", type=int, default=300, help="Number of (lhs,r2) edge pairs to seed per graph")
+    parser.add_argument("--pairs", type=int, default=300, help="Number of (lhs,r2) edge pairs to seed")
     parser.add_argument("--match-runs", type=int, default=80, help="How many repeated match queries to run")
-    parser.add_argument("--rewrite-runs", type=int, default=12, help="How many seeded rewrite graphs to run")
+    parser.add_argument("--rewrite-runs", type=int, default=12, help="How many seeded rewrite runs to execute")
     parser.add_argument("--trials", type=int, default=1, help="How many full benchmark trials to run")
     args = parser.parse_args()
     if args.trials < 1:

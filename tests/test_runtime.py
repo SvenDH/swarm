@@ -13,7 +13,6 @@ class RuntimeTests(unittest.TestCase):
         fd, self.db_path = tempfile.mkstemp(prefix="runtime_test_", suffix=".db")
         os.close(fd)
         self.engine = runtime._Engine(self.db_path)
-        self.gid = "g"
 
     def tearDown(self) -> None:
         self.engine.db.close()
@@ -26,7 +25,6 @@ class RuntimeTests(unittest.TestCase):
 
     def _seed_two_terms(self) -> None:
         self.engine.run(
-            self.gid,
             runtime.rewrite(
                 to=[
                     runtime.edge("a", "a", "b", tag="lhs"),
@@ -40,8 +38,8 @@ class RuntimeTests(unittest.TestCase):
         self._seed_two_terms()
         cmd = runtime.match((x, x, y), ("r2", (y, z, u)))
 
-        out1 = self.engine.run(self.gid, cmd)
-        out2 = self.engine.run(self.gid, cmd)
+        out1 = self.engine.run(cmd)
+        out2 = self.engine.run(cmd)
 
         self.assertEqual(len(out1), 1)
         self.assertEqual(len(out2), 1)
@@ -54,7 +52,6 @@ class RuntimeTests(unittest.TestCase):
         self._seed_two_terms()
 
         out = self.engine.run(
-            self.gid,
             runtime.match((x, x, y), ("r2", (y, z, u))).rewrite(
                 [(x, v, u), (y, v, z), (v, v, u)],
                 mode="first",
@@ -75,7 +72,7 @@ class RuntimeTests(unittest.TestCase):
         x, y, z, u = runtime.vars("x y z u")
         self._seed_two_terms()
 
-        before = self.engine.run(self.gid, runtime.match((x, x, y), ("r2", (y, z, u))))
+        before = self.engine.run(runtime.match((x, x, y), ("r2", (y, z, u))))
         self.assertEqual(len(before), 1)
 
         non_terminating = runtime.match((x, x, y), ("r2", (y, z, u))).rewrite(
@@ -84,9 +81,9 @@ class RuntimeTests(unittest.TestCase):
             limit=2,
         )
         with self.assertRaises(ValueError):
-            self.engine.run(self.gid, non_terminating)
+            self.engine.run(non_terminating)
 
-        after = self.engine.run(self.gid, runtime.match((x, x, y), ("r2", (y, z, u))))
+        after = self.engine.run(runtime.match((x, x, y), ("r2", (y, z, u))))
         self.assertEqual(before, after)
 
     def test_rewrite_all_overlapping_matches(self) -> None:
@@ -94,7 +91,6 @@ class RuntimeTests(unittest.TestCase):
         # Two candidate matches share the same first edge:
         # (a,a,b) with (b,c,d) and (a,a,b) with (b,e,f).
         self.engine.run(
-            self.gid,
             runtime.rewrite(
                 to=
                 [
@@ -110,12 +106,12 @@ class RuntimeTests(unittest.TestCase):
             mode="all",
             limit=10,
         )
-        out = self.engine.run(self.gid, cmd)
+        out = self.engine.run(cmd)
 
         # Only one rewrite step can run because both initial matches overlap on (a,a,b).
         self.assertEqual(len(out), 1)
 
-        remaining = self.engine.run(self.gid, runtime.match((x, x, y), ("r2", (y, z, u))))
+        remaining = self.engine.run(runtime.match((x, x, y), ("r2", (y, z, u))))
         self.assertEqual(len(remaining), 0)
 
     def test_edge_filters_track_original_term_positions(self) -> None:
@@ -126,19 +122,16 @@ class RuntimeTests(unittest.TestCase):
             runtime.Edge(1).tag == "lhs",
             runtime.Edge(2).tag == "rhs",
         )
-        out = self.engine.run(self.gid, cmd)
+        out = self.engine.run(cmd)
         self.assertEqual(len(out), 1)
 
     def test_node_property_filter(self) -> None:
         x, y, z, u = runtime.vars("x y z u")
         self._seed_two_terms()
-        self.engine.run(
-            self.gid,
-            runtime.rewrite(to=[runtime.node("a", kind="entity")]),
-        )
+        self.engine.run(runtime.rewrite(to=[runtime.node("a", kind="entity")]))
 
         cmd = runtime.match((x, x, y), ("r2", (y, z, u))).where(x.kind == "entity")
-        out = self.engine.run(self.gid, cmd)
+        out = self.engine.run(cmd)
         self.assertEqual(len(out), 1)
 
     def test_random_mode_picks_one_match(self) -> None:
@@ -148,9 +141,9 @@ class RuntimeTests(unittest.TestCase):
             a, b, c, d = f"a{i}", f"b{i}", f"c{i}", f"d{i}"
             seed_terms.append(runtime.edge(a, a, b))
             seed_terms.append(runtime.edge(b, c, d, rel="r2"))
-        self.engine.run(self.gid, runtime.rewrite(to=seed_terms))
+        self.engine.run(runtime.rewrite(to=seed_terms))
 
-        out = self.engine.run(self.gid, runtime.match((x, x, y), ("r2", (y, z, u)), limit=8, mode="random"))
+        out = self.engine.run(runtime.match((x, x, y), ("r2", (y, z, u)), limit=8, mode="random"))
         self.assertEqual(len(out), 1)
 
     def test_all_mode_returns_multiple_matches(self) -> None:
@@ -160,18 +153,18 @@ class RuntimeTests(unittest.TestCase):
             a, b, c, d = f"a{i}", f"b{i}", f"c{i}", f"d{i}"
             seed_terms.append(runtime.edge(a, a, b))
             seed_terms.append(runtime.edge(b, c, d, rel="r2"))
-        self.engine.run(self.gid, runtime.rewrite(to=seed_terms))
+        self.engine.run(runtime.rewrite(to=seed_terms))
 
-        out = self.engine.run(self.gid, runtime.match((x, x, y), ("r2", (y, z, u)), limit=4, mode="all"))
+        out = self.engine.run(runtime.match((x, x, y), ("r2", (y, z, u)), limit=4, mode="all"))
         self.assertEqual(len(out), 4)
 
     def test_friendly_api_aliases(self) -> None:
         x, y, z, u = runtime.vars("x y z u")
-        self.engine.run(self.gid, runtime.rewrite(to=[runtime.edge("a", "a", "b"), runtime.edge("b", "c", "d", rel="r2")]))
-        self.engine.run(self.gid, runtime.rewrite(to=[runtime.node("a", kind="entity")]))
+        self.engine.run(runtime.rewrite(to=[runtime.edge("a", "a", "b"), runtime.edge("b", "c", "d", rel="r2")]))
+        self.engine.run(runtime.rewrite(to=[runtime.node("a", kind="entity")]))
 
         cmd = runtime.match((x, x, y), ("r2", (y, z, u))).where(x.kind == "entity")
-        out = self.engine.run(self.gid, cmd)
+        out = self.engine.run(cmd)
         self.assertEqual(len(out), 1)
 
 
