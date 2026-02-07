@@ -2,7 +2,7 @@ from __future__ import annotations
 import json
 import sqlite3
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any
 
 OPS = {"=", "!=", ">", ">=", "<", "<=", "LIKE", "IN"}
@@ -98,76 +98,43 @@ class Command:
     mode: str = "first"
     rewrite_limit: int | None = None
     
-    def __init__(
-        self,
-        *lhs: Any,
-        where: tuple[Any, ...] | list[Any] | None = None,
-        limit: int = 100,
-        mode: str = "first",
-    ) -> None:
-        object.__setattr__(self, "lhs", tuple(lhs))
-        object.__setattr__(self, "where_clauses", tuple(where or ()))
-        object.__setattr__(self, "limit", int(limit))
-        object.__setattr__(self, "rhs", None)
-        object.__setattr__(self, "mode", str(mode))
-        object.__setattr__(self, "rewrite_limit", None)
-
-    def _clone(self, **changes: Any) -> Command:
-        out = Command(*self.lhs, where=self.where_clauses, limit=self.limit, mode=self.mode)
-        object.__setattr__(out, "rhs", self.rhs)
-        object.__setattr__(out, "rewrite_limit", self.rewrite_limit)
-        for k, v in changes.items():
-            object.__setattr__(out, k, v)
-        return out
-    
     def where(self, *predicates: Any) -> Command:
         # Immutable chain API.
-        return self._clone(where_clauses=self.where_clauses + tuple(predicates))
+        return replace(self, where_clauses=self.where_clauses + tuple(predicates))
     
     def update(self, rhs: list[Any] | tuple[Any, ...], *, mode: str = "first", limit: int | None = None) -> Command:
         # Rewrite is expressed as Match(lhs).update(rhs,...).
-        return self._clone(rhs=tuple(rhs), mode=str(mode), rewrite_limit=None if limit is None else int(limit))
+        return replace(
+            self,
+            rhs=tuple(rhs),
+            mode=str(mode),
+            rewrite_limit=None if limit is None else int(limit),
+        )
 
 class _Engine:
     def __init__(self, db_path: str = "graphs.db") -> None:
         self.db = sqlite3.connect(db_path)
         self.db.row_factory = sqlite3.Row
-        self.db.execute("PRAGMA foreign_keys = ON")
         # Favor rewrite throughput with durable-enough defaults for local workloads.
         self.db.execute("PRAGMA journal_mode = WAL")
         self.db.execute("PRAGMA synchronous = NORMAL")
         self.db.execute("PRAGMA temp_store = MEMORY")
         self.db.executescript(
             """
-            CREATE TABLE IF NOT EXISTS graphs(id TEXT PRIMARY KEY);
             CREATE TABLE IF NOT EXISTS nodes(
                 graph_id TEXT NOT NULL,
                 id TEXT NOT NULL,
                 data TEXT NOT NULL DEFAULT '{}',
-                PRIMARY KEY(graph_id,id),
-                FOREIGN KEY(graph_id) REFERENCES graphs(id) ON DELETE CASCADE
+                PRIMARY KEY(graph_id,id)
             );
             CREATE TABLE IF NOT EXISTS hyperedges(
                 edge_id INTEGER PRIMARY KEY AUTOINCREMENT,
                 graph_id TEXT NOT NULL,
                 relation TEXT NOT NULL,
-                arity INTEGER NOT NULL,
                 nodes_json TEXT NOT NULL,
-                data TEXT NOT NULL DEFAULT '{}',
-                FOREIGN KEY(graph_id) REFERENCES graphs(id) ON DELETE CASCADE
+                data TEXT NOT NULL DEFAULT '{}'
             );
-            CREATE TABLE IF NOT EXISTS edge_nodes(
-                graph_id TEXT NOT NULL,
-                edge_id INTEGER NOT NULL,
-                pos INTEGER NOT NULL,
-                node_id TEXT NOT NULL,
-                PRIMARY KEY(graph_id,edge_id,pos),
-                FOREIGN KEY(edge_id) REFERENCES hyperedges(edge_id) ON DELETE CASCADE
-            );
-            CREATE INDEX IF NOT EXISTS idx_hyper ON hyperedges(graph_id,relation,arity);
-            CREATE INDEX IF NOT EXISTS idx_hyper_graph_arity ON hyperedges(graph_id,arity);
-            CREATE INDEX IF NOT EXISTS idx_edge_nodes ON edge_nodes(graph_id,node_id,edge_id,pos);
-            CREATE INDEX IF NOT EXISTS idx_edge_nodes_edgepos ON edge_nodes(graph_id,edge_id,pos,node_id);
+            CREATE INDEX IF NOT EXISTS idx_hyper ON hyperedges(graph_id,relation);
             CREATE UNIQUE INDEX IF NOT EXISTS uq_hyper ON hyperedges(graph_id,relation,nodes_json);
             """
         )
@@ -183,13 +150,8 @@ class _Engine:
         qlimit = 1 if mode == "random" else command.limit
         lhs = [_as_term(t, pattern=True) for t in command.lhs]
         filters = [_as_pred(pred) for pred in command.where_clauses]
-        sql_text, params, vars_sorted, edge_cols = self._compile_query(
-            graph_id,
-            lhs,
-            filters,
-            qlimit,
-            random_order=mode == "random",
-        )
+        sql_text, params, vars_sorted, edge_cols = self._compile_query(graph_id, lhs, filters, qlimit, mode == "random")
+        
         rows = self.db.execute(sql_text, params).fetchall()
         if not rows:
             return []
@@ -217,7 +179,6 @@ class _Engine:
         # Single transaction for the full rewrite loop.
         self.db.execute("BEGIN IMMEDIATE")
         try:
-            self.db.execute("INSERT OR IGNORE INTO graphs(id) VALUES (?)", (graph_id,))
             if not lhs:
                 rewritten = [self._emit_terms(graph_id, rhs, {})] if rhs else []
                 self.db.commit()
@@ -265,13 +226,13 @@ class _Engine:
             edge_aliases.append(edge_alias)
             if i == 1:
                 joins.append("FROM hyperedges h1")
-                where.extend(["h1.graph_id = ?", "h1.arity = ?"])
+                where.extend(["h1.graph_id = ?", "json_array_length(h1.nodes_json) = ?"])
                 where_params.extend([graph_id, len(term["nodes"])])
                 if term["relation"] != "_":
                     where.append("h1.relation = ?")
                     where_params.append(term["relation"])
             else:
-                on = [f"{edge_alias}.graph_id = h1.graph_id", f"{edge_alias}.arity = ?"]
+                on = [f"{edge_alias}.graph_id = h1.graph_id", f"json_array_length({edge_alias}.nodes_json) = ?"]
                 on.extend(f"{edge_alias}.edge_id <> h{k}.edge_id" for k in range(1, i))
                 join_params.append(len(term["nodes"]))
                 if term["relation"] != "_":
@@ -280,13 +241,10 @@ class _Engine:
                 joins.append(f"JOIN hyperedges {edge_alias} ON {' AND '.join(on)}")
 
             for j, tok in enumerate(term["nodes"]):
-                en = f"en{i}_{j}"
-                on = [f"{en}.graph_id={edge_alias}.graph_id", f"{en}.edge_id={edge_alias}.edge_id", f"{en}.pos={j}"]
+                col = f"json_extract({edge_alias}.nodes_json, '$[{j}]')"
                 if tok["kind"] == "const":
-                    on.append(f"{en}.node_id = ?")
-                    join_params.append(tok["value"])
-                joins.append(f"JOIN edge_nodes {en} ON {' AND '.join(on)}")
-                col = f"{en}.node_id"
+                    where.append(f"{col} = ?")
+                    where_params.append(tok["value"])
                 if tok["kind"] == "var":
                     prev = var_col.get(tok["value"])
                     if prev is None:
@@ -400,16 +358,11 @@ class _Engine:
         nodes_json = json.dumps(node_ids, separators=(",", ":"))
         data_json = json.dumps(data or {}, separators=(",", ":"))
         cur = self.db.execute(
-            "INSERT OR IGNORE INTO hyperedges(graph_id,relation,arity,nodes_json,data) VALUES (?,?,?,?,?)",
-            (graph_id, relation, len(node_ids), nodes_json, data_json),
+            "INSERT OR IGNORE INTO hyperedges(graph_id,relation,nodes_json,data) VALUES (?,?,?,?)",
+            (graph_id, relation, nodes_json, data_json),
         )
         if cur.rowcount == 1:
-            edge_id = int(cur.lastrowid)
-            self.db.executemany(
-                "INSERT INTO edge_nodes(graph_id,edge_id,pos,node_id) VALUES (?,?,?,?)",
-                [(graph_id, edge_id, i, node_id) for i, node_id in enumerate(node_ids)],
-            )
-            return edge_id
+            return int(cur.lastrowid)
 
         row = self.db.execute(
             "SELECT edge_id FROM hyperedges WHERE graph_id=? AND relation=? AND nodes_json=?",
@@ -462,11 +415,22 @@ def _as_pred(item: Any) -> dict[str, Any]:
     return pred
 
 
-select = Command  # Alias for nicer DSL.
+def select(
+    *lhs: Any,
+    where: tuple[Any, ...] | list[Any] | None = None,
+    limit: int = 100,
+    mode: str = "first",
+) -> Command:
+    return Command(
+        lhs=tuple(lhs),
+        where_clauses=tuple(where or ()),
+        limit=int(limit),
+        mode=str(mode),
+    )
 
 
 def update(rhs: list[Any] | tuple[Any, ...], **kwargs: Any) -> Command:
-    return Command().update(rhs, **kwargs)
+    return select().update(rhs, **kwargs)
 
 
 _ENGINE = _Engine()
