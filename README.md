@@ -2,8 +2,8 @@
 
 Single API function:
 
+- `runtime.exec(command)` for the default graph
 - `runtime.exec(graph_id, command)`
-- `runtime.sql(graph_id, command)` to inspect compiled SQL + bind params
 
 It executes an object-based DSL command and returns the result.
 
@@ -12,12 +12,14 @@ It executes an object-based DSL command and returns the result.
 Core objects:
 
 - `runtime.Var("x")` or `runtime.Var.many("x y z")`
+- `runtime.vars("x y z")` (friendly alias)
 - `runtime.Const("node_id")`
 - `runtime.Edge(1)` for edge-property filters
-- `runtime.Term(*nodes, rel="_")`
-- `runtime.Match(...)`
+- `runtime.edge(*nodes, rel="_", **props)` (friendly term builder)
+- `runtime.node("id", **props)` for node metadata edges
+- `runtime.match(...)`
 
-Rewrite is expressed as `Match(...).update(...)`.
+Rewrite is expressed as `match(...).rewrite(...)` or top-level `rewrite(..., to=[...])`.
 
 ## Usage
 
@@ -25,32 +27,28 @@ Rewrite is expressed as `Match(...).update(...)`.
 import json
 import runtime
 
-# Seed graph: empty LHS rewrite via Match().update(...)
-runtime.exec(
-    "demo",
-    runtime.Match().update(
-        [
-            runtime.Term("a", "a", "b"),
-            runtime.Term("b", "c", "d"),
-            runtime.Term("a", "b", "c", rel="friend", data={"weight": 0.8}),
-        ]
-    ),
-)
+# Seed graph: empty LHS rewrite
+runtime.exec("demo", runtime.rewrite(to=[
+    runtime.edge("a", "a", "b"),
+    runtime.edge("b", "c", "d", rel="r2"),
+    runtime.edge("a", "b", "c", rel="friend", weight=0.8),
+    runtime.node("a", kind="person"),
+]))
 
-x, y, z, u = runtime.Var.many("x y z u")
+x, y, z, u = runtime.vars("x y z u")
 
 # Query
 m = runtime.exec(
     "demo",
-    runtime.Match((x, x, y), (y, z, u)).where(x.kind == "person", runtime.Edge(1).weight >= 0.5),
+    runtime.match((x, x, y), (y, z, u)).where(x.kind == "person", runtime.Edge(1).weight >= 0.5),
 )
 print(json.dumps(m, indent=2))
 
 # Rewrite
-x, y, z, u, v = runtime.Var.many("x y z u v")
+x, y, z, u, v = runtime.vars("x y z u v")
 r = runtime.exec(
     "demo",
-    runtime.Match((x, x, y), (y, z, u)).update(
+    runtime.match((x, x, y), (y, z, u)).rewrite(
         [(x, v, u), (y, v, z), (v, v, u)],
         mode="first",
         limit=100,
@@ -59,11 +57,88 @@ r = runtime.exec(
 print(json.dumps(r, indent=2))
 ```
 
+## Modeling Different Graph Types
+
+Use `rel` + edge/node properties to encode graph semantics.
+
+### General Recipe (Any Domain)
+
+```python
+# structural links
+runtime.edge("src", "dst", rel="link_type", weight=0.9)
+
+# node attributes
+runtime.node("src", kind="entity", label="Person")
+
+# n-ary relations
+runtime.edge("a", "b", "c", rel="event", ts=1700000000)
+```
+
+### Knowledge Graph (KG)
+
+```python
+runtime.exec("kg", runtime.rewrite(to=[
+    runtime.edge("alice", "openai", rel="works_at", source="hr"),
+    runtime.edge("alice", "sf", rel="lives_in"),
+    runtime.node("alice", label="Person"),
+    runtime.node("openai", label="Org"),
+]))
+```
+
+### Bayesian Network
+
+```python
+runtime.exec("bn", runtime.rewrite(to=[
+    runtime.edge("Rain", "WetGrass", rel="parent"),
+    runtime.edge("Sprinkler", "WetGrass", rel="parent"),
+    runtime.node("Rain", kind="bayes", states=["T", "F"], cpt={"T": 0.2, "F": 0.8}),
+    runtime.node("Sprinkler", kind="bayes", states=["T", "F"], cpt={"T": 0.4, "F": 0.6}),
+    runtime.node("WetGrass", kind="bayes", states=["T", "F"], cpt={
+        "Rain=T,Sprinkler=T": {"T": 0.99, "F": 0.01},
+        "Rain=T,Sprinkler=F": {"T": 0.9, "F": 0.1},
+        "Rain=F,Sprinkler=T": {"T": 0.8, "F": 0.2},
+        "Rain=F,Sprinkler=F": {"T": 0.0, "F": 1.0},
+    }),
+]))
+```
+
+### Causal Graph
+
+```python
+runtime.exec("causal", runtime.rewrite(to=[
+    runtime.edge("Smoking", "Cancer", rel="causes", strength=0.7),
+    runtime.edge("Tar", "Cancer", rel="mediates"),
+    runtime.edge("Tax", "Smoking", rel="intervenes", effect="-"),
+    runtime.node("Smoking", kind="variable"),
+    runtime.node("Cancer", kind="outcome"),
+]))
+```
+
+### AST / Program Graph
+
+```python
+runtime.exec("ast", runtime.rewrite(to=[
+    runtime.node("n_if", kind="ast", type="If"),
+    runtime.node("n_cond", kind="ast", type="Compare"),
+    runtime.node("n_then", kind="ast", type="Assign"),
+    runtime.edge("n_if", "n_cond", rel="child", slot="test", idx=0),
+    runtime.edge("n_if", "n_then", rel="child", slot="body", idx=0),
+]))
+```
+
+### Factor / Hypergraph Style
+
+```python
+runtime.exec("factor", runtime.rewrite(to=[
+    runtime.edge("X1", "X2", "X3", rel="factor", fn="phi1"),
+    runtime.edge("X2", "X4", rel="factor", fn="phi2"),
+]))
+```
+
 ## Notes
 
-- `Match.where(...)` is chainable.
+- `match(...).where(...)` is chainable.
 - Pattern strings and `Var` are variables.
 - Literal node ids in patterns use `Const("node_id")`.
 - New RHS variables create fresh nodes.
 - Rewrites execute atomically in one SQLite transaction.
-- `python runtime.py` runs a built-in example that prints seed/match/rewrite SQL and outputs.

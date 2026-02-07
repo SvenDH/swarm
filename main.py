@@ -9,13 +9,14 @@ from smolagents import CodeAgent, LiteLLMModel
 
 GRAPH_CODE_INSTRUCTIONS = """
 For graph work, import `runtime` and use only:
+- runtime.exec(command)  # default graph
 - runtime.exec(graph_id, command)
 
 DSL command format:
 - object DSL:
-  x, y, z, u, v = runtime.Var.many("x y z u v")
-  runtime.select((x, x, y), (y, z, u)).where(x.kind == "person", runtime.Edge(1).weight >= 0.5)
-  runtime.select((x, x, y), (y, z, u)).update(
+  x, y, z, u, v = runtime.vars("x y z u v")
+  runtime.match((x, x, y), (y, z, u)).where(x.kind == "person", runtime.Edge(1).weight >= 0.5)
+  runtime.match((x, x, y), (y, z, u)).rewrite(
       [(x, v, u), (y, v, z), (v, v, u)],
       mode="all",
       limit=100,
@@ -23,15 +24,17 @@ DSL command format:
 
 Examples:
 - seed graph data (empty LHS):
-  runtime.exec("demo", runtime.update(
-      [runtime.Term("a", "a", "b"), runtime.Term("b", "c", "d"), runtime.Term("a", "b", "c", rel="friend")]
-  ))
+  runtime.exec("demo", runtime.rewrite(to=[
+      runtime.edge("a", "a", "b"),
+      runtime.edge("b", "c", "d"),
+      runtime.edge("a", "b", "c", rel="friend"),
+  ]))
 - run query:
-  x, y, z, u = runtime.Var.many("x y z u")
-  runtime.exec("demo", runtime.select((x, x, y), (y, z, u)))
+  x, y, z, u = runtime.vars("x y z u")
+  runtime.exec("demo", runtime.match((x, x, y), (y, z, u)))
 - run rewrite:
-  x, y, z, u, v = runtime.Var.many("x y z u v")
-  runtime.exec("demo", runtime.select((x, x, y), (y, z, u)).update(
+  x, y, z, u, v = runtime.vars("x y z u v")
+  runtime.exec("demo", runtime.match((x, x, y), (y, z, u)).rewrite(
       [(x, v, u), (y, v, z), (v, v, u)],
       mode="all",
       limit=100,
@@ -40,7 +43,17 @@ Examples:
 Rules:
 - Use hyperedges (not binary-only edges).
 - In patterns, strings/Var are variables. Use runtime.Const("node_id") for literal node ids.
-- Node property filters (like x.kind == "person") read unary node-meta edges: runtime.Term("node_id", rel="__node__", data={...}).
+- Node property filters (like x.kind == "person") read unary node-meta edges: runtime.node("node_id", kind="person").
+- General modeling recipe:
+  - Put structural links in edges: runtime.edge(src, dst, rel="...").
+  - Put node attributes in unary node edges: runtime.node(id, ...).
+  - Put edge attributes in edge properties: runtime.edge(..., weight=..., confidence=...).
+- Common graph conventions:
+  - KG: runtime.edge(head, tail, rel="predicate"), runtime.node(entity, label="Type")
+  - Bayesian: runtime.edge(parent, child, rel="parent"), runtime.node(var, kind="bayes", states=[...], cpt={...})
+  - Causal: runtime.edge(cause, effect, rel="causes", strength=..., sign=...)
+  - AST/program graph: runtime.edge(parent, child, rel="child", slot="body", idx=0), runtime.node(n, kind="ast", type="If")
+  - Factor/hypergraph: runtime.edge(v1, v2, v3, rel="factor", fn="phi_name")
 """
 
 

@@ -2,6 +2,7 @@ from __future__ import annotations
 import json
 import sqlite3
 import uuid
+import warnings
 from dataclasses import dataclass, replace
 from typing import Any
 
@@ -103,13 +104,18 @@ class Command:
         return replace(self, where_clauses=self.where_clauses + tuple(predicates))
     
     def update(self, rhs: list[Any] | tuple[Any, ...], *, mode: str = "first", limit: int | None = None) -> Command:
-        # Rewrite is expressed as Match(lhs).update(rhs,...).
+        # Back-compat alias; prefer rewrite().
         return replace(
             self,
             rhs=tuple(rhs),
             mode=str(mode),
             rewrite_limit=None if limit is None else int(limit),
         )
+
+    def rewrite(self, *rhs: Any, mode: str = "first", limit: int | None = None) -> Command:
+        # Friendlier alias: match(...).rewrite(term1, term2, ...)
+        terms = rhs[0] if len(rhs) == 1 and isinstance(rhs[0], (list, tuple)) else rhs
+        return self.update(tuple(terms), mode=mode, limit=limit)
 
 class _Engine:
     def __init__(self, db_path: str = "graphs.db") -> None:
@@ -139,8 +145,8 @@ class _Engine:
 
     def _match(self, graph_id: str, command: Command) -> list[dict[str, Any]]:
         mode = command.mode.lower()
-        if mode not in {"first", "random"}:
-            raise ValueError("match mode must be 'first' or 'random'")
+        if mode not in {"first", "all", "random"}:
+            raise ValueError("match mode must be 'first', 'all', or 'random'")
         qlimit = 1 if mode == "random" else command.limit
         lhs = [_as_term(t, pattern=True) for t in command.lhs]
         filters = [_as_pred(pred) for pred in command.where_clauses]
@@ -404,7 +410,7 @@ def _as_pred(item: Any) -> dict[str, Any]:
     return pred
 
 
-def select(
+def match(
     *lhs: Any,
     where: tuple[Any, ...] | list[Any] | None = None,
     limit: int = 100,
@@ -414,16 +420,76 @@ def select(
         lhs=tuple(lhs),
         where_clauses=tuple(where or ()),
         limit=int(limit),
-        mode=str(mode),
+        mode=str(mode).lower(),
     )
 
 
+def rewrite(
+    *lhs: Any,
+    to: list[Any] | tuple[Any, ...],
+    where: tuple[Any, ...] | list[Any] | None = None,
+    mode: str = "first",
+    limit: int = 100,
+) -> Command:
+    return match(*lhs, where=where).rewrite(to, mode=mode, limit=limit)
+
+
+def select(
+    *lhs: Any,
+    where: tuple[Any, ...] | list[Any] | None = None,
+    limit: int = 100,
+    mode: str = "first",
+) -> Command:
+    warnings.warn("runtime.select(...) is deprecated; use runtime.match(...)", DeprecationWarning, stacklevel=2)
+    return match(*lhs, where=where, limit=limit, mode=mode)
+
+
 def update(rhs: list[Any] | tuple[Any, ...], **kwargs: Any) -> Command:
-    return select().update(rhs, **kwargs)
+    warnings.warn("runtime.update(...) is deprecated; use runtime.rewrite(to=...)", DeprecationWarning, stacklevel=2)
+    return rewrite(to=rhs, **kwargs)
+
+
+def vars(names: str | list[str] | tuple[str, ...]) -> tuple[Var, ...]:
+    return Var.many(names)
+
+
+def edge(*nodes: Any, rel: str = "_", data: dict[str, Any] | None = None, **props: Any) -> Term:
+    payload = dict(data or {})
+    payload.update(props)
+    return Term(*nodes, rel=rel, data=payload or None)
+
+
+def node(node_id: Any, data: dict[str, Any] | None = None, **props: Any) -> Term:
+    payload = dict(data or {})
+    payload.update(props)
+    return Term(node_id, rel="__node__", data=payload or None)
+
+
+__all__ = [
+    "Pred",
+    "Field",
+    "Var",
+    "Edge",
+    "Const",
+    "Term",
+    "Command",
+    "match",
+    "rewrite",
+    "vars",
+    "edge",
+    "node",
+    "exec",
+]
 
 
 _ENGINE = _Engine()
 
 
-def exec(graph_id: str, command: Command) -> list[dict[str, Any]]:  # noqa: A001
-    return _ENGINE.run(graph_id, command)
+def exec(graph_or_command: str | Command, command: Command | None = None) -> list[dict[str, Any]]:  # noqa: A001
+    if command is None:
+        if not isinstance(graph_or_command, Command):
+            raise TypeError("exec(command) or exec(graph_id, command)")
+        return _ENGINE.run("default", graph_or_command)
+    if not isinstance(graph_or_command, str):
+        raise TypeError("graph_id must be a string")
+    return _ENGINE.run(graph_or_command, command)

@@ -16,20 +16,20 @@ def build_seed_terms(pairs: int) -> list[runtime.Term]:
     terms: list[runtime.Term] = []
     for i in range(pairs):
         a, b, c, d = f"a{i}", f"b{i}", f"c{i}", f"d{i}"
-        terms.append(runtime.Term(a, a, b, data={"tag": "lhs"}))
-        terms.append(runtime.Term(b, c, d, rel="r2", data={"tag": "rhs"}))
+        terms.append(runtime.edge(a, a, b, tag="lhs"))
+        terms.append(runtime.edge(b, c, d, rel="r2", tag="rhs"))
     return terms
 
 
 def seed(engine: runtime._Engine, graph_id: str, pairs: int) -> float:
     t0 = time.perf_counter()
-    engine.run(graph_id, runtime.update(build_seed_terms(pairs)))
+    engine.run(graph_id, runtime.rewrite(to=build_seed_terms(pairs)))
     return time.perf_counter() - t0
 
 
 def bench_match(engine: runtime._Engine, graph_id: str, pairs: int, runs: int) -> dict[str, float]:
-    x, y, z, u = runtime.Var.many("x y z u")
-    cmd = runtime.select((x, x, y), ("r2", (y, z, u)), limit=pairs)
+    x, y, z, u = runtime.vars("x y z u")
+    cmd = runtime.match((x, x, y), ("r2", (y, z, u)), limit=pairs)
 
     # Warmup
     for _ in range(3):
@@ -51,8 +51,8 @@ def bench_match(engine: runtime._Engine, graph_id: str, pairs: int, runs: int) -
 
 
 def bench_rewrite(engine: runtime._Engine, pairs: int, runs: int) -> dict[str, float]:
-    x, y, z, u, v = runtime.Var.many("x y z u v")
-    cmd = runtime.select((x, x, y), ("r2", (y, z, u))).update(
+    x, y, z, u, v = runtime.vars("x y z u v")
+    cmd = runtime.match((x, x, y), ("r2", (y, z, u))).rewrite(
         [(x, v, u), (y, v, z), (v, v, u)],
         mode="all",
         limit=max(10, pairs * 4),
