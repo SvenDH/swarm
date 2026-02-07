@@ -121,12 +121,6 @@ class _Engine:
         self.db.execute("PRAGMA temp_store = MEMORY")
         self.db.executescript(
             """
-            CREATE TABLE IF NOT EXISTS nodes(
-                graph_id TEXT NOT NULL,
-                id TEXT NOT NULL,
-                data TEXT NOT NULL DEFAULT '{}',
-                PRIMARY KEY(graph_id,id)
-            );
             CREATE TABLE IF NOT EXISTS hyperedges(
                 edge_id INTEGER PRIMARY KEY AUTOINCREMENT,
                 graph_id TEXT NOT NULL,
@@ -257,10 +251,14 @@ class _Engine:
                 ref = str(pred["ref"])
                 if ref not in var_col:
                     raise ValueError(f"unknown node variable in filter: {ref}")
-                clause, values = self._filter_clause("n.data", pred)
+                clause, values = self._filter_clause("np.data", pred)
                 where.append(
-                    "EXISTS (SELECT 1 FROM nodes n "
-                    f"WHERE n.graph_id = h1.graph_id AND n.id = {var_col[ref]} AND {clause})"
+                    "EXISTS (SELECT 1 FROM hyperedges np "
+                    f"WHERE np.graph_id = h1.graph_id "
+                    "AND np.relation = '__node__' "
+                    "AND json_array_length(np.nodes_json)=1 "
+                    f"AND json_extract(np.nodes_json, '$[0]') = {var_col[ref]} "
+                    f"AND {clause})"
                 )
                 where_params.extend(values)
                 continue
@@ -309,7 +307,6 @@ class _Engine:
 
     def _emit_terms(self, graph_id: str, terms: list[dict[str, Any]], env: dict[str, str]) -> dict[str, Any]:
         resolved_terms: list[tuple[str, list[str], dict[str, Any]]] = []
-        all_node_ids: list[str] = []
         for term in terms:
             node_ids: list[str] = []
             for tok in term["nodes"]:
@@ -321,9 +318,6 @@ class _Engine:
                     env[name] = f"n_{uuid.uuid4().hex[:12]}"
                 node_ids.append(env[name])
             resolved_terms.append((term["relation"], node_ids, term["data"]))
-            all_node_ids.extend(node_ids)
-
-        self._ensure_nodes(graph_id, all_node_ids)
         edge_ids = [self._insert_edge(graph_id, relation, node_ids, data) for relation, node_ids, data in resolved_terms]
 
         if not edge_ids:
@@ -371,11 +365,6 @@ class _Engine:
         if row is None:
             raise RuntimeError("failed to resolve edge id after upsert")
         return int(row["edge_id"])
-
-    def _ensure_nodes(self, graph_id: str, node_ids: list[str]) -> None:
-        unique = list(dict.fromkeys(node_ids))
-        if unique:
-            self.db.executemany("INSERT OR IGNORE INTO nodes(graph_id,id,data) VALUES (?,?,'{}')", [(graph_id, node_id) for node_id in unique])
 
 
 def _as_term(raw: Any, pattern: bool) -> dict[str, Any]:

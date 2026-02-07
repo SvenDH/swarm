@@ -131,11 +131,10 @@ class RuntimeTests(unittest.TestCase):
     def test_node_property_filter(self) -> None:
         x, y, z, u = runtime.Var.many("x y z u")
         self._seed_two_terms()
-        self.engine.db.execute(
-            "UPDATE nodes SET data = ? WHERE graph_id = ? AND id = ?",
-            ('{"kind":"entity"}', self.gid, "a"),
+        self.engine.run(
+            self.gid,
+            runtime.update([runtime.Term("a", rel="__node__", data={"kind": "entity"})]),
         )
-        self.engine.db.commit()
 
         cmd = runtime.select((x, x, y), ("r2", (y, z, u))).where(x.kind == "entity")
         out = self.engine.run(self.gid, cmd)

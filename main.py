@@ -40,6 +40,7 @@ Examples:
 Rules:
 - Use hyperedges (not binary-only edges).
 - In patterns, strings/Var are variables. Use runtime.Const("node_id") for literal node ids.
+- Node property filters (like x.kind == "person") read unary node-meta edges: runtime.Term("node_id", rel="__node__", data={...}).
 """
 
 
