@@ -446,6 +446,71 @@ expanded = runtime.exec(
 Optional dependencies:
 - `pip install pandas numpy matplotlib`
 
+## Agent Hierarchy Example
+
+Create an entry agent controlling `N x N` agents, where each of those controls `M x M` agents.
+Each layer has 4-neighbor lateral communication and every agent has its own interpreter node
+that shares one single graph node.
+
+The hierarchy creates one context node and one memory-graph node per agent.
+Parent/child structure is enforced by spawn budgets (`max_children` on each agent).
+
+Context-level auto-routing channels:
+- `commands_down_ctx`: parent-context -> child-context
+- `answers_up_ctx`: child-context -> parent-context
+- `answers_lateral_ctx`: neighbor-context -> neighbor-context
+- `publishes_to_graph`: context -> shared graph node
+- `consults_memory`: context -> local memory graph
+- `writes_memory`: context -> local memory graph
+
+ACL edges (user/group based):
+- Bootstrap ACL terms: `acl.terms(namespace, name, layer=..., context=..., memory=..., graph=...)`
+- Wrapper: `acl.client(name).ns(namespace)` with `exec/allow/deny/join/leave` (build commands with `runtime`)
+- Check access: `w.can(...)` from wrapper or `acl.check(subject, ...)`
+
+```bash
+.venv/bin/python hierarchy.py --n 3 --m 2 --namespace agents --db-path agent_hierarchy.db
+```
+
+Programmatic usage:
+
+```python
+from hierarchy import create_agent_hierarchy, route_messages_once, spawn_agent
+import acl
+import runtime
+
+summary = create_agent_hierarchy(3, 2, namespace="agents", root_budget=12, child_budget=6)
+print(summary)
+root = summary["root_agent"]
+
+# dynamic spawn by parent, budget-checked
+extra = spawn_agent(root, None, namespace="agents", max_children=2)
+print(extra)
+
+g = runtime.ns("agents")
+x = runtime.vars("x")[0]
+l1 = runtime.exec(g.match(g.node(x), limit=1).where(x.kind == "agent", x.layer == 1))[0]["bindings"]["x"]
+l2 = runtime.exec(g.match(g.node(x), limit=1).where(x.kind == "agent", x.layer == 2, x.parent == l1))[0]["bindings"]["x"]
+runtime.exec(g.rewrite(to=[
+    g.edge(f"ctx:{l2}", "msg:1", rel="out_answer", topic="status"),
+    g.edge(f"ctx:{l1}", "msg:2", rel="out_command", task="delegate"),
+    g.edge(f"ctx:{l2}", "msg:3", rel="out_graph", kind="log"),
+]))
+print(route_messages_once("agents"))
+
+# ACL check (direct + group inherited)
+print(acl.client(root).ns("agents").can(action="read"))
+
+# ACL wrapper around runtime with access checks
+w = acl.client(root).ns("agents")
+print(w.exec(g.match(g.node(x), limit=1).where(x.kind == "agent")))
+```
+
+Routing conventions:
+- outbound: `out_answer`, `out_command`, `out_graph`
+- delivered: `in_answer`, `in_command`, `in_graph`
+- memory writes: `memory_item(memory_graph, message)`
+
 ## Notes
 
 - `match(...).where(...)` is chainable.

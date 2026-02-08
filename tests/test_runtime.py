@@ -5,6 +5,7 @@ import os
 import tempfile
 import unittest
 
+import acl
 import runtime
 
 
@@ -22,6 +23,9 @@ class RuntimeTests(unittest.TestCase):
         for extra in glob.glob(f"{self.db_path}*"):
             if os.path.exists(extra):
                 os.remove(extra)
+
+    def test_runtime_exec_removed(self) -> None:
+        self.assertFalse(hasattr(runtime, "exec"))
 
     def _seed_two_terms(self) -> None:
         self.engine.run(
@@ -229,6 +233,140 @@ class RuntimeTests(unittest.TestCase):
         out = self.engine.run(cmd)
         self.assertEqual(len(out), 1)
 
+    def test_permission_options_on_edge(self) -> None:
+        a, b = runtime.vars("a b")
+        self.engine.run(
+            runtime.rewrite(
+                to=[
+                    runtime.edge("agent:1", "ctx:1", rel="can", read=True, write=True),
+                    runtime.edge("agent:1", "mem:1", rel="can", read=True, write=True),
+                ]
+            )
+        )
+
+        can_read = self.engine.run(runtime.match(runtime.edge(a, b, rel="can"), limit=10).where(runtime.on(1).read == True))
+        can_write = self.engine.run(runtime.match(runtime.edge(a, b, rel="can"), limit=10).where(runtime.on(1).write == True))
+        self.assertEqual(len(can_read), 2)
+        self.assertEqual(len(can_write), 2)
+
+    def test_acl_helpers_and_has_permission(self) -> None:
+        terms = acl.terms(
+            "gacl",
+            "agent:alice",
+            layer=2,
+            context="ctx:agent:alice",
+            memory="mem:agent:alice",
+            graph="graph:gacl:shared",
+        )
+        ids = {n for t in terms for n in t.get("nodes", ())}
+        self.assertIn("user:agent:alice", ids)
+        self.assertIn("group:gacl:all", ids)
+        self.assertIn("group:gacl:layer:2", ids)
+        self.assertTrue(any(t["relation"] == "member_of" for t in terms))
+        self.assertTrue(any(t["relation"] == "uses_identity" for t in terms))
+        self.engine.run(runtime.ns("gacl").rewrite(to=terms))
+
+        self.assertTrue(
+            acl.check(
+                "user:agent:alice",
+                "graph:gacl:shared",
+                action="read",
+                namespace="gacl",
+                engine=self.engine,
+            )
+        )
+
+    def test_acl_user_facing_api(self) -> None:
+        g = runtime.ns("aclx")
+        user = "user:agent:bob"
+        group = "group:aclx:layer:1"
+        target = "graph:aclx:shared"
+
+        self.assertEqual(user, "user:agent:bob")
+        self.assertEqual("group:aclx:all", "group:aclx:all")
+        self.assertEqual(group, "group:aclx:layer:1")
+
+        self.engine.run(
+            g.rewrite(
+                to=[
+                    runtime.node(user, kind="user"),
+                    runtime.node(group, kind="group"),
+                    runtime.edge("agent:bob", user, rel="uses_identity"),
+                    runtime.edge(user, group, rel="member_of"),
+                    runtime.edge(group, target, rel="can", read=True, write=False),
+                ]
+            )
+        )
+
+        self.assertTrue(acl.check(user, target, action="read", namespace="aclx", engine=self.engine))
+        self.assertFalse(acl.check(user, target, action="write", namespace="aclx", engine=self.engine))
+        bob = acl.client("agent:bob", engine=self.engine).ns("aclx")
+        self.assertTrue(bob.can(action="read"))
+        self.assertFalse(bob.can(action="write"))
+
+    def test_acl_access_wrapper(self) -> None:
+        g = runtime.ns("aclw")
+        graph = "graph:aclw:shared"
+        self.engine.run(
+            g.rewrite(
+                to=[
+                    runtime.node(graph, kind="shared_graph"),
+                    runtime.edge("user:alice", graph, rel="can", read=True, write=True),
+                ]
+            )
+        )
+
+        w = acl.client("alice", engine=self.engine).ns("aclw")
+        x, y = runtime.vars("x y")
+        out = w.exec(
+            runtime.rewrite(to=[runtime.edge("a", "b", rel="friend")]),
+            runtime.match(runtime.edge(x, y, rel="friend"), limit=1),
+        )
+        self.assertEqual(len(out), 2)
+        self.assertEqual(out[1][0]["bindings"], {"x": "a", "y": "b"})
+
+        w.deny(graph)
+        with self.assertRaises(PermissionError):
+            w.exec(runtime.rewrite(to=[runtime.edge("b", "c", rel="friend")]))
+
+    def test_acl_access_wrapper_temp_always_allowed(self) -> None:
+        g = runtime.ns("aclwt")
+        graph = "graph:aclwt:shared"
+        self.engine.run(g.rewrite(to=[runtime.node(graph, kind="shared_graph")]))
+        w = acl.client("nobody", engine=self.engine).ns("aclwt")
+
+        x, y = runtime.vars("x y")
+        out = w.exec(
+            runtime.rewrite(to=[runtime.edge("t", "u", rel="temp_friend")]),
+            runtime.match(runtime.edge(x, y, rel="temp_friend"), limit=1),
+            temp=True,
+        )
+        self.assertEqual(len(out), 2)
+        self.assertEqual(out[1][0]["bindings"], {"x": "t", "y": "u"})
+
+        persisted = self.engine.run(g.match(g.edge(x, y, rel="temp_friend"), limit=10))
+        self.assertEqual(persisted, [])
+
+    def test_acl_wrap_executes_runtime_commands(self) -> None:
+        g = runtime.ns("aclr")
+        graph = "graph:aclr:shared"
+        self.engine.run(
+            g.rewrite(
+                to=[
+                    runtime.node(graph, kind="shared_graph"),
+                    runtime.edge("user:eva", graph, rel="can", read=True, write=True),
+                ]
+            )
+        )
+        r = acl.client("eva", engine=self.engine).ns("aclr")
+        x, y = runtime.vars("x y")
+        out = r.exec(
+            runtime.rewrite(to=[runtime.edge("p", "q", rel="friend")]),
+            runtime.match(runtime.edge(x, y, rel="friend"), limit=1),
+        )
+        self.assertEqual(len(out), 2)
+        self.assertEqual(out[1][0]["bindings"], {"x": "p", "y": "q"})
+
     def test_execution_ops_arithmetic(self) -> None:
         a, b, out = runtime.vars("a b out")
         self.engine.run(runtime.rewrite(to=[runtime.edge("2", "3", "sum", rel="add")]))
@@ -282,45 +420,57 @@ class RuntimeTests(unittest.TestCase):
 
     def test_module_exec_varargs_runs_atomically(self) -> None:
         x, y = runtime.vars("x y")
-        prev = runtime._ENGINE
-        runtime._ENGINE = self.engine
-        try:
-            out = runtime.exec(
-                runtime.rewrite(to=[runtime.edge("a", "b", rel="friend")]),
-                runtime.match(runtime.edge(x, y, rel="friend")),
+        g = runtime.ns("mexec1")
+        self.engine.run(
+            g.rewrite(
+                to=[
+                    runtime.node("graph:mexec1:shared", kind="shared_graph"),
+                    runtime.edge("user:runner", "graph:mexec1:shared", rel="can", read=True, write=True),
+                ]
             )
-        finally:
-            runtime._ENGINE = prev
+        )
+        w = acl.client("runner", engine=self.engine).ns("mexec1")
+        out = w.exec(
+            runtime.rewrite(to=[runtime.edge("a", "b", rel="friend")]),
+            runtime.match(runtime.edge(x, y, rel="friend")),
+        )
         self.assertEqual(len(out), 2)
         self.assertEqual(out[1][0]["bindings"], {"x": "a", "y": "b"})
 
     def test_module_exec_rejects_mem_argument(self) -> None:
         x, y = runtime.vars("x y")
+        w = acl.client("runner", engine=self.engine).ns("mexec2")
         with self.assertRaises(TypeError):
-            runtime.exec(
+            w.exec(
                 runtime.match(runtime.edge(x, y, rel="friend"), limit=10),
                 mem=[runtime.edge("a", "b", rel="friend")],  # type: ignore[call-arg]
             )
 
     def test_module_exec_accepts_inline_temp_terms(self) -> None:
         x, y = runtime.vars("x y")
-        prev = runtime._ENGINE
-        runtime._ENGINE = self.engine
-        try:
-            out = runtime.exec(
-                runtime.match(runtime.edge(x, y, rel="friend"), limit=10),
-                runtime.edge("a", "b", rel="friend", temp=True),
-                runtime.node("a", kind="person", temp=True),
+        g = runtime.ns("mexec3")
+        self.engine.run(
+            g.rewrite(
+                to=[
+                    runtime.node("graph:mexec3:shared", kind="shared_graph"),
+                    runtime.edge("user:runner", "graph:mexec3:shared", rel="can", read=True, write=True),
+                ]
             )
-        finally:
-            runtime._ENGINE = prev
+        )
+        w = acl.client("runner", engine=self.engine).ns("mexec3")
+        out = w.exec(
+            runtime.match(runtime.edge(x, y, rel="friend"), limit=10),
+            runtime.edge("a", "b", rel="friend", temp=True),
+            runtime.node("a", kind="person", temp=True),
+        )
         self.assertEqual(len(out), 1)
         self.assertEqual(out[0]["bindings"], {"x": "a", "y": "b"})
 
     def test_module_exec_rejects_non_temp_inline_terms(self) -> None:
         x, y = runtime.vars("x y")
+        w = acl.client("runner", engine=self.engine).ns("mexec4")
         with self.assertRaises(TypeError):
-            runtime.exec(runtime.match(runtime.edge(x, y, rel="friend")), runtime.edge("a", "b", rel="friend"))
+            w.exec(runtime.match(runtime.edge(x, y, rel="friend")), runtime.edge("a", "b", rel="friend"))
 
     def test_result_map_and_select_helpers(self) -> None:
         x, y = runtime.vars("x y")
@@ -435,92 +585,87 @@ class RuntimeTests(unittest.TestCase):
 
     def test_temp_exec_persists_within_batch_only(self) -> None:
         pc, nxt, x, y = runtime.vars("pc nxt x y")
-        prev = runtime._ENGINE
-        runtime._ENGINE = self.engine
-        try:
-            out = runtime.exec(
-                runtime.rewrite(
-                    to=[
-                        runtime.edge("m1", "n0", rel="state"),
-                        runtime.edge("n0", "n1", rel="step"),
-                    ]
-                ),
-                runtime.match(
-                    runtime.edge(runtime.const("m1"), pc, rel="state"),
-                    runtime.edge(pc, nxt, rel="step"),
-                ).rewrite([runtime.edge(runtime.const("m1"), nxt, rel="state")]),
-                runtime.match(runtime.edge(x, y, rel="state"), limit=10),
-                temp=True,
-            )
-        finally:
-            runtime._ENGINE = prev
+        w = acl.client("tmp1", engine=self.engine).ns("t1")
+        out = w.exec(
+            runtime.rewrite(
+                to=[
+                    runtime.edge("m1", "n0", rel="state"),
+                    runtime.edge("n0", "n1", rel="step"),
+                ]
+            ),
+            runtime.match(
+                runtime.edge(runtime.const("m1"), pc, rel="state"),
+                runtime.edge(pc, nxt, rel="step"),
+            ).rewrite([runtime.edge(runtime.const("m1"), nxt, rel="state")]),
+            runtime.match(runtime.edge(x, y, rel="state"), limit=10),
+            temp=True,
+        )
         self.assertEqual(len(out), 3)
         self.assertEqual(len(out[2]), 1)
         self.assertEqual(out[2][0]["bindings"], {"x": "m1", "y": "n1"})
 
     def test_temp_exec_is_isolated_from_default_engine(self) -> None:
         x, y = runtime.vars("x y")
-        prev = runtime._ENGINE
-        runtime._ENGINE = self.engine
-        try:
-            in_state = runtime.exec(
-                runtime.rewrite(to=[runtime.edge("a", "b", rel="friend")]),
-                runtime.match(runtime.edge(x, y, rel="friend")),
-                temp=True,
-            )
-            self.assertEqual(len(in_state[1]), 1)
-            in_default = runtime.exec(runtime.match(runtime.edge(x, y, rel="friend")))
-            self.assertEqual(in_default, [])
-        finally:
-            runtime._ENGINE = prev
+        w = acl.client("tmp2", engine=self.engine).ns("t2")
+        in_state = w.exec(
+            runtime.rewrite(to=[runtime.edge("a", "b", rel="friend")]),
+            runtime.match(runtime.edge(x, y, rel="friend")),
+            temp=True,
+        )
+        self.assertEqual(len(in_state[1]), 1)
+        in_default = self.engine.run(runtime.ns("t2").match(runtime.edge(x, y, rel="friend")))
+        self.assertEqual(in_default, [])
 
     def test_temp_exec_reads_default_graph_but_rolls_back_writes(self) -> None:
         x, y = runtime.vars("x y")
-        prev = runtime._ENGINE
-        runtime._ENGINE = self.engine
-        try:
-            runtime.exec(runtime.rewrite(to=[runtime.edge("a", "b", rel="friend")]))
-            seen = runtime.exec(runtime.match(runtime.edge(x, y, rel="friend")), temp=True)
-            self.assertEqual(len(seen), 1)
-            self.assertEqual(seen[0]["bindings"], {"x": "a", "y": "b"})
-
-            runtime.exec(
-                runtime.match(runtime.edge(x, y, rel="friend")).rewrite([runtime.edge(x, y, rel="friend2")]),
-                temp=True,
+        g = runtime.ns("t3")
+        self.engine.run(
+            g.rewrite(
+                to=[
+                    runtime.node("graph:t3:shared", kind="shared_graph"),
+                    runtime.edge("user:tmp3", "graph:t3:shared", rel="can", read=True, write=True),
+                ]
             )
-            persisted = runtime.exec(runtime.match(runtime.edge(x, y, rel="friend2")))
-            self.assertEqual(persisted, [])
-        finally:
-            runtime._ENGINE = prev
+        )
+        w = acl.client("tmp3", engine=self.engine).ns("t3")
+        w.exec(runtime.rewrite(to=[runtime.edge("a", "b", rel="friend")]))
+        seen = w.exec(runtime.match(runtime.edge(x, y, rel="friend")), temp=True)
+        self.assertEqual(len(seen), 1)
+        self.assertEqual(seen[0]["bindings"], {"x": "a", "y": "b"})
+
+        w.exec(
+            runtime.match(runtime.edge(x, y, rel="friend")).rewrite([runtime.edge(x, y, rel="friend2")]),
+            temp=True,
+        )
+        persisted = w.exec(runtime.match(runtime.edge(x, y, rel="friend2")))
+        self.assertEqual(persisted, [])
 
     def test_temp_exec_complex_program_tree_leaves_no_traces(self) -> None:
         pc, nxt, alt, flag, a, b, outv, av, bv, rv = runtime.vars("pc nxt alt flag a b outv av bv rv")
-        prev = runtime._ENGINE
-        runtime._ENGINE = self.engine
-        try:
-            out = runtime.exec(
-                # Program + AST + constants.
-                runtime.rewrite(
-                    to=[
-                        runtime.edge("vm", "pc0", rel="state"),
-                        runtime.edge("pc0", "pc1", "c2", "c3", "t1", rel="add_instr"),
-                        runtime.edge("pc1", "pc_then", "pc_else", "f0", rel="branch_instr"),
-                        runtime.edge("f0", "true", rel="flag"),
-                        runtime.edge("pc_then", "pc_join", "t1", "c4", "t2", rel="mul_instr"),
-                        runtime.edge("pc_else", "pc_join", "t1", "c1", "t2", rel="sub_instr"),
-                        runtime.edge("pc_join", "pc_out", rel="jump_instr"),
-                        runtime.edge("pc_out", "pc_done", "t2", "result", rel="copy_instr"),
-                        # Program tree (AST-like) structure for richer control flow.
-                        runtime.edge("if0", "f0", "then0", "else0", rel="ast_if"),
-                        runtime.edge("then0", "t1", "c4", "t2", rel="ast_mul"),
-                        runtime.edge("else0", "t1", "c1", "t2", rel="ast_sub"),
-                        runtime.edge("out0", "t2", "result", rel="ast_copy"),
-                        runtime.edge("c1", "1", rel="value"),
-                        runtime.edge("c2", "2", rel="value"),
-                        runtime.edge("c3", "3", rel="value"),
-                        runtime.edge("c4", "4", rel="value"),
-                    ]
-                ),
+        w = acl.client("tmp4", engine=self.engine).ns("t4")
+        out = w.exec(
+            # Program + AST + constants.
+            runtime.rewrite(
+                to=[
+                    runtime.edge("vm", "pc0", rel="state"),
+                    runtime.edge("pc0", "pc1", "c2", "c3", "t1", rel="add_instr"),
+                    runtime.edge("pc1", "pc_then", "pc_else", "f0", rel="branch_instr"),
+                    runtime.edge("f0", "true", rel="flag"),
+                    runtime.edge("pc_then", "pc_join", "t1", "c4", "t2", rel="mul_instr"),
+                    runtime.edge("pc_else", "pc_join", "t1", "c1", "t2", rel="sub_instr"),
+                    runtime.edge("pc_join", "pc_out", rel="jump_instr"),
+                    runtime.edge("pc_out", "pc_done", "t2", "result", rel="copy_instr"),
+                    # Program tree (AST-like) structure for richer control flow.
+                    runtime.edge("if0", "f0", "then0", "else0", rel="ast_if"),
+                    runtime.edge("then0", "t1", "c4", "t2", rel="ast_mul"),
+                    runtime.edge("else0", "t1", "c1", "t2", rel="ast_sub"),
+                    runtime.edge("out0", "t2", "result", rel="ast_copy"),
+                    runtime.edge("c1", "1", rel="value"),
+                    runtime.edge("c2", "2", rel="value"),
+                    runtime.edge("c3", "3", rel="value"),
+                    runtime.edge("c4", "4", rel="value"),
+                ]
+            ),
                 # Step 1: entry arithmetic.
                 runtime.match(
                     runtime.edge("vm", pc, rel="state"),
@@ -602,8 +747,6 @@ class RuntimeTests(unittest.TestCase):
                 runtime.match(runtime.edge(runtime.const("result"), rv, rel="value"), limit=1),
                 temp=True,
             )
-        finally:
-            runtime._ENGINE = prev
 
         self.assertEqual(len(out), 9)
         self.assertEqual(len(out[1]), 1)  # add
