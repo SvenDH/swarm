@@ -36,7 +36,7 @@ class RuntimeTests(unittest.TestCase):
     def test_match_order_is_deterministic(self) -> None:
         x, y, z, u = runtime.vars("x y z u")
         self._seed_two_terms()
-        cmd = runtime.match((x, x, y), ("r2", (y, z, u)))
+        cmd = runtime.match(runtime.edge(x, x, y), runtime.edge(y, z, u, rel="r2"))
 
         out1 = self.engine.run(cmd)
         out2 = self.engine.run(cmd)
@@ -52,8 +52,8 @@ class RuntimeTests(unittest.TestCase):
         self._seed_two_terms()
 
         out = self.engine.run(
-            runtime.match((x, x, y), ("r2", (y, z, u))).rewrite(
-                [(x, v, u), (y, v, z), (v, v, u)],
+            runtime.match(runtime.edge(x, x, y), runtime.edge(y, z, u, rel="r2")).rewrite(
+                [runtime.edge(x, v, u), runtime.edge(y, v, z), runtime.edge(v, v, u)],
             ),
         )
 
@@ -71,14 +71,14 @@ class RuntimeTests(unittest.TestCase):
         x, y, z, u = runtime.vars("x y z u")
         self._seed_two_terms()
         out = self.engine.run(
-            runtime.match((x, x, y), ("r2", (y, z, u))).rewrite(
-            [(x, x, y), ("r2", (y, z, u))],
+            runtime.match(runtime.edge(x, x, y), runtime.edge(y, z, u, rel="r2")).rewrite(
+            [runtime.edge(x, x, y), runtime.edge(y, z, u, rel="r2")],
             limit=2,
         )
         )
         self.assertEqual(len(out), 2)
 
-        after = self.engine.run(runtime.match((x, x, y), ("r2", (y, z, u))))
+        after = self.engine.run(runtime.match(runtime.edge(x, x, y), runtime.edge(y, z, u, rel="r2")))
         self.assertEqual(len(after), 1)
 
     def test_rewrite_all_overlapping_matches(self) -> None:
@@ -96,7 +96,7 @@ class RuntimeTests(unittest.TestCase):
             ),
         )
 
-        cmd = runtime.match((x, x, y), ("r2", (y, z, u))).rewrite(
+        cmd = runtime.match(runtime.edge(x, x, y), runtime.edge(y, z, u, rel="r2")).rewrite(
             [runtime.edge(x, z, u, rel="out")],
             limit=10,
         )
@@ -105,14 +105,14 @@ class RuntimeTests(unittest.TestCase):
         # Only one rewrite step can run because both initial matches overlap on (a,a,b).
         self.assertEqual(len(out), 1)
 
-        remaining = self.engine.run(runtime.match((x, x, y), ("r2", (y, z, u))))
+        remaining = self.engine.run(runtime.match(runtime.edge(x, x, y), runtime.edge(y, z, u, rel="r2")))
         self.assertEqual(len(remaining), 0)
 
     def test_edge_filters_track_original_term_positions(self) -> None:
         x, y, z, u = runtime.vars("x y z u")
         self._seed_two_terms()
 
-        cmd = runtime.match((x, x, y), ("r2", (y, z, u))).where(
+        cmd = runtime.match(runtime.edge(x, x, y), runtime.edge(y, z, u, rel="r2")).where(
             runtime.Edge(1).tag == "lhs",
             runtime.Edge(2).tag == "rhs",
         )
@@ -124,7 +124,7 @@ class RuntimeTests(unittest.TestCase):
         self._seed_two_terms()
         self.engine.run(runtime.rewrite(to=[runtime.node("a", kind="entity")]))
 
-        cmd = runtime.match((x, x, y), ("r2", (y, z, u))).where(x.kind == "entity")
+        cmd = runtime.match(runtime.edge(x, x, y), runtime.edge(y, z, u, rel="r2")).where(x.kind == "entity")
         out = self.engine.run(cmd)
         self.assertEqual(len(out), 1)
 
@@ -137,7 +137,7 @@ class RuntimeTests(unittest.TestCase):
             seed_terms.append(runtime.edge(b, c, d, rel="r2"))
         self.engine.run(runtime.rewrite(to=seed_terms))
 
-        out = self.engine.run(runtime.match((x, x, y), ("r2", (y, z, u)), limit=8, random=True))
+        out = self.engine.run(runtime.match(runtime.edge(x, x, y), runtime.edge(y, z, u, rel="r2"), limit=8, random=True))
         self.assertEqual(len(out), 8)
 
     def test_all_mode_returns_multiple_matches(self) -> None:
@@ -149,20 +149,30 @@ class RuntimeTests(unittest.TestCase):
             seed_terms.append(runtime.edge(b, c, d, rel="r2"))
         self.engine.run(runtime.rewrite(to=seed_terms))
 
-        out = self.engine.run(runtime.match((x, x, y), ("r2", (y, z, u)), limit=4))
+        out = self.engine.run(runtime.match(runtime.edge(x, x, y), runtime.edge(y, z, u, rel="r2"), limit=4))
         self.assertEqual(len(out), 4)
+
+    def test_default_limit_returns_all_matches(self) -> None:
+        x, y, z, u = runtime.vars("x y z u")
+        seed_terms = []
+        for i in range(5):
+            a, b, c, d = f"a{i}", f"b{i}", f"c{i}", f"d{i}"
+            seed_terms.append(runtime.edge(a, a, b))
+            seed_terms.append(runtime.edge(b, c, d, rel="r2"))
+        self.engine.run(runtime.rewrite(to=seed_terms))
+
+        out = self.engine.run(runtime.match(runtime.edge(x, x, y), runtime.edge(y, z, u, rel="r2")))
+        self.assertEqual(len(out), 5)
 
     def test_namespace_match_isolated(self) -> None:
         x, y, z, u = runtime.vars("x y z u")
         g1, g2 = runtime.ns("g1"), runtime.ns("g2")
         self.engine.run(
-            [
-                g1.rewrite(to=[g1.edge("a", "a", "b"), g1.edge("b", "c", "d", rel="r2")]),
-                g2.rewrite(to=[g2.edge("a", "a", "b"), g2.edge("b", "c", "d", rel="r2")]),
-            ]
+            g1.rewrite(to=[g1.edge("a", "a", "b"), g1.edge("b", "c", "d", rel="r2")]),
+            g2.rewrite(to=[g2.edge("a", "a", "b"), g2.edge("b", "c", "d", rel="r2")]),
         )
 
-        out = self.engine.run(g1.match((x, x, y), ("r2", (y, z, u)), limit=10))
+        out = self.engine.run(g1.match(g1.edge(x, x, y), g1.edge(y, z, u, rel="r2"), limit=10))
         self.assertEqual(len(out), 1)
         self.assertEqual(out[0]["bindings"], {"u": "d", "x": "a", "y": "b", "z": "c"})
 
@@ -171,7 +181,7 @@ class RuntimeTests(unittest.TestCase):
         g1 = runtime.ns("g1")
         self.engine.run(g1.rewrite(to=[g1.edge("a", "a", "b"), g1.edge("b", "c", "d", rel="r2")]))
 
-        out = self.engine.run(g1.match((x, x, y), ("r2", (y, z, u))).rewrite([(x, v, u)]))
+        out = self.engine.run(g1.match(g1.edge(x, x, y), g1.edge(y, z, u, rel="r2")).rewrite([runtime.edge(x, v, u)]))
         self.assertEqual(len(out), 1)
         self.assertIn("v", out[0]["bindings"])
         self.assertTrue(out[0]["bindings"]["v"].startswith("n_"))
@@ -181,7 +191,7 @@ class RuntimeTests(unittest.TestCase):
         g1 = runtime.ns("g1")
         self.engine.run(g1.rewrite(to=[g1.edge("a", "a", "b"), g1.edge("b", "c", "d", rel="r2")]))
 
-        out = self.engine.run(g1.match((x, x, y), ("r2", (y, z, u))))
+        out = self.engine.run(g1.match(g1.edge(x, x, y), g1.edge(y, z, u, rel="r2")))
         self.assertEqual(len(out), 1)
         self.assertEqual(out[0]["bindings"], {"u": "d", "x": "a", "y": "b", "z": "c"})
 
@@ -198,11 +208,11 @@ class RuntimeTests(unittest.TestCase):
             )
         )
 
-        out = self.engine.run(g1.match((x, x, y), ("r2", (y, z, u))).where(runtime.on(1).tag == "lhs", x.kind == "entity"))
+        out = self.engine.run(g1.match(g1.edge(x, x, y), g1.edge(y, z, u, rel="r2")).where(runtime.on(1).tag == "lhs", x.kind == "entity"))
         self.assertEqual(len(out), 1)
         self.assertEqual(out[0]["bindings"], {"u": "d", "x": "a", "y": "b", "z": "c"})
 
-        out2 = self.engine.run(g1.match(("r2", (runtime.const("b"), z, u)), limit=10))
+        out2 = self.engine.run(g1.match(g1.edge(runtime.const("b"), z, u, rel="r2"), limit=10))
         self.assertEqual(len(out2), 1)
         self.assertEqual(out2[0]["bindings"]["z"], "c")
 
@@ -215,7 +225,7 @@ class RuntimeTests(unittest.TestCase):
         self.engine.run(runtime.rewrite(to=[runtime.edge("a", "a", "b"), runtime.edge("b", "c", "d", rel="r2")]))
         self.engine.run(runtime.rewrite(to=[runtime.node("a", kind="entity")]))
 
-        cmd = runtime.match((x, x, y), ("r2", (y, z, u))).where(x.kind == "entity")
+        cmd = runtime.match(runtime.edge(x, x, y), runtime.edge(y, z, u, rel="r2")).where(x.kind == "entity")
         out = self.engine.run(cmd)
         self.assertEqual(len(out), 1)
 
@@ -224,7 +234,7 @@ class RuntimeTests(unittest.TestCase):
         self.engine.run(runtime.rewrite(to=[runtime.edge("2", "3", "sum", rel="add")]))
 
         step = self.engine.run(
-            runtime.match(("add", (a, b, out))).rewrite(
+            runtime.match(runtime.edge(a, b, out, rel="add")).rewrite(
                 [runtime.node(out, value=a + b, diff=a - b, prod=a * b, quo=b // a)],
             )
         )
@@ -240,7 +250,7 @@ class RuntimeTests(unittest.TestCase):
         self.engine.run(runtime.rewrite(to=[runtime.edge(" Hello ", "world", "msg", rel="concat")]))
 
         step = self.engine.run(
-            runtime.match(("concat", (a, b, out))).rewrite(
+            runtime.match(runtime.edge(a, b, out, rel="concat")).rewrite(
                 [runtime.node(out, text=a.strip().concat("-", b.upper()), n=a.concat(b).strlen())],
             )
         )
@@ -252,7 +262,8 @@ class RuntimeTests(unittest.TestCase):
     def test_run_many_commits_all_commands(self) -> None:
         x, y = runtime.vars("x y")
         out = self.engine.run(
-            [runtime.rewrite(to=[runtime.edge("a", "b", rel="friend")]), runtime.match(("friend", (x, y)))]
+            runtime.rewrite(to=[runtime.edge("a", "b", rel="friend")]),
+            runtime.match(runtime.edge(x, y, rel="friend")),
         )
         self.assertEqual(len(out), 2)
         self.assertEqual(len(out[1]), 1)
@@ -262,13 +273,11 @@ class RuntimeTests(unittest.TestCase):
         x, y = runtime.vars("x y")
         with self.assertRaises(ValueError):
             self.engine.run(
-                [
-                    runtime.rewrite(to=[runtime.edge("a", "b", rel="friend")]),
-                    runtime.match(("friend", (x, y))).rewrite([(x, y)], limit=0),
-                ]
+                runtime.rewrite(to=[runtime.edge("a", "b", rel="friend")]),
+                runtime.match(runtime.edge(x, y, rel="friend")).rewrite([runtime.edge(x, y)], limit=0),
             )
 
-        out = self.engine.run(runtime.match(("friend", (x, y))))
+        out = self.engine.run(runtime.match(runtime.edge(x, y, rel="friend")))
         self.assertEqual(out, [])
 
     def test_module_exec_varargs_runs_atomically(self) -> None:
@@ -278,7 +287,7 @@ class RuntimeTests(unittest.TestCase):
         try:
             out = runtime.exec(
                 runtime.rewrite(to=[runtime.edge("a", "b", rel="friend")]),
-                runtime.match(("friend", (x, y))),
+                runtime.match(runtime.edge(x, y, rel="friend")),
             )
         finally:
             runtime._ENGINE = prev
@@ -289,7 +298,7 @@ class RuntimeTests(unittest.TestCase):
         x, y = runtime.vars("x y")
         with self.assertRaises(TypeError):
             runtime.exec(
-                runtime.match(("friend", (x, y)), limit=10),
+                runtime.match(runtime.edge(x, y, rel="friend"), limit=10),
                 mem=[runtime.edge("a", "b", rel="friend")],  # type: ignore[call-arg]
             )
 
@@ -299,7 +308,7 @@ class RuntimeTests(unittest.TestCase):
         runtime._ENGINE = self.engine
         try:
             out = runtime.exec(
-                runtime.match(("friend", (x, y)), limit=10),
+                runtime.match(runtime.edge(x, y, rel="friend"), limit=10),
                 runtime.edge("a", "b", rel="friend", temp=True),
                 runtime.node("a", kind="person", temp=True),
             )
@@ -311,7 +320,7 @@ class RuntimeTests(unittest.TestCase):
     def test_module_exec_rejects_non_temp_inline_terms(self) -> None:
         x, y = runtime.vars("x y")
         with self.assertRaises(TypeError):
-            runtime.exec(runtime.match(("friend", (x, y))), runtime.edge("a", "b", rel="friend"))
+            runtime.exec(runtime.match(runtime.edge(x, y, rel="friend")), runtime.edge("a", "b", rel="friend"))
 
     def test_result_map_and_select_helpers(self) -> None:
         x, y = runtime.vars("x y")
@@ -323,7 +332,7 @@ class RuntimeTests(unittest.TestCase):
                 ]
             )
         )
-        out = self.engine.run(runtime.match(("friend", (x, y)), limit=10))
+        out = self.engine.run(runtime.match(runtime.edge(x, y, rel="friend"), limit=10))
 
         pairs = out.map(lambda row: (row["bindings"]["x"], row["bindings"]["y"]))
         self.assertIn(("a", "b"), pairs)
@@ -360,7 +369,7 @@ class RuntimeTests(unittest.TestCase):
         )
         q = [1.0, 0.0, 0.0]
         out = self.engine.run(
-            runtime.match(("friend", (x, y)), limit=10).where(
+            runtime.match(runtime.edge(x, y, rel="friend"), limit=10).where(
                 runtime.on(1).embedding.similar(q, min_score=0.8),
                 x.embedding.similar(q, min_score=0.7),
             )
@@ -375,7 +384,7 @@ class RuntimeTests(unittest.TestCase):
         self.engine.run(g2.rewrite(to=[g2.node("a", embedding=[0.0, 1.0]), g2.edge("a", "b", rel="friend", embedding=[0.0, 1.0])]))
         q = [1.0, 0.0]
         out = self.engine.run(
-            g1.match(("friend", (x, y)), limit=10).where(
+            g1.match(g1.edge(x, y, rel="friend"), limit=10).where(
                 runtime.on(1).embedding.similar(q, min_score=0.8),
                 x.embedding.similar(q, min_score=0.8),
             )
@@ -386,7 +395,7 @@ class RuntimeTests(unittest.TestCase):
     def test_in_memory_match_uses_virtual_subgraph(self) -> None:
         x, y = runtime.vars("x y")
         out = self.engine.run(
-            runtime.match(("friend", (x, y)), limit=10).where(
+            runtime.match(runtime.edge(x, y, rel="friend"), limit=10).where(
                 x.kind == "person", runtime.on(1).weight >= 0.8
             ),
             mem=[
@@ -398,15 +407,15 @@ class RuntimeTests(unittest.TestCase):
         self.assertEqual(out[0]["bindings"], {"x": "a", "y": "b"})
 
         # Virtual terms are query-time only.
-        persisted = self.engine.run(runtime.match(("friend", (x, y)), limit=10))
+        persisted = self.engine.run(runtime.match(runtime.edge(x, y, rel="friend"), limit=10))
         self.assertEqual(persisted, [])
 
     def test_in_memory_rewrite_rolls_back_by_default(self) -> None:
         pc, nxt = runtime.vars("pc nxt")
         out = self.engine.run(
             runtime.match(
-                ("state", (runtime.const("m1"), pc)),
-                ("step", (pc, nxt)),
+                runtime.edge(runtime.const("m1"), pc, rel="state"),
+                runtime.edge(pc, nxt, rel="step"),
             ).rewrite(
                 [runtime.edge(runtime.const("m1"), nxt, rel="state")],
             ),
@@ -421,25 +430,30 @@ class RuntimeTests(unittest.TestCase):
 
         # Rewritten result is returned, but graph remains unchanged.
         x, y = runtime.vars("x y")
-        persisted = self.engine.run(runtime.match(("state", (x, y)), limit=10))
+        persisted = self.engine.run(runtime.match(runtime.edge(x, y, rel="state"), limit=10))
         self.assertEqual(persisted, [])
 
     def test_temp_exec_persists_within_batch_only(self) -> None:
         pc, nxt, x, y = runtime.vars("pc nxt x y")
-        out = runtime.exec(
-            runtime.rewrite(
-                to=[
-                    runtime.edge("m1", "n0", rel="state"),
-                    runtime.edge("n0", "n1", rel="step"),
-                ]
-            ),
-            runtime.match(
-                ("state", (runtime.const("m1"), pc)),
-                ("step", (pc, nxt)),
-            ).rewrite([runtime.edge(runtime.const("m1"), nxt, rel="state")]),
-            runtime.match(("state", (x, y)), limit=10),
-            temp=True,
-        )
+        prev = runtime._ENGINE
+        runtime._ENGINE = self.engine
+        try:
+            out = runtime.exec(
+                runtime.rewrite(
+                    to=[
+                        runtime.edge("m1", "n0", rel="state"),
+                        runtime.edge("n0", "n1", rel="step"),
+                    ]
+                ),
+                runtime.match(
+                    runtime.edge(runtime.const("m1"), pc, rel="state"),
+                    runtime.edge(pc, nxt, rel="step"),
+                ).rewrite([runtime.edge(runtime.const("m1"), nxt, rel="state")]),
+                runtime.match(runtime.edge(x, y, rel="state"), limit=10),
+                temp=True,
+            )
+        finally:
+            runtime._ENGINE = prev
         self.assertEqual(len(out), 3)
         self.assertEqual(len(out[2]), 1)
         self.assertEqual(out[2][0]["bindings"], {"x": "m1", "y": "n1"})
@@ -451,12 +465,31 @@ class RuntimeTests(unittest.TestCase):
         try:
             in_state = runtime.exec(
                 runtime.rewrite(to=[runtime.edge("a", "b", rel="friend")]),
-                runtime.match(("friend", (x, y))),
+                runtime.match(runtime.edge(x, y, rel="friend")),
                 temp=True,
             )
             self.assertEqual(len(in_state[1]), 1)
-            in_default = runtime.exec(runtime.match(("friend", (x, y))))
+            in_default = runtime.exec(runtime.match(runtime.edge(x, y, rel="friend")))
             self.assertEqual(in_default, [])
+        finally:
+            runtime._ENGINE = prev
+
+    def test_temp_exec_reads_default_graph_but_rolls_back_writes(self) -> None:
+        x, y = runtime.vars("x y")
+        prev = runtime._ENGINE
+        runtime._ENGINE = self.engine
+        try:
+            runtime.exec(runtime.rewrite(to=[runtime.edge("a", "b", rel="friend")]))
+            seen = runtime.exec(runtime.match(runtime.edge(x, y, rel="friend")), temp=True)
+            self.assertEqual(len(seen), 1)
+            self.assertEqual(seen[0]["bindings"], {"x": "a", "y": "b"})
+
+            runtime.exec(
+                runtime.match(runtime.edge(x, y, rel="friend")).rewrite([runtime.edge(x, y, rel="friend2")]),
+                temp=True,
+            )
+            persisted = runtime.exec(runtime.match(runtime.edge(x, y, rel="friend2")))
+            self.assertEqual(persisted, [])
         finally:
             runtime._ENGINE = prev
 

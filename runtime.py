@@ -98,7 +98,7 @@ class Const(_ExprOps):
 class Command:
     lhs: tuple[Any, ...] = ()
     where_clauses: tuple[Any, ...] = ()
-    limit: int = 100
+    limit: int | None = None
     random: bool = False
     rhs: tuple[Any, ...] | None = None
     namespace: str | None = None
@@ -106,13 +106,14 @@ class Command:
     def where(self, *predicates):
         return replace(self, where_clauses=self.where_clauses + tuple(predicates))
 
-    def rewrite(self, *rhs, random=None, limit=None):
-        terms = rhs[0] if len(rhs) == 1 and isinstance(rhs[0], (list, tuple)) else rhs
+    def rewrite(self, rhs, random=None, limit=None):
+        if not isinstance(rhs, (list, tuple)):
+            raise TypeError("rewrite(rhs) expects a list/tuple of rhs terms")
         return replace(
             self,
-            rhs=tuple(terms),
+            rhs=tuple(rhs),
             random=self.random if random is None else bool(random),
-            limit=self.limit if limit is None else int(limit),
+            limit=self.limit if limit is None else _as_limit(limit),
         )
 
 
@@ -120,22 +121,20 @@ class Command:
 class Namespace:
     name: str
 
-    def __post_init__(self): object.__setattr__(self, "name", _normalize_ns(self.name))
+    def __post_init__(self):
+        object.__setattr__(self, "name", _normalize_ns(self.name))
 
     def edge(self, *nodes, rel="_", embedding=None, data=None, temp=False, **props):
-        return edge(
-            *[n if isinstance(n, (Var, Expr, Const)) else str(n) for n in nodes],
-            rel=rel,
-            embedding=embedding,
-            data=data,
-            temp=temp,
-            **props,
-        )
+        return edge(*nodes, rel=rel, embedding=embedding, data=data, temp=temp, **props)
 
     def node(self, node_id, embedding=None, data=None, temp=False, **props):
-        return node(str(node_id), embedding=embedding, data=data, temp=temp, **props)
-    def match(self, *lhs, limit=100, random=False): return replace(match(*lhs, limit=limit, random=random), namespace=self.name)
-    def rewrite(self, *lhs, to, random=False, limit=100): return self.match(*lhs, limit=limit, random=random).rewrite(to)
+        return node(node_id, embedding=embedding, data=data, temp=temp, **props)
+
+    def match(self, *lhs, limit=None, random=False):
+        return replace(match(*lhs, limit=limit, random=random), namespace=self.name)
+
+    def rewrite(self, *lhs, to, random=False, limit=None):
+        return self.match(*lhs, limit=limit, random=random).rewrite(to)
 
 
 class Result(list[dict[str, Any]]):
@@ -154,7 +153,8 @@ class Result(list[dict[str, Any]]):
             rows.append(dict((edge or {}).get("data") or {}))
         return _project(rows, keys, default)
 
-    def rows(self, *keys, default=None): return _project([dict(r) for r in self], keys, default)
+    def rows(self, *keys, default=None):
+        return _project([dict(r) for r in self], keys, default)
 
 
 class _Engine:
@@ -176,15 +176,19 @@ class _Engine:
                 namespace TEXT NOT NULL DEFAULT '',
                 relation TEXT NOT NULL,
                 nodes_json TEXT NOT NULL,
+                arity INTEGER NOT NULL,
+                node0 TEXT,
+                node1 TEXT,
+                node2 TEXT,
                 data TEXT NOT NULL DEFAULT '{}',
                 embedding TEXT
             );
-            CREATE INDEX IF NOT EXISTS idx_hyper_ns_rel ON hyperedges(namespace, relation);
             CREATE UNIQUE INDEX IF NOT EXISTS uq_hyper_ns ON hyperedges(namespace, relation, nodes_json);
+            CREATE INDEX IF NOT EXISTS idx_hyper_ns_arity ON hyperedges(namespace, arity);
+            CREATE INDEX IF NOT EXISTS idx_hyper_ns_rel_arity ON hyperedges(namespace, relation, arity);
+            CREATE INDEX IF NOT EXISTS idx_hyper_ns_rel_arity_n0 ON hyperedges(namespace, relation, arity, node0);
             """
         )
-        cols = {r["name"] for r in self.db.execute("PRAGMA table_info(hyperedges)").fetchall()}
-        if "embedding" not in cols: self.db.execute("ALTER TABLE hyperedges ADD COLUMN embedding TEXT")
         self.db.commit()
 
     @contextmanager
@@ -211,20 +215,21 @@ class _Engine:
             self.db.execute(f"ROLLBACK TO {name}")
             self.db.execute(f"RELEASE {name}")
 
-    def run(self, *commands, mem=None):
-        commands, single = _commands(commands, "run(command[, command2, ...], mem=...)")
+    def run(self, *commands, mem=None, temp=False):
+        commands, single = _as_command_list(commands, "run(command[, command2, ...], mem=...)")
         mem_terms = [_as_term(t, pattern=False) for t in _coerce_terms(mem)]
         with self._tx():
-            out = [Result(self._run_one(c, mem_terms)) for c in commands]
+            with self._savepoint(bool(temp)):
+                out = []
+                for command in commands:
+                    with self._savepoint(bool(mem_terms)):
+                        if mem_terms:
+                            ns = command.namespace or ""
+                            for term in mem_terms:
+                                self._upsert_term(ns, term, {})
+                        rows = self._match(command) if command.rhs is None else self._rewrite(command)
+                        out.append(Result(rows))
         return out[0] if single else out
-
-    def _run_one(self, command, mem_terms):
-        with self._savepoint(bool(mem_terms)):
-            if mem_terms:
-                ns = command.namespace or ""
-                for term in mem_terms:
-                    self._upsert_term(ns, term, {})
-            return self._match(command) if command.rhs is None else self._rewrite(command)
 
     def _compile_query(self, lhs, filters, limit, random_order, namespace):
         if not lhs: raise ValueError("match requires at least one lhs term")
@@ -233,7 +238,7 @@ class _Engine:
 
         for i, term in enumerate(lhs, 1):
             a = f"h{i}"
-            where += [f"{a}.namespace = ?", f"json_array_length({a}.nodes_json) = ?"]
+            where += [f"{a}.namespace = ?", f"{a}.arity = ?"]
             params += [ns, len(term["nodes"])]
             if term["relation"] != "_":
                 where.append(f"{a}.relation = ?")
@@ -241,7 +246,7 @@ class _Engine:
             where += [f"{a}.edge_id <> h{k}.edge_id" for k in range(1, i)]
 
             for j, tok in enumerate(term["nodes"]):
-                col = f"json_extract({a}.nodes_json, '$[{j}]')"
+                col = f"{a}.node{j}" if j < 3 else f"json_extract({a}.nodes_json, '$[{j}]')"
                 if tok["kind"] == "const":
                     where.append(f"{col} = ?")
                     params.append(tok["value"])
@@ -258,8 +263,8 @@ class _Engine:
                 where.append(
                     "EXISTS (SELECT 1 FROM hyperedges np "
                     "WHERE np.namespace = ? AND np.relation = '__node__' "
-                    "AND json_array_length(np.nodes_json) = 1 "
-                    f"AND json_extract(np.nodes_json, '$[0]') = {var_col[ref]} AND {clause})"
+                    "AND np.arity = 1 "
+                    f"AND np.node0 = {var_col[ref]} AND {clause})"
                 )
                 params.append(ns)
                 params.extend(vals)
@@ -276,10 +281,16 @@ class _Engine:
         select += [f"{var_col[v]} AS v_{v}" for v in vars_sorted]
         sql = f"SELECT {', '.join(select)} {from_sql} WHERE {' AND '.join(where)}"
         if random_order: sql += " ORDER BY RANDOM()"
-        sql += f" LIMIT {int(limit)}"
+        if limit is not None:
+            sql += f" LIMIT {int(limit)}"
         return sql, params, vars_sorted, edge_cols
 
-    def _pred_sql(self, json_col, pred):
+    def _filter_sql(self, pred, json_col, emb_col):
+        if pred["op"] == "COSINE_GTE":
+            if pred["prop"] != "embedding": raise ValueError("similar() is only supported on the embedding field")
+            q = _vec_json(pred["value"]["query"])
+            min_score = float(pred["value"].get("min", 0.0))
+            return f"{emb_col} IS NOT NULL AND vec_distance_cosine({emb_col}, ?) <= ?", [q, 1.0 - min_score]
         op, path, val = pred["op"], f"$.{pred['prop']}", pred["value"]
         ex = f"json_extract({json_col}, ?)"
         if op == "IN":
@@ -288,16 +299,6 @@ class _Engine:
         if val is None and op == "=": return f"{ex} IS NULL", [path]
         if val is None and op == "!=": return f"{ex} IS NOT NULL", [path]
         return f"{ex} {op} ?", [path, val]
-
-    def _filter_sql(self, pred, json_col, emb_col):
-        if pred["op"] == "COSINE_GTE":
-            if pred["prop"] != "embedding": raise ValueError("similar() is only supported on the embedding field")
-            return self._embed_sql(emb_col, pred)
-        return self._pred_sql(json_col, pred)
-
-    def _embed_sql(self, col, pred):
-        q, m = _vec_json(pred["value"]["query"]), float(pred["value"].get("min", 0.0))
-        return f"{col} IS NOT NULL AND vec_distance_cosine({col}, ?) <= ?", [q, 1.0 - m]
 
     def _match(self, command):
         sql, params, vars_sorted, edge_cols = self._compile_query(
@@ -323,12 +324,12 @@ class _Engine:
         rhs = [_as_term(t, pattern=bool(lhs)) for t in (command.rhs or ())]
         filters = [_as_pred(p) for p in command.where_clauses]
         random_order, limit = command.random, command.limit
-        if limit < 1: raise ValueError("limit must be >= 1")
+        if limit is not None and limit < 1: raise ValueError("limit must be >= 1")
 
         if not lhs: return [self._emit(rhs, {}, command.namespace)] if rhs else []
         sql, params, vars_sorted, edge_cols = self._compile_query(lhs, filters, 1, random_order, command.namespace)
         out = []
-        while len(out) < limit:
+        while limit is None or len(out) < limit:
             row = self.db.execute(sql, params).fetchone()
             if row is None: break
             ids = [int(row[c]) for c in edge_cols]
@@ -340,9 +341,8 @@ class _Engine:
 
     def _emit(self, terms, env, namespace):
         ns = namespace or ""
-        edge_ids = [self._upsert_term(ns, term, env) for term in terms]
-        edge_by_id = self._fetch_edges(edge_ids)
-        return {"bindings": dict(env), "hyperedges": [edge_by_id[eid] for eid in edge_ids if eid in edge_by_id]}
+        edges = [self._upsert_term(ns, term, env) for term in terms]
+        return {"bindings": dict(env), "hyperedges": edges}
 
     def _upsert_term(self, namespace, term, env):
         nodes = []
@@ -356,8 +356,11 @@ class _Engine:
             name = str(tok["value"])
             if name not in env: env[name] = f"n_{uuid.uuid4().hex[:12]}"
             nodes.append(env[name])
+        relation = term["relation"]
+        data = _resolve(term["data"], env)
         emb = _resolve(term["embedding"], env) if term["embedding"] is not None else None
-        return self._upsert_edge(namespace, term["relation"], nodes, _resolve(term["data"], env), emb)
+        edge_id = self._upsert_edge(namespace, relation, nodes, data, emb)
+        return _edge_obj(edge_id, relation, nodes, data, emb)
 
     def _fetch_edges(self, edge_ids):
         if not edge_ids: return {}
@@ -365,24 +368,42 @@ class _Engine:
             f"SELECT edge_id, relation, nodes_json, data, embedding FROM hyperedges WHERE edge_id IN ({','.join(['?'] * len(edge_ids))})",
             edge_ids,
         ).fetchall()
-        return {
-            int(r["edge_id"]): {
-                "edge_id": int(r["edge_id"]),
-                "relation": r["relation"],
-                "nodes": json.loads(r["nodes_json"]),
-                "data": json.loads(r["data"]),
-                "embedding": None if r["embedding"] is None else json.loads(r["embedding"]),
-            }
-            for r in rows
-        }
+        loads = json.loads
+        out = {}
+        for r in rows:
+            eid = int(r["edge_id"])
+            out[eid] = _edge_obj(
+                eid,
+                r["relation"],
+                loads(r["nodes_json"]),
+                loads(r["data"]),
+                None if r["embedding"] is None else loads(r["embedding"]),
+            )
+        return out
 
     def _upsert_edge(self, namespace, relation, nodes, data, embedding):
         payload = dict(data or {})
         emb = None if embedding is None else _vec_json(embedding)
+        arity = len(nodes)
+        n0 = nodes[0] if arity > 0 else None
+        n1 = nodes[1] if arity > 1 else None
+        n2 = nodes[2] if arity > 2 else None
         row = self.db.execute(
-            "INSERT INTO hyperedges(namespace, relation, nodes_json, data, embedding) VALUES (?,?,?,?,?) "
-            "ON CONFLICT(namespace, relation, nodes_json) DO UPDATE SET data=excluded.data, embedding=excluded.embedding RETURNING edge_id",
-            (namespace, relation, json.dumps(nodes, separators=(",", ":")), json.dumps(payload, separators=(",", ":")), emb),
+            "INSERT INTO hyperedges(namespace, relation, nodes_json, arity, node0, node1, node2, data, embedding) VALUES (?,?,?,?,?,?,?,?,?) "
+            "ON CONFLICT(namespace, relation, nodes_json) DO UPDATE SET "
+            "arity=excluded.arity, node0=excluded.node0, node1=excluded.node1, node2=excluded.node2, "
+            "data=excluded.data, embedding=excluded.embedding RETURNING edge_id",
+            (
+                namespace,
+                relation,
+                json.dumps(nodes, separators=(",", ":")),
+                arity,
+                n0,
+                n1,
+                n2,
+                json.dumps(payload, separators=(",", ":")),
+                emb,
+            ),
         ).fetchone()
         if row is None: raise RuntimeError("failed to upsert edge")
         return int(row["edge_id"])
@@ -391,26 +412,30 @@ def _project(rows, keys, default):
     return rows if not keys else [{k: row.get(k, default) for k in keys} for row in rows]
 
 
+def _edge_obj(edge_id, relation, nodes, data, embedding):
+    return {
+        "edge_id": int(edge_id),
+        "relation": relation,
+        "nodes": list(nodes),
+        "data": dict(data),
+        "embedding": None if embedding is None else _vec(embedding),
+    }
+
+
 def _coerce_terms(raw):
     if raw is None: return []
-    if isinstance(raw, list): return raw
-    if isinstance(raw, tuple) and (not raw or isinstance(raw[0], (dict, list, tuple))): return list(raw)
+    if isinstance(raw, (list, tuple)): return list(raw)
     return [raw]
 
 
 def _as_term(raw, pattern):
-    if isinstance(raw, dict):
-        rel, nodes, data = str(raw.get("relation", "_")), list(raw.get("nodes", ())), dict(raw.get("data") or {})
-        embedding = raw.get("embedding")
-        temp = bool(raw.get("temp", False))
-    elif isinstance(raw, (tuple, list)):
-        if len(raw) == 2 and isinstance(raw[0], str) and isinstance(raw[1], (tuple, list)): rel, nodes = str(raw[0]), list(raw[1])
-        else: rel, nodes = "_", list(raw)
-        data = {}
-        embedding = None
-        temp = False
-    else:
-        raise ValueError("term must be dict/list/tuple")
+    if not isinstance(raw, dict):
+        raise ValueError("term must be created with runtime.edge(...) or runtime.node(...)")
+    rel = str(raw["relation"])
+    nodes = list(raw["nodes"])
+    data = dict(raw.get("data") or {})
+    embedding = raw.get("embedding")
+    temp = bool(raw.get("temp", False))
     if not nodes: raise ValueError("term nodes must be non-empty")
     return {"relation": rel, "nodes": [_as_tok(n, pattern) for n in nodes], "data": data, "embedding": embedding, "temp": temp}
 
@@ -494,8 +519,8 @@ def _vec_json(value): return json.dumps(_vec(value), separators=(",", ":"))
 
 
 def vars(names):
-    raw = names.replace(",", " ").split() if isinstance(names, str) else [str(n) for n in names]
-    return tuple(Var(name) for name in raw if name)
+    if not isinstance(names, str): raise TypeError("vars(names) expects a space-delimited string")
+    return tuple(Var(name) for name in names.split() if name)
 
 
 def const(value): return Const(str(value))
@@ -513,11 +538,17 @@ def node(node_id, embedding=None, data=None, temp=False, **props):
     return edge(node_id, rel="__node__", embedding=embedding, data=data, temp=temp, **props)
 
 
-def match(*lhs, limit=100, random=False):
-    return Command(lhs=tuple(lhs), where_clauses=(), limit=int(limit), random=bool(random), namespace=None)
+def _as_limit(limit):
+    if limit is None: return None
+    return int(limit)
 
 
-def rewrite(*lhs, to, random=False, limit=100): return match(*lhs, limit=limit, random=random).rewrite(to)
+def match(*lhs, limit=None, random=False):
+    return Command(lhs=tuple(lhs), where_clauses=(), limit=_as_limit(limit), random=bool(random), namespace=None)
+
+
+def rewrite(*lhs, to, random=False, limit=None):
+    return match(*lhs, limit=limit, random=random).rewrite(to)
 
 
 def ns(name): return Namespace(name)
@@ -539,20 +570,15 @@ def _engine():
     return _ENGINE
 
 
-def _commands(raw, err):
+def _as_command_list(raw, err):
     if not raw: raise TypeError(err)
-    if len(raw) == 1:
-        one = raw[0]
-        if isinstance(one, Command): return [one], True
-        if isinstance(one, (list, tuple)) and all(isinstance(c, Command) for c in one): return list(one), False
-    if all(isinstance(c, Command) for c in raw): return list(raw), len(raw) == 1
+    items, single = list(raw), len(raw) == 1
+    if items and all(isinstance(c, Command) for c in items): return items, single
     raise TypeError(err)
 
 
 def _split_exec_args(raw):
     if not raw: raise TypeError("exec(command[, command2, ...], ...)")
-    if len(raw) == 1 and isinstance(raw[0], (list, tuple)) and all(isinstance(c, Command) for c in raw[0]):
-        return list(raw[0]), True, []
     commands, inline_seed = [], []
     for item in raw:
         if isinstance(item, Command):
@@ -566,16 +592,12 @@ def _split_exec_args(raw):
             raise TypeError("non-command exec args must be edge/node with temp=True")
         inline_seed.append(item)
     if not commands: raise TypeError("exec() requires at least one command")
-    return commands, len(commands) == 1, inline_seed
+    return commands, inline_seed
 
 
 def exec(*commands, temp=False):  # noqa: A001
-    cmds, single, inline_seed = _split_exec_args(commands)
-    if not temp: return _engine().run(cmds if not single else cmds[0], mem=inline_seed)
-    eng = _Engine(":memory:")
-    try:
-        return eng.run(cmds if not single else cmds[0], mem=inline_seed)
-    finally: eng.db.close()
+    cmds, inline_seed = _split_exec_args(commands)
+    return _engine().run(*cmds, mem=inline_seed, temp=temp)
 
 
 __all__ = ["vars", "const", "on", "edge", "node", "ns", "match", "rewrite", "exec", "Result"]

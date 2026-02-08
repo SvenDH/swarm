@@ -6,6 +6,8 @@ Single API function:
 
 It executes an object-based DSL command and returns the result.
 
+No backward-compat migrations are applied. If the schema changes, recreate the DB file.
+
 ## Object DSL
 
 Core objects:
@@ -18,10 +20,12 @@ Core objects:
 - `runtime.ns("name")` namespace handle
 - `runtime.match(...)`
 - `field.similar(query, min_score=0.0)` for embedding similarity in `where(...)`
-- `runtime.exec(..., temp=True)` for ephemeral in-memory execution
+- `runtime.exec(..., temp=True)` for ephemeral execution on current DB state (rollback at end)
 - `runtime.edge(..., temp=True)` / `runtime.node(..., temp=True)` for inline virtual seed terms
+- Terms are explicit: use `runtime.edge(...)` / `runtime.node(...)` only (tuple syntax is not supported)
 
 Rewrite is expressed as `match(...).rewrite(...)` or top-level `rewrite(..., to=[...])`.
+`limit=None` is the default and means "all matches".
 
 ## Usage
 
@@ -37,25 +41,25 @@ runtime.exec(runtime.rewrite(to=[
     runtime.node("a", kind="person", embedding=[0.9, 0.1, 0.0]),
 ]))
 
-# Atomic batch (equivalent to exec([cmd1, cmd2, ...]))
+# Atomic batch
 batch = runtime.exec(
     runtime.rewrite(to=[runtime.edge("u", "v", rel="seed")]),
-    runtime.match(("seed", ("u", "v"))),
+    runtime.match(runtime.edge("u", "v", rel="seed")),
 )
 
 x, y, z, u = runtime.vars("x y z u")
 
 # Query
 m = runtime.exec(
-    runtime.match((x, x, y), (y, z, u)).where(x.kind == "person", runtime.on(1).weight >= 0.5),
+    runtime.match(runtime.edge(x, x, y), runtime.edge(y, z, u)).where(x.kind == "person", runtime.on(1).weight >= 0.5),
 )
 print(json.dumps(m, indent=2))
 
 # Rewrite
 x, y, z, u, v = runtime.vars("x y z u v")
 r = runtime.exec(
-    runtime.match((x, x, y), (y, z, u)).rewrite(
-        [(x, v, u), (y, v, z), (v, v, u)],
+    runtime.match(runtime.edge(x, x, y), runtime.edge(y, z, u)).rewrite(
+        [runtime.edge(x, v, u), runtime.edge(y, v, z), runtime.edge(v, v, u)],
         limit=100,
     ),
 )
@@ -70,7 +74,7 @@ These temp terms are overlay-only and rolled back after returning results.
 ```python
 x, y = runtime.vars("x y")
 virtual = runtime.exec(
-    runtime.match(("friend", (x, y)), limit=10).where(
+    runtime.match(runtime.edge(x, y, rel="friend"), limit=10).where(
         x.kind == "person", runtime.on(1).weight >= 0.8
     ),
     runtime.edge("a", "b", rel="friend", weight=0.9, temp=True),
@@ -84,8 +88,8 @@ Virtual program step:
 pc, nxt = runtime.vars("pc nxt")
 step = runtime.exec(
     runtime.match(
-        ("state", (runtime.const("m1"), pc)),
-        ("step", (pc, nxt)),
+        runtime.edge(runtime.const("m1"), pc, rel="state"),
+        runtime.edge(pc, nxt, rel="step"),
     ).rewrite([runtime.edge(runtime.const("m1"), nxt, rel="state")]),
     runtime.edge("m1", "n0", rel="state", temp=True),
     runtime.edge("n0", "n1", rel="step", temp=True),
@@ -96,12 +100,12 @@ step = runtime.exec(
 
 ```python
 runtime.exec(
-    runtime.match(("friend", (x, y))).rewrite([runtime.edge(x, y, rel="friend2")]),
+    runtime.match(runtime.edge(x, y, rel="friend")).rewrite([runtime.edge(x, y, rel="friend2")]),
     runtime.edge("a", "b", rel="friend", temp=True),
 )
 ```
 
-Ephemeral in-memory program state (single call):
+Ephemeral program state (single call, rollback at end):
 
 ```python
 pc, nxt, x, y = runtime.vars("pc nxt x y")
@@ -110,10 +114,10 @@ out = runtime.exec(
         runtime.edge("m1", "n0", rel="state"),
         runtime.edge("n0", "n1", rel="step"),
     ]),
-    runtime.match(("state", ("m1", pc)), ("step", (pc, nxt))).rewrite(
+    runtime.match(runtime.edge(runtime.const("m1"), pc, rel="state"), runtime.edge(pc, nxt, rel="step")).rewrite(
         [runtime.edge("m1", nxt, rel="state")],
     ),
-    runtime.match(("state", (x, y))),
+    runtime.match(runtime.edge(x, y, rel="state")),
     temp=True,
 )
 ```
@@ -138,7 +142,7 @@ q = [1.0, 0.0, 0.0]
 # Edge embedding similarity
 x, y = runtime.vars("x y")
 near_edges = runtime.exec(
-    runtime.match(("friend", (x, y)), limit=5).where(
+    runtime.match(runtime.edge(x, y, rel="friend"), limit=5).where(
         runtime.on(1).embedding.similar(q, min_score=0.75)
     )
 )
@@ -147,7 +151,7 @@ near_edges = runtime.exec(
 g1 = runtime.ns("g1")
 u, v = runtime.vars("u v")
 g1_hits = runtime.exec(
-    g1.match(("friend", (u, v)), limit=5).where(
+    g1.match(g1.edge(u, v, rel="friend"), limit=5).where(
         u.embedding.similar(q, min_score=0.7)
     )
 )
@@ -194,7 +198,7 @@ x, y = runtime.vars("x y")
 g1 = runtime.ns("g1")
 
 # only matches rows stored in namespace "g1"
-g1_matches = runtime.exec(g1.match(("friend", (x, y)), limit=100))
+g1_matches = runtime.exec(g1.match(g1.edge(x, y, rel="friend"), limit=100))
 ```
 
 Namespaces are stored in a dedicated SQL column, so node ids can be reused across namespaces.
@@ -269,7 +273,7 @@ x, y = runtime.vars("x y")
 
 # find friend edges where source node is a Person
 out = runtime.exec(
-    runtime.match(("friend", (x, y))).where(
+    runtime.match(runtime.edge(x, y, rel="friend")).where(
         runtime.on(1).weight >= 0.5,
         x.label == "Person",
     )
@@ -283,7 +287,7 @@ x, y, z = runtime.vars("x y z")
 
 # if friend(x,y) and friend(y,z), infer friend2(x,z)
 derived = runtime.exec(
-    runtime.match(("friend", (x, y)), ("friend", (y, z))).rewrite(
+    runtime.match(runtime.edge(x, y, rel="friend"), runtime.edge(y, z, rel="friend")).rewrite(
         [runtime.edge(x, z, rel="friend2", rule="two_hop")],
         limit=1000,
     )
@@ -305,9 +309,9 @@ runtime.exec(runtime.rewrite(to=[
 
 posterior = runtime.exec(
     runtime.match(
-        ("evidence", ("Rain", rain)),
-        ("evidence", ("Sprinkler", sprinkler)),
-        ("cpt_wetgrass", (rain, sprinkler, wet)),
+        runtime.edge(runtime.const("Rain"), rain, rel="evidence"),
+        runtime.edge(runtime.const("Sprinkler"), sprinkler, rel="evidence"),
+        runtime.edge(rain, sprinkler, wet, rel="cpt_wetgrass"),
     ).where(runtime.on(3).p >= 0.8).rewrite(
         [runtime.edge("WetGrass", wet, rel="belief", source="cpt")],
     )
@@ -327,7 +331,7 @@ runtime.exec(runtime.rewrite(to=[
 ]))
 
 step1 = runtime.exec(
-    runtime.match(("state", ("m1", pc)), ("step", (pc, nxt))).rewrite(
+    runtime.match(runtime.edge(runtime.const("m1"), pc, rel="state"), runtime.edge(pc, nxt, rel="step")).rewrite(
         [runtime.edge("m1", nxt, rel="state")],
     )
 )
@@ -342,7 +346,7 @@ a, b, out = runtime.vars("a b out")
 runtime.exec(runtime.rewrite(to=[runtime.edge("2", "3", "sum", rel="add")]))
 
 step = runtime.exec(
-    runtime.match(("add", (a, b, out))).rewrite(
+    runtime.match(runtime.edge(a, b, out, rel="add")).rewrite(
         [runtime.node(out, value=a + b, diff=a - b, prod=a * b, quo=b // a)],
     )
 )
@@ -361,7 +365,7 @@ Supported expression operators:
 Use helper conversions:
 
 ```python
-out = runtime.exec(runtime.match(("friend", (x, y)), limit=100))
+out = runtime.exec(runtime.match(runtime.edge(x, y, rel="friend"), limit=100))
 
 # Map rows
 pairs = out.map(lambda row: (row["bindings"]["x"], row["bindings"]["y"]))
@@ -414,12 +418,12 @@ Query (semantic retrieval + expansion):
 ```python
 q = [1.0, 0.0, 0.0]
 hits = runtime.exec(
-    runtime.match(("mentions", (chunk, ent)), limit=20).where(
+    runtime.match(runtime.edge(chunk, ent, rel="mentions"), limit=20).where(
         chunk.embedding.similar(q, min_score=0.75)
     )
 )
 expanded = runtime.exec(
-    runtime.match(("related", (ent, nbr)), limit=20).where(
+    runtime.match(runtime.edge(ent, nbr, rel="related"), limit=20).where(
         runtime.on(1).weight >= 0.7
     )
 )

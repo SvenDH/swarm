@@ -12,8 +12,8 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 import runtime
 
 
-def build_seed_terms(pairs: int) -> list[runtime.Term]:
-    terms: list[runtime.Term] = []
+def build_seed_terms(pairs: int) -> list[dict[str, object]]:
+    terms: list[dict[str, object]] = []
     for i in range(pairs):
         a, b, c, d = f"a{i}", f"b{i}", f"c{i}", f"d{i}"
         terms.append(runtime.edge(a, a, b, tag="lhs"))
@@ -29,7 +29,7 @@ def seed(engine: runtime._Engine, pairs: int) -> float:
 
 def bench_match(engine: runtime._Engine, pairs: int, runs: int) -> dict[str, float]:
     x, y, z, u = runtime.vars("x y z u")
-    cmd = runtime.match((x, x, y), ("r2", (y, z, u)), limit=pairs)
+    cmd = runtime.match(runtime.edge(x, x, y), runtime.edge(y, z, u, rel="r2"), limit=pairs)
 
     # Warmup
     for _ in range(3):
@@ -52,9 +52,8 @@ def bench_match(engine: runtime._Engine, pairs: int, runs: int) -> dict[str, flo
 
 def bench_rewrite(engine: runtime._Engine, pairs: int, runs: int) -> dict[str, float]:
     x, y, z, u, v = runtime.vars("x y z u v")
-    cmd = runtime.match((x, x, y), ("r2", (y, z, u))).rewrite(
-        [(x, v, u), (y, v, z), (v, v, u)],
-        mode="all",
+    cmd = runtime.match(runtime.edge(x, x, y), runtime.edge(y, z, u, rel="r2")).rewrite(
+        [runtime.edge(x, v, u), runtime.edge(y, v, z), runtime.edge(v, v, u)],
         limit=max(10, pairs * 4),
     )
 

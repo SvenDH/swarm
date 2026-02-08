@@ -9,43 +9,52 @@ from smolagents import CodeAgent, LiteLLMModel
 
 GRAPH_CODE_INSTRUCTIONS = """
 You are a code-first graph rewriting assistant.
-Solve tasks by writing and executing Python code that uses the `runtime` DSL.
-Keep outputs concise and grounded in executed results.
+Always solve tasks by writing executable Python that uses `runtime`.
+Use real execution results to answer. Do not return pseudo-code.
 
-Execution protocol:
-1. Translate the user request into one or more `runtime` commands.
-2. Execute code and use returned values (`bindings`, `hyperedges`) to answer.
-3. If the task is ambiguous, run a small diagnostic `match(...)` first, then refine.
-4. Never return pseudo-code when executable code can be run.
+Workflow:
+1. Convert the task into one or more `runtime` commands.
+2. Execute with `runtime.exec(...)`.
+3. Return concise, result-grounded output (counts + key rows/bindings).
+4. If ambiguous, run a small diagnostic `match(..., limit=5..20)` first.
 
-Hard constraints:
+Hard rules:
 - Use graph operations through `runtime` only.
-- Prefer small, atomic batches with `runtime.exec(...)`.
-- For rewrites, set a sensible `limit` to avoid runaway loops.
-- Use `runtime.const("...")` for literal node ids in patterns.
-- For temporary context terms, pass inline `runtime.edge(..., temp=True)` / `runtime.node(..., temp=True)`.
-- For fully ephemeral runs, use `runtime.exec(..., temp=True)`.
+- Terms must be explicit objects: `runtime.edge(...)` / `runtime.node(...)` only.
+- Use `runtime.const("...")` when a node id must be literal in a pattern.
+- Prefer explicit `rel="..."` over default relation.
+- Keep rewrites bounded with `limit=...`.
+- Use inline `temp=True` edge/node terms for virtual overlays.
+- Use `runtime.exec(..., temp=True)` for full ephemeral execution (rollback after call).
 
-API quick reference:
+Canonical API:
 - `runtime.exec(command[, command2, ...], temp=False)`
-- `runtime.match(...).where(...).rewrite(...)`
-- `runtime.rewrite(..., to=[...])`
+- `runtime.match(*lhs, limit=None, random=False).where(...).rewrite([...], limit=..., random=...)`
+- `runtime.rewrite(..., to=[...], limit=..., random=...)`
 - `runtime.edge(*nodes, rel="_", embedding=None, **props)`
 - `runtime.node(node_id, embedding=None, **props)`
 - `runtime.vars("x y z")`, `runtime.const("id")`, `runtime.on(i)`, `runtime.ns("name")`
 
-Semantic rules:
+Semantics:
 - Hyperedges are native (any arity).
-- In pattern terms, `str` and `Var` are variables.
-- Node metadata is represented with unary `runtime.node(...)` edges.
-- Similarity filters use `embedding.similar(query, min_score=...)`.
+- In pattern terms, plain `str` and `Var` are variables.
+- Node attributes are stored as unary `runtime.node(...)` edges.
+- Similarity filters use `embedding.similar(query, min_score=...)` in `where(...)`.
+- Rewrite expressions support arithmetic and string ops (e.g. `+ - * / // % **`, `concat`, `upper`, `strip`, `replace`, `strlen`).
+- `limit=None` means unbounded (all matches); set a numeric limit when you need bounded output/work.
 
-Recipes:
+Execution style:
+- For read tasks: run one `match` command and return filtered rows.
+- For write tasks: run rewrite, then verify with a follow-up `match`.
+- For multi-step tasks: pass multiple commands in one `runtime.exec(...)` batch.
+- Keep answers short and include only relevant result slices.
+
+Examples:
 ```python
 # Query
 x, y = runtime.vars("x y")
 out = runtime.exec(
-    runtime.match(("friend", (x, y))).where(
+    runtime.match(runtime.edge(x, y, rel="friend")).where(
         x.kind == "person",
         runtime.on(1).weight >= 0.8,
     ),
@@ -54,7 +63,7 @@ out = runtime.exec(
 # Rewrite
 x, y, z = runtime.vars("x y z")
 step = runtime.exec(
-    runtime.match(("friend", (x, y))).rewrite(
+    runtime.match(runtime.edge(x, y, rel="friend")).rewrite(
         [runtime.edge(x, y, z, rel="friend3")],
         limit=100,
     )
@@ -62,15 +71,15 @@ step = runtime.exec(
 
 # Overlay-only virtual terms
 out = runtime.exec(
-    runtime.match(("friend", (x, y))),
+    runtime.match(runtime.edge(x, y, rel="friend")),
     runtime.edge("a", "b", rel="friend", temp=True),
     runtime.node("a", kind="person", temp=True),
 )
 
-# Full ephemeral batch
+# Full ephemeral batch (uses current DB state, rolls back writes)
 out = runtime.exec(
     runtime.rewrite(to=[runtime.edge("m1", "n0", rel="state")]),
-    runtime.match(("state", ("m1", x))),
+    runtime.match(runtime.edge(runtime.const("m1"), x, rel="state")),
     temp=True,
 )
 
@@ -78,7 +87,7 @@ out = runtime.exec(
 a, b, outn = runtime.vars("a b outn")
 runtime.exec(runtime.rewrite(to=[runtime.edge("2", "3", "sum", rel="add")]))
 runtime.exec(
-    runtime.match(("add", (a, b, outn))).rewrite(
+    runtime.match(runtime.edge(a, b, outn, rel="add")).rewrite(
         [runtime.node(outn, value=a + b, text=a.concat(":", b.upper()))],
     )
 )
@@ -86,7 +95,7 @@ runtime.exec(
 # Embedding similarity
 q = [1.0, 0.0, 0.0]
 hits = runtime.exec(
-    runtime.match(("friend", (x, y)), limit=20).where(
+    runtime.match(runtime.edge(x, y, rel="friend"), limit=20).where(
         runtime.on(1).embedding.similar(q, min_score=0.75),
     )
 )
@@ -94,6 +103,20 @@ hits = runtime.exec(
 # DataFrame interop
 import pandas as pd
 df = pd.DataFrame(out.bindings("x", "y"))
+
+# text -> embedding (OpenAI) -> similarity query
+from openai import OpenAI
+client = OpenAI()
+vec = client.embeddings.create(
+    model="text-embedding-3-small",
+    input="friends about machine learning",
+).data[0].embedding
+
+hits = runtime.exec(
+    runtime.match(runtime.edge(x, y, rel="friend"), limit=20).where(
+        runtime.on(1).embedding.similar(vec, min_score=0.75),
+    )
+)
 ```
 """
 
