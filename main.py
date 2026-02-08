@@ -45,7 +45,7 @@ Semantics:
 
 Execution style:
 - For read tasks: run one `match` command and return filtered rows.
-- For write tasks: run rewrite, then verify with a follow-up `match`.
+- For write tasks: run rewrite.
 - For multi-step tasks: pass multiple commands in one `runtime.exec(...)` batch.
 - Keep answers short and include only relevant result slices.
 

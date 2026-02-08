@@ -493,5 +493,132 @@ class RuntimeTests(unittest.TestCase):
         finally:
             runtime._ENGINE = prev
 
+    def test_temp_exec_complex_program_tree_leaves_no_traces(self) -> None:
+        pc, nxt, alt, flag, a, b, outv, av, bv, rv = runtime.vars("pc nxt alt flag a b outv av bv rv")
+        prev = runtime._ENGINE
+        runtime._ENGINE = self.engine
+        try:
+            out = runtime.exec(
+                # Program + AST + constants.
+                runtime.rewrite(
+                    to=[
+                        runtime.edge("vm", "pc0", rel="state"),
+                        runtime.edge("pc0", "pc1", "c2", "c3", "t1", rel="add_instr"),
+                        runtime.edge("pc1", "pc_then", "pc_else", "f0", rel="branch_instr"),
+                        runtime.edge("f0", "true", rel="flag"),
+                        runtime.edge("pc_then", "pc_join", "t1", "c4", "t2", rel="mul_instr"),
+                        runtime.edge("pc_else", "pc_join", "t1", "c1", "t2", rel="sub_instr"),
+                        runtime.edge("pc_join", "pc_out", rel="jump_instr"),
+                        runtime.edge("pc_out", "pc_done", "t2", "result", rel="copy_instr"),
+                        # Program tree (AST-like) structure for richer control flow.
+                        runtime.edge("if0", "f0", "then0", "else0", rel="ast_if"),
+                        runtime.edge("then0", "t1", "c4", "t2", rel="ast_mul"),
+                        runtime.edge("else0", "t1", "c1", "t2", rel="ast_sub"),
+                        runtime.edge("out0", "t2", "result", rel="ast_copy"),
+                        runtime.edge("c1", "1", rel="value"),
+                        runtime.edge("c2", "2", rel="value"),
+                        runtime.edge("c3", "3", rel="value"),
+                        runtime.edge("c4", "4", rel="value"),
+                    ]
+                ),
+                # Step 1: entry arithmetic.
+                runtime.match(
+                    runtime.edge("vm", pc, rel="state"),
+                    runtime.edge(pc, nxt, a, b, outv, rel="add_instr"),
+                    runtime.edge(a, av, rel="value"),
+                    runtime.edge(b, bv, rel="value"),
+                ).rewrite(
+                    [
+                        runtime.edge("vm", nxt, rel="state"),
+                        runtime.edge(outv, av + bv, rel="value"),
+                    ],
+                    limit=1,
+                ),
+                # Step 2a: branch true.
+                runtime.match(
+                    runtime.edge("vm", pc, rel="state"),
+                    runtime.edge(pc, nxt, alt, flag, rel="branch_instr"),
+                    runtime.edge(flag, runtime.const("true"), rel="flag"),
+                ).rewrite(
+                    [runtime.edge("vm", nxt, rel="state")],
+                    limit=1,
+                ),
+                # Step 2b: branch false (should not fire in this seeded program).
+                runtime.match(
+                    runtime.edge("vm", pc, rel="state"),
+                    runtime.edge(pc, alt, nxt, flag, rel="branch_instr"),
+                    runtime.edge(flag, runtime.const("false"), rel="flag"),
+                ).rewrite(
+                    [runtime.edge("vm", nxt, rel="state")],
+                    limit=1,
+                ),
+                # Step 3a: then-path arithmetic.
+                runtime.match(
+                    runtime.edge("vm", pc, rel="state"),
+                    runtime.edge(pc, nxt, a, b, outv, rel="mul_instr"),
+                    runtime.edge(a, av, rel="value"),
+                    runtime.edge(b, bv, rel="value"),
+                ).rewrite(
+                    [
+                        runtime.edge("vm", nxt, rel="state"),
+                        runtime.edge(outv, av * bv, rel="value"),
+                    ],
+                    limit=1,
+                ),
+                # Step 3b: else-path arithmetic (should not fire).
+                runtime.match(
+                    runtime.edge("vm", pc, rel="state"),
+                    runtime.edge(pc, nxt, a, b, outv, rel="sub_instr"),
+                    runtime.edge(a, av, rel="value"),
+                    runtime.edge(b, bv, rel="value"),
+                ).rewrite(
+                    [
+                        runtime.edge("vm", nxt, rel="state"),
+                        runtime.edge(outv, av - bv, rel="value"),
+                    ],
+                    limit=1,
+                ),
+                # Step 4: control-flow jump.
+                runtime.match(
+                    runtime.edge("vm", pc, rel="state"),
+                    runtime.edge(pc, nxt, rel="jump_instr"),
+                ).rewrite(
+                    [runtime.edge("vm", nxt, rel="state")],
+                    limit=1,
+                ),
+                # Step 5: output copy.
+                runtime.match(
+                    runtime.edge("vm", pc, rel="state"),
+                    runtime.edge(pc, nxt, a, outv, rel="copy_instr"),
+                    runtime.edge(a, av, rel="value"),
+                ).rewrite(
+                    [
+                        runtime.edge("vm", nxt, rel="state"),
+                        runtime.edge(outv, av, rel="value"),
+                    ],
+                    limit=1,
+                ),
+                # Read final program output.
+                runtime.match(runtime.edge(runtime.const("result"), rv, rel="value"), limit=1),
+                temp=True,
+            )
+        finally:
+            runtime._ENGINE = prev
+
+        self.assertEqual(len(out), 9)
+        self.assertEqual(len(out[1]), 1)  # add
+        self.assertEqual(len(out[2]), 1)  # branch true
+        self.assertEqual(len(out[3]), 0)  # branch false
+        self.assertEqual(len(out[4]), 1)  # then mul
+        self.assertEqual(len(out[5]), 0)  # else sub
+        self.assertEqual(len(out[6]), 1)  # jump
+        self.assertEqual(len(out[7]), 1)  # copy
+        self.assertEqual(len(out[8]), 1)  # final read
+        self.assertEqual(out[8][0]["bindings"]["rv"], "20")
+
+        # Everything above was ephemeral: no traces in persisted DB.
+        persisted_count = self.engine.db.execute("SELECT COUNT(*) FROM hyperedges").fetchone()[0]
+        self.assertEqual(persisted_count, 0)
+
 if __name__ == "__main__":
     unittest.main()

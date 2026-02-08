@@ -203,6 +203,19 @@ class _Engine:
             raise
 
     @contextmanager
+    def _rollback_tx(self):
+        own = not self.db.in_transaction
+        if own:
+            self.db.execute("BEGIN IMMEDIATE")
+            try:
+                yield
+            finally:
+                self.db.rollback()
+            return
+        with self._savepoint(True):
+            yield
+
+    @contextmanager
     def _savepoint(self, enabled):
         if not enabled:
             yield
@@ -218,8 +231,8 @@ class _Engine:
     def run(self, *commands, mem=None, temp=False):
         commands, single = _as_command_list(commands, "run(command[, command2, ...], mem=...)")
         mem_terms = [_as_term(t, pattern=False) for t in _coerce_terms(mem)]
-        with self._tx():
-            with self._savepoint(bool(temp)):
+        scope = self._rollback_tx if temp else self._tx
+        with scope():
                 out = []
                 for command in commands:
                     with self._savepoint(bool(mem_terms)):
@@ -329,12 +342,12 @@ class _Engine:
         if not lhs: return [self._emit(rhs, {}, command.namespace)] if rhs else []
         sql, params, vars_sorted, edge_cols = self._compile_query(lhs, filters, 1, random_order, command.namespace)
         out = []
+        delete_sql = f"DELETE FROM hyperedges WHERE edge_id IN ({','.join(['?'] * len(edge_cols))})"
         while limit is None or len(out) < limit:
             row = self.db.execute(sql, params).fetchone()
             if row is None: break
             ids = [int(row[c]) for c in edge_cols]
-            if ids:
-                self.db.execute(f"DELETE FROM hyperedges WHERE edge_id IN ({','.join(['?'] * len(ids))})", ids)
+            self.db.execute(delete_sql, ids)
             env = {v: str(row[f"v_{v}"]) for v in vars_sorted}
             out.append(self._emit(rhs, env, command.namespace))
         return out

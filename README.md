@@ -396,6 +396,20 @@ Most useful `Result` helpers:
 - `out.edge_data(...)`
 - `out.rows(...)`
 
+## Benchmarks
+
+General match/rewrite benchmark:
+
+```bash
+.venv/bin/python benchmarks/benchmark_runtime.py
+```
+
+`temp=True` rewrite throughput benchmark:
+
+```bash
+.venv/bin/python benchmarks/benchmark_temp_rewrite.py --pairs 500 --runs 40 --limit 500
+```
+
 ## GraphRAG Example
 
 Build:
