@@ -6,18 +6,21 @@ from typing import Any
 
 import acl
 import names
-import runtime
+import graph
+
+MAX_HIERARCHY_DEPTH = 3
 
 
-def _neighbors(i: int, j: int, size: int):
-    if i > 0:
-        yield "north", i - 1, j
-    if i + 1 < size:
-        yield "south", i + 1, j
-    if j > 0:
-        yield "west", i, j - 1
-    if j + 1 < size:
-        yield "east", i, j + 1
+def _default_engine() -> graph._Engine:
+    eng = getattr(graph, "_ENGINE", None)
+    if eng is None:
+        eng = graph._Engine()
+        graph._ENGINE = eng
+    return eng
+
+
+def _load_json(value: str | None) -> dict[str, Any]:
+    return json.loads(value) if value else {}
 
 
 def _node_data(db, namespace: str, node_id: str) -> dict[str, Any] | None:
@@ -30,19 +33,18 @@ def _node_data(db, namespace: str, node_id: str) -> dict[str, Any] | None:
     return json.loads(row["data"]) if row["data"] else {}
 
 
-def _child_count(db, namespace: str, parent_id: str) -> int:
-    return int(
-        db.execute(
-            "SELECT COUNT(*) FROM hyperedges WHERE namespace=? AND relation='controls' AND node0=?",
-            (namespace, parent_id),
-        ).fetchone()[0]
-    )
+def _children(db, namespace: str, parent_id: str) -> list[str]:
+    rows = db.execute(
+        "SELECT node1 FROM hyperedges WHERE namespace=? AND relation='controls' AND node0=? ORDER BY node1",
+        (namespace, parent_id),
+    ).fetchall()
+    return [str(row["node1"]) for row in rows]
 
 
-def _new_agent_id(db, namespace: str, used: set[str] | None = None) -> str:
+def _new_node_id(db, namespace: str, used: set[str] | None = None) -> str:
     used = used or set()
     while True:
-        candidate = f"agent:{names.gen_name()}"
+        candidate = f"node:{names.gen_name()}"
         if candidate in used:
             continue
         if _node_data(db, namespace, candidate) is None:
@@ -50,19 +52,18 @@ def _new_agent_id(db, namespace: str, used: set[str] | None = None) -> str:
             return candidate
 
 
-def _agent_terms(
-    g: runtime.Namespace,
+def _node_terms(
+    g: graph.Namespace,
     *,
     namespace: str,
-    agent_id: str,
+    node_id: str,
     layer: int,
-    max_children: int,
     shared_graph_id: str,
     parent_id: str | None = None,
     x: int | None = None,
     y: int | None = None,
 ) -> list[dict[str, Any]]:
-    props: dict[str, Any] = {"kind": "agent", "layer": int(layer), "max_children": int(max_children)}
+    props: dict[str, Any] = {"kind": "node", "layer": int(layer)}
     if parent_id is not None:
         props["parent"] = parent_id
     if x is not None:
@@ -70,22 +71,22 @@ def _agent_terms(
     if y is not None:
         props["y"] = y
 
-    ctx, mem, interp = f"ctx:{agent_id}", f"mem:{agent_id}", f"interp:{agent_id}"
+    ctx, mem, interp = f"ctx:{node_id}", f"mem:{node_id}", f"interp:{node_id}"
     terms = [
-        g.node(agent_id, **props),
-        g.node(ctx, kind="context", layer=layer, agent=agent_id),
-        g.node(mem, kind="memory_graph", layer=layer, agent=agent_id),
-        g.node(interp, kind="interpreter", layer=layer, agent=agent_id, runtime="python"),
-        g.edge(agent_id, ctx, rel="has_context"),
-        g.edge(agent_id, mem, rel="has_memory_graph"),
-        g.edge(agent_id, interp, rel="uses_interpreter"),
+        g.node(node_id, **props),
+        g.node(ctx, kind="context", layer=layer, node=node_id),
+        g.node(mem, kind="memory_graph", layer=layer, node=node_id),
+        g.node(interp, kind="interpreter", layer=layer, node=node_id, runtime="python"),
+        g.edge(node_id, ctx, rel="has_context"),
+        g.edge(node_id, mem, rel="has_memory_graph"),
+        g.edge(node_id, interp, rel="uses_interpreter"),
         g.edge(interp, shared_graph_id, rel="shares_graph"),
         g.edge(ctx, shared_graph_id, rel="publishes_to_graph", mode="auto"),
         g.edge(ctx, mem, rel="consults_memory", mode="auto"),
         g.edge(ctx, mem, rel="writes_memory", mode="auto"),
         *acl.terms(
             namespace,
-            agent_id,
+            node_id,
             layer=layer,
             context=ctx,
             memory=mem,
@@ -95,187 +96,93 @@ def _agent_terms(
     if parent_id is not None:
         parent_ctx = f"ctx:{parent_id}"
         terms += [
-            g.edge(parent_id, agent_id, rel="controls"),
+            g.edge(parent_id, node_id, rel="controls"),
             g.edge(parent_ctx, ctx, rel="commands_down_ctx", mode="auto"),
             g.edge(ctx, parent_ctx, rel="answers_up_ctx", mode="auto"),
         ]
     return terms
 
 
-def _lateral_terms(
-    g: runtime.Namespace,
-    ids: dict[tuple[int, int], str],
+def _sibling_lateral_terms(
+    g: graph.Namespace,
+    child_id: str,
+    siblings: list[str],
     *,
-    size: int,
     layer: int,
-    parent_id: str | None = None,
+    parent_id: str,
 ) -> list[dict[str, Any]]:
     out: list[dict[str, Any]] = []
-    for (i, j), src in ids.items():
-        for direction, ni, nj in _neighbors(i, j, size):
-            dst = ids[(ni, nj)]
-            payload: dict[str, Any] = {"layer": int(layer), "direction": direction}
-            if parent_id is not None:
-                payload["parent"] = parent_id
-            out.append(g.edge(src, dst, rel="lateral", **payload))
-            out.append(g.edge(f"ctx:{src}", f"ctx:{dst}", rel="answers_lateral_ctx", mode="auto", **payload))
+    payload: dict[str, Any] = {"layer": int(layer), "parent": parent_id}
+    for sibling in siblings:
+        out.append(g.edge(child_id, sibling, rel="lateral", **payload))
+        out.append(g.edge(sibling, child_id, rel="lateral", **payload))
+        out.append(g.edge(f"ctx:{child_id}", f"ctx:{sibling}", rel="answers_lateral_ctx", mode="auto", **payload))
+        out.append(g.edge(f"ctx:{sibling}", f"ctx:{child_id}", rel="answers_lateral_ctx", mode="auto", **payload))
     return out
 
 
-def spawn_agent(
-    parent_id: str,
+def spawn_node(
+    parent_id: str | None = None,
     child_id: str | None = None,
     *,
-    namespace: str = "agent_hierarchy",
-    layer: int | None = None,
+    namespace: str = "hierarchy",
     x: int | None = None,
     y: int | None = None,
-    max_children: int = 0,
-    engine: runtime._Engine | None = None,
+    engine: graph._Engine | None = None,
 ) -> dict[str, Any]:
-    eng = engine or runtime._engine()
-    ns = runtime._normalize_ns(namespace)
-    g = runtime.ns(ns)
+    """Create one hierarchy node (or child under `parent_id`) with sibling links."""
+    eng = engine or _default_engine()
+    ns = graph._normalize_ns(namespace)
+    g = graph.ns(ns)
+    shared_graph_id = f"graph:{ns}:shared"
 
     with eng._tx():
-        parent = _node_data(eng.db, ns, parent_id)
-        if parent is None or parent.get("kind") != "agent":
-            raise ValueError(f"parent agent not found: {parent_id}")
-
-        used = _child_count(eng.db, ns, parent_id)
-        budget = int(parent.get("max_children", 0))
-        if used >= budget:
-            raise ValueError(f"spawn budget exceeded for {parent_id}: {used}/{budget}")
-
-        child = child_id or _new_agent_id(eng.db, ns)
+        terms: list[dict[str, Any]] = [g.node(shared_graph_id, kind="shared_graph")]
+        siblings: list[str] = []
+        child_layer = 0
+        if parent_id is not None:
+            parent = _node_data(eng.db, ns, parent_id)
+            if parent is None or parent.get("kind") != "node":
+                raise ValueError(f"parent node not found: {parent_id}")
+            child_layer = int(parent.get("layer", 0)) + 1
+            if child_layer > MAX_HIERARCHY_DEPTH:
+                raise ValueError(
+                    f"max hierarchy depth exceeded for {parent_id}: "
+                    f"{child_layer}>{MAX_HIERARCHY_DEPTH}"
+                )
+            siblings = _children(eng.db, ns, parent_id)
+        child = child_id or _new_node_id(eng.db, ns)
         if child_id is not None and _node_data(eng.db, ns, child) is not None:
-            raise ValueError(f"child agent already exists: {child}")
+            raise ValueError(f"child node already exists: {child}")
 
-        child_layer = int(parent.get("layer", 0)) + 1 if layer is None else int(layer)
-        terms = _agent_terms(
+        terms += _node_terms(
             g,
             namespace=ns,
-            agent_id=child,
+            node_id=child,
             layer=child_layer,
-            max_children=max_children,
-            shared_graph_id=f"graph:{ns}:shared",
+            shared_graph_id=shared_graph_id,
             parent_id=parent_id,
             x=x,
             y=y,
         )
+        if parent_id is not None and siblings:
+            terms += _sibling_lateral_terms(
+                g,
+                child,
+                siblings,
+                layer=child_layer,
+                parent_id=parent_id,
+            )
         eng.run(g.rewrite(to=terms))
 
     return {
         "namespace": ns,
         "parent": parent_id,
+        "node": child,
         "child": child,
         "layer": child_layer,
-        "parent_budget": budget,
-        "parent_children_used": used + 1,
-        "parent_children_remaining": budget - (used + 1),
-    }
-
-
-def create_agent_hierarchy(
-    n: int,
-    m: int,
-    namespace: str = "agent_hierarchy",
-    *,
-    root_budget: int | None = None,
-    child_budget: int | None = None,
-    engine: runtime._Engine | None = None,
-) -> dict[str, Any]:
-    if n < 1 or m < 1:
-        raise ValueError("n and m must be >= 1")
-
-    eng = engine or runtime._engine()
-    ns = runtime._normalize_ns(namespace)
-    g = runtime.ns(ns)
-    used_ids: set[str] = set()
-
-    root_id = _new_agent_id(eng.db, ns, used_ids)
-    shared_graph_id = f"graph:{ns}:shared"
-    root_max = n * n if root_budget is None else int(root_budget)
-    mid_max = m * m if child_budget is None else int(child_budget)
-
-    terms: list[dict[str, Any]] = [g.node(shared_graph_id, kind="shared_graph")]
-    terms += _agent_terms(
-        g,
-        namespace=ns,
-        agent_id=root_id,
-        layer=0,
-        max_children=root_max,
-        shared_graph_id=shared_graph_id,
-    )
-
-    level1: dict[tuple[int, int], str] = {}
-    for i in range(n):
-        for j in range(n):
-            aid = _new_agent_id(eng.db, ns, used_ids)
-            level1[(i, j)] = aid
-            terms += _agent_terms(
-                g,
-                namespace=ns,
-                agent_id=aid,
-                layer=1,
-                max_children=mid_max,
-                shared_graph_id=shared_graph_id,
-                parent_id=root_id,
-                x=i,
-                y=j,
-            )
-    terms += _lateral_terms(g, level1, size=n, layer=1)
-
-    for parent in level1.values():
-        level2: dict[tuple[int, int], str] = {}
-        for i in range(m):
-            for j in range(m):
-                aid = _new_agent_id(eng.db, ns, used_ids)
-                level2[(i, j)] = aid
-                terms += _agent_terms(
-                    g,
-                    namespace=ns,
-                    agent_id=aid,
-                    layer=2,
-                    max_children=0,
-                    shared_graph_id=shared_graph_id,
-                    parent_id=parent,
-                    x=i,
-                    y=j,
-                )
-        terms += _lateral_terms(g, level2, size=m, layer=2, parent_id=parent)
-
-    eng.run(g.rewrite(to=terms))
-
-    agents_total = 1 + n * n + n * n * m * m
-    users_total = agents_total
-    groups_total = 4
-    edges_can_agent = agents_total * 3
-    edges_can_user = agents_total * 2
-    edges_can_group = groups_total
-    edges_can_total = edges_can_agent + edges_can_user + edges_can_group
-
-    return {
-        "namespace": ns,
-        "n": n,
-        "m": m,
-        "agents_total": agents_total,
-        "users_total": users_total,
-        "groups_total": groups_total,
-        "root_budget": root_max,
-        "child_budget": mid_max,
-        "edges_can": edges_can_total,
-        "edges_can_agent": edges_can_agent,
-        "edges_can_user": edges_can_user,
-        "edges_can_group": edges_can_group,
-        "edges_can_read": edges_can_total,
-        "edges_can_write": edges_can_total,
-        "edges_member_of": users_total * 2,
-        "edges_uses_identity": users_total,
-        "root_agent": root_id,
-        "group_all": f"group:{ns}:all",
-        "graph_node": shared_graph_id,
-        "terms_upserted": len(terms),
+        "max_depth": MAX_HIERARCHY_DEPTH,
+        "connected_siblings": len(siblings),
     }
 
 
@@ -284,23 +191,25 @@ def has_permission(
     target: str,
     *,
     action: str = "read",
-    namespace: str = "agent_hierarchy",
-    engine: runtime._Engine | None = None,
+    namespace: str = "hierarchy",
+    engine: graph._Engine | None = None,
 ) -> bool:
+    """Check ACL permission in the hierarchy namespace."""
     return acl.check(subject, target, action=action, namespace=namespace, engine=engine)
 
 
 def route_messages_once(
-    namespace: str = "agent_hierarchy",
+    namespace: str = "hierarchy",
     *,
     limit: int = 1000,
-    engine: runtime._Engine | None = None,
+    engine: graph._Engine | None = None,
 ) -> dict[str, int]:
+    """Route one batch of outbound context messages to recipients and memory graphs."""
     if limit < 1:
         raise ValueError("limit must be >= 1")
 
-    eng = engine or runtime._engine()
-    ns = runtime._normalize_ns(namespace)
+    eng = engine or _default_engine()
+    ns = graph._normalize_ns(namespace)
     routes = [
         ("out_answer", ("answers_up_ctx", "answers_lateral_ctx"), "in_answer", "answer", True, "answer_delivered"),
         ("out_command", ("commands_down_ctx",), "in_command", "command", True, "command_delivered"),
@@ -331,21 +240,33 @@ def route_messages_once(
                 (*via_rels, ns, out_rel, limit),
             ).fetchall()
 
+            mem_by_ctx: dict[str, list[str]] = {}
+            if write_memory and rows:
+                dsts = sorted({str(r["dst"]) for r in rows})
+                qmarks = ",".join("?" for _ in dsts)
+                mem_rows = eng.db.execute(
+                    f"""
+                    SELECT node0, node1
+                    FROM hyperedges
+                    WHERE namespace=? AND relation='consults_memory' AND node0 IN ({qmarks})
+                    """,
+                    (ns, *dsts),
+                ).fetchall()
+                for mem_row in mem_rows:
+                    mem_by_ctx.setdefault(str(mem_row["node0"]), []).append(str(mem_row["node1"]))
+
             consumed: list[int] = []
             for row in rows:
-                data = json.loads(row["data"]) if row["data"] else {}
+                data = _load_json(row["data"])
                 emb = None if row["embedding"] is None else json.loads(row["embedding"])
                 eng._upsert_edge(ns, in_rel, [row["dst"], row["msg"]], data, emb)
                 consumed.append(int(row["edge_id"]))
 
                 if write_memory:
-                    mem_rows = eng.db.execute(
-                        "SELECT node1 FROM hyperedges WHERE namespace=? AND relation='consults_memory' AND node0=?",
-                        (ns, row["dst"]),
-                    ).fetchall()
-                    for mem in mem_rows:
-                        eng._upsert_edge(ns, "memory_item", [mem["node1"], row["msg"]], {"channel": channel}, emb)
-                    stats["memory_items_written"] += len(mem_rows)
+                    mem_targets = mem_by_ctx.get(str(row["dst"]), [])
+                    for mem_id in mem_targets:
+                        eng._upsert_edge(ns, "memory_item", [mem_id, row["msg"]], {"channel": channel}, emb)
+                    stats["memory_items_written"] += len(mem_targets)
 
             if consumed:
                 eng.db.execute(
@@ -359,25 +280,25 @@ def route_messages_once(
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Create an agent hierarchy graph in runtime.")
-    parser.add_argument("--n", type=int, default=3, help="Grid size N for layer-1 (NxN).")
-    parser.add_argument("--m", type=int, default=2, help="Grid size M for each layer-2 child grid (MxM).")
-    parser.add_argument("--namespace", default="agent_hierarchy", help="Graph namespace.")
-    parser.add_argument("--db-path", default="agent_hierarchy.db", help="SQLite DB path for runtime engine.")
-    parser.add_argument("--root-budget", type=int, default=None, help="Max number of children controlled by root.")
-    parser.add_argument("--child-budget", type=int, default=None, help="Max number of children controlled by layer-1 agents.")
+    parser = argparse.ArgumentParser(description="Create one hierarchy node (optionally under an existing parent).")
+    parser.add_argument("--parent-id", default=None, help="Parent node id. Omit to create a root node.")
+    parser.add_argument("--child-id", default=None, help="Optional explicit id for the new node.")
+    parser.add_argument("--x", type=int, default=None, help="Optional x coordinate metadata.")
+    parser.add_argument("--y", type=int, default=None, help="Optional y coordinate metadata.")
+    parser.add_argument("--namespace", default="hierarchy", help="Graph namespace.")
+    parser.add_argument("--db-path", default="hierarchy.db", help="SQLite DB path for runtime engine.")
     args = parser.parse_args()
 
-    engine = runtime._Engine(args.db_path)
+    engine = graph._Engine(args.db_path)
     try:
         print(
             json.dumps(
-                create_agent_hierarchy(
-                    args.n,
-                    args.m,
+                spawn_node(
+                    args.parent_id,
+                    args.child_id,
                     namespace=args.namespace,
-                    root_budget=args.root_budget,
-                    child_budget=args.child_budget,
+                    x=args.x,
+                    y=args.y,
                     engine=engine,
                 ),
                 indent=2,

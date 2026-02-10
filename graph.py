@@ -162,7 +162,7 @@ class Command:
             self,
             rhs=tuple(rhs),
             random=self.random if random is None else bool(random),
-            limit=self.limit if limit is None else _as_limit(limit),
+            limit=self.limit if limit is None else int(limit),
         )
 
 
@@ -240,6 +240,8 @@ class _Engine:
             CREATE INDEX IF NOT EXISTS idx_hyper_ns_arity ON hyperedges(namespace, arity);
             CREATE INDEX IF NOT EXISTS idx_hyper_ns_rel_arity ON hyperedges(namespace, relation, arity);
             CREATE INDEX IF NOT EXISTS idx_hyper_ns_rel_arity_n0 ON hyperedges(namespace, relation, arity, node0);
+            CREATE INDEX IF NOT EXISTS idx_hyper_ns_rel_n0_n1 ON hyperedges(namespace, relation, node0, node1);
+            CREATE INDEX IF NOT EXISTS idx_hyper_ns_rel_n0 ON hyperedges(namespace, relation, node0);
             """
         )
         self.db.commit()
@@ -453,9 +455,9 @@ class _Engine:
             out[int(row["edge_id"])] = _edge_obj(
                 row["edge_id"],
                 row["relation"],
-                json.loads(row["nodes_json"]),
-                json.loads(row["data"]),
-                None if row["embedding"] is None else json.loads(row["embedding"]),
+                _json_load(row["nodes_json"], default=[]),
+                _json_load(row["data"], default={}),
+                _json_load(row["embedding"], default=None),
             )
         return out
 
@@ -487,6 +489,10 @@ def _project(rows, keys, default):
     return rows if not keys else [{k: row.get(k, default) for k in keys} for row in rows]
 
 
+def _json_load(raw, default):
+    return default if raw is None else json.loads(raw)
+
+
 def _edge_obj(edge_id, relation, nodes, data, embedding):
     return {
         "edge_id": int(edge_id),
@@ -498,14 +504,12 @@ def _edge_obj(edge_id, relation, nodes, data, embedding):
 
 
 def _coerce_terms(raw):
-    if raw is None:
-        return []
-    return list(raw) if isinstance(raw, (list, tuple)) else [raw]
+    return [] if raw is None else (list(raw) if isinstance(raw, (list, tuple)) else [raw])
 
 
 def _as_term(raw, pattern):
     if not isinstance(raw, dict):
-        raise ValueError("term must be created with runtime.edge(...) or runtime.node(...)")
+        raise ValueError("term must be created with graph.edge(...) or graph.node(...)")
     nodes = list(raw["nodes"])
     if not nodes:
         raise ValueError("term nodes must be non-empty")
@@ -514,7 +518,6 @@ def _as_term(raw, pattern):
         "nodes": [_as_tok(tok, pattern) for tok in nodes],
         "data": dict(raw.get("data") or {}),
         "embedding": raw.get("embedding"),
-        "temp": bool(raw.get("temp", False)),
     }
 
 
@@ -616,7 +619,7 @@ def _eval(expr, env):
 
 
 def _vec(value):
-    raw = json.loads(value) if isinstance(value, str) else value
+    raw = _json_load(value, default=None) if isinstance(value, str) else value
     if not isinstance(raw, (list, tuple)) or not raw:
         raise ValueError("embedding must be a non-empty list/tuple of numbers")
     try:
@@ -636,6 +639,15 @@ def _normalize_ns(namespace):
     if ":" in value:
         raise ValueError("invalid namespace; ':' is reserved")
     return value
+
+
+def normalize_ns(namespace):
+    return _normalize_ns(namespace)
+
+
+def validate_term(term):
+    _as_term(term, pattern=False)
+    return term
 
 
 def vars(names):
@@ -670,12 +682,8 @@ def node(node_id, embedding=None, data=None, temp=False, **props):
     return edge(node_id, rel="__node__", embedding=embedding, data=data, temp=temp, **props)
 
 
-def _as_limit(limit):
-    return None if limit is None else int(limit)
-
-
 def match(*lhs, limit=None, random=False):
-    return Command(lhs=tuple(lhs), limit=_as_limit(limit), random=bool(random))
+    return Command(lhs=tuple(lhs), limit=None if limit is None else int(limit), random=bool(random))
 
 
 def rewrite(*lhs, to, random=False, limit=None):
@@ -689,7 +697,29 @@ def ns(name):
 _ENGINE: _Engine | None = None
 
 
+def get_engine() -> _Engine:
+    global _ENGINE
+    if _ENGINE is None:
+        _ENGINE = _Engine()
+    return _ENGINE
+
+
+@contextmanager
+def using_engine(engine: _Engine | None):
+    if engine is None:
+        yield get_engine()
+        return
+    global _ENGINE
+    prev = _ENGINE
+    _ENGINE = engine
+    try:
+        yield engine
+    finally:
+        _ENGINE = prev
+
+
 __all__ = [
+    "_Engine",
     "vars",
     "const",
     "on",
@@ -699,4 +729,8 @@ __all__ = [
     "match",
     "rewrite",
     "Result",
+    "normalize_ns",
+    "validate_term",
+    "get_engine",
+    "using_engine",
 ]

@@ -9,27 +9,27 @@ import tempfile
 import time
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
-import runtime
+import graph
 
 
 def build_seed_terms(pairs: int) -> list[dict[str, object]]:
     terms: list[dict[str, object]] = []
     for i in range(pairs):
         a, b, c, d = f"a{i}", f"b{i}", f"c{i}", f"d{i}"
-        terms.append(runtime.edge(a, a, b, tag="lhs"))
-        terms.append(runtime.edge(b, c, d, rel="r2", tag="rhs"))
+        terms.append(graph.edge(a, a, b, tag="lhs"))
+        terms.append(graph.edge(b, c, d, rel="r2", tag="rhs"))
     return terms
 
 
-def seed(engine: runtime._Engine, pairs: int) -> float:
+def seed(engine: graph._Engine, pairs: int) -> float:
     t0 = time.perf_counter()
-    engine.run(runtime.rewrite(to=build_seed_terms(pairs)))
+    engine.run(graph.rewrite(to=build_seed_terms(pairs)))
     return time.perf_counter() - t0
 
 
-def bench_match(engine: runtime._Engine, pairs: int, runs: int) -> dict[str, float]:
-    x, y, z, u = runtime.vars("x y z u")
-    cmd = runtime.match(runtime.edge(x, x, y), runtime.edge(y, z, u, rel="r2"), limit=pairs)
+def bench_match(engine: graph._Engine, pairs: int, runs: int) -> dict[str, float]:
+    x, y, z, u = graph.vars("x y z u")
+    cmd = graph.match(graph.edge(x, x, y), graph.edge(y, z, u, rel="r2"), limit=pairs)
 
     # Warmup
     for _ in range(3):
@@ -50,10 +50,10 @@ def bench_match(engine: runtime._Engine, pairs: int, runs: int) -> dict[str, flo
     }
 
 
-def bench_rewrite(engine: runtime._Engine, pairs: int, runs: int) -> dict[str, float]:
-    x, y, z, u, v = runtime.vars("x y z u v")
-    cmd = runtime.match(runtime.edge(x, x, y), runtime.edge(y, z, u, rel="r2")).rewrite(
-        [runtime.edge(x, v, u), runtime.edge(y, v, z), runtime.edge(v, v, u)],
+def bench_rewrite(engine: graph._Engine, pairs: int, runs: int) -> dict[str, float]:
+    x, y, z, u, v = graph.vars("x y z u v")
+    cmd = graph.match(graph.edge(x, x, y), graph.edge(y, z, u, rel="r2")).rewrite(
+        [graph.edge(x, v, u), graph.edge(y, v, z), graph.edge(v, v, u)],
         limit=max(10, pairs * 4),
     )
 
@@ -106,7 +106,7 @@ def _run_trial(pairs: int, match_runs: int, rewrite_runs: int) -> dict[str, obje
     fd, db_path = tempfile.mkstemp(prefix="runtime_bench_", suffix=".db")
     os.close(fd)
     try:
-        engine = runtime._Engine(db_path)
+        engine = graph._Engine(db_path)
         seed_seconds = seed(engine, pairs)
         match = bench_match(engine, pairs, match_runs)
         rewrite = bench_rewrite(engine, pairs, rewrite_runs)

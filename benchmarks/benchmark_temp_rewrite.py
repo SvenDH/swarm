@@ -9,25 +9,25 @@ import tempfile
 import time
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
-import runtime
+import graph
 
 
 def build_seed_terms(pairs: int) -> list[dict[str, object]]:
     terms: list[dict[str, object]] = []
     for i in range(pairs):
         a, b, c, d = f"a{i}", f"b{i}", f"c{i}", f"d{i}"
-        terms.append(runtime.edge(a, a, b))
-        terms.append(runtime.edge(b, c, d, rel="r2"))
+        terms.append(graph.edge(a, a, b))
+        terms.append(graph.edge(b, c, d, rel="r2"))
     return terms
 
 
-def build_rewrite(limit: int) -> runtime.Command:
-    x, y, z, u, v = runtime.vars("x y z u v")
-    return runtime.match(
-        runtime.edge(x, x, y),
-        runtime.edge(y, z, u, rel="r2"),
+def build_rewrite(limit: int) -> graph.Command:
+    x, y, z, u, v = graph.vars("x y z u v")
+    return graph.match(
+        graph.edge(x, x, y),
+        graph.edge(y, z, u, rel="r2"),
     ).rewrite(
-        [runtime.edge(x, v, u), runtime.edge(y, v, z), runtime.edge(v, v, u)],
+        [graph.edge(x, v, u), graph.edge(y, v, z), graph.edge(v, v, u)],
         limit=limit,
     )
 
@@ -36,9 +36,9 @@ def bench_temp_rewrite(pairs: int, runs: int, limit: int, warmup: int) -> dict[s
     fd, db_path = tempfile.mkstemp(prefix="runtime_temp_bench_", suffix=".db")
     os.close(fd)
     try:
-        engine = runtime._Engine(db_path)
+        engine = graph._Engine(db_path)
         seed_start = time.perf_counter()
-        engine.run(runtime.rewrite(to=build_seed_terms(pairs)))
+        engine.run(graph.rewrite(to=build_seed_terms(pairs)))
         seed_seconds = time.perf_counter() - seed_start
 
         cmd = build_rewrite(limit)
