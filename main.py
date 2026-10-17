@@ -1,6 +1,7 @@
 """Example: LLM_API_KEY=... uv run main.py (or configure LLM_BASE_URL)."""
 import argparse
-from agents import CodeAgent
+import asyncio
+from agents import Runtime
 from rich.console import Console
 from rich.live import Live
 from rich.markdown import Markdown
@@ -51,47 +52,58 @@ class ReplOutput:
         self.kind, self.text = None, ''
 
 
-def main():
+async def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--session', type=int, help='reopen a saved session ID')
     parser.add_argument('--database', default='agent.db')
     parser.add_argument('--workspaces')
+    parser.add_argument('--template', help='starter files copied into each new agent home')
+    parser.add_argument('--workers', type=int, default=4, help='shared Monty workers in this host process')
+    parser.add_argument('--model-concurrency', type=int, default=128)
     args = parser.parse_args()
     output = ReplOutput()
-    options = {'workspaces': args.workspaces, 'on_output': output}
-    agent = CodeAgent(args.database, session_id=args.session, **options)
-    print('Monty agent — /new, /sessions, /use ID, /resume, /quit')
-    try:
-        while True:
-            try:
-                prompt = input(f'{agent.id}:{agent.name}> ').strip()
-                if prompt == '/quit':
+    async with Runtime(args.database, workspaces=args.workspaces, workers=args.workers,
+                       model_concurrency=args.model_concurrency, template=args.template) as runtime:
+        agent = await runtime.agent(session_id=args.session, on_output=output)
+        print('Monty agent — /new, /sessions, /use ID, /resume, /quit')
+        resume = args.session is not None
+        try:
+            while True:
+                try:
+                    if resume:
+                        resume = False
+                        output.reset()
+                        await agent.run()
+                        output.finish()
+                    prompt = (await asyncio.to_thread(input, f'{agent.id}:{agent.name}> ')).strip()
+                    if prompt == '/quit':
+                        break
+                    if prompt == '/sessions':
+                        for session in await agent.sessions():
+                            print(f"{session['id']}: {session['name']} — {session['workspace']}")
+                        continue
+                    if prompt == '/new' or prompt.startswith('/use '):
+                        replacement = await runtime.agent(on_output=output,
+                            session_id=None if prompt == '/new' else int(prompt.split()[1]))
+                        await agent.close()
+                        agent = replacement
+                        resume = True
+                        continue
+                    if prompt:
+                        output.reset()
+                        answer = await agent.run(None if prompt == '/resume' else prompt)
+                        if output.kind is None:
+                            output('assistant', answer)
+                        output.finish()
+                except EOFError:
                     break
-                if prompt == '/sessions':
-                    for session in agent.sessions():
-                        print(f"{session['id']}: {session['name']} — {session['workspace']}")
-                    continue
-                if prompt == '/new' or prompt.startswith('/use '):
-                    replacement = CodeAgent(args.database, **options,
-                                            session_id=None if prompt == '/new' else int(prompt.split()[1]))
-                    agent.close()
-                    agent = replacement
-                    continue
-                if prompt:
-                    output.reset()
-                    answer = agent.run(None if prompt == '/resume' else prompt)
-                    if output.kind is None:
-                        output('assistant', answer)
+                except Exception as exc:
+                    output('error', f'{type(exc).__name__}: {exc}')
                     output.finish()
-            except EOFError:
-                break
-            except Exception as exc:
-                output('error', f'{type(exc).__name__}: {exc}')
-                output.finish()
-    finally:
-        output.finish()
-        agent.close()
+        finally:
+            output.finish()
+            await agent.close()
 
 
 if __name__ == '__main__':
-    main()
+    asyncio.run(main())

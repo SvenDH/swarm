@@ -1,66 +1,55 @@
-"""Monty code agent: events + immutable objects are the durable source of truth.
+"""Async Monty agents with durable SQLite checkpoints and resumable pending work.
 
-sessions/files and visible workspaces are rebuildable views. Changes go through
-agent tools; editing a workspace directly does not change recorded state.
-execute() resumes pending work; execution_id deduplicates retries. rebuild()
-replays events without running code. Inject Storage to replace local files.
-The database and Monty snapshots must be trusted. Library wrappers expose plain
-data and virtual files; their host work is outside Monty's resource accounting.
+Files are immutable storage objects referenced by SQLite; workspaces are disposable
+copies. Only completed model messages and successful interpreter changes commit.
+The database and interpreter snapshots must be trusted. Native-library wrappers
+operate on virtual bytes/plain data outside Monty's resource accounting.
 """
 from __future__ import annotations
 
 import fnmatch
+import asyncio
 import hashlib
-import io
 import json
 import os
 import posixpath
-import re
 import shutil
 import sqlite3
+import threading
 import uuid
+from concurrent.futures import ThreadPoolExecutor
+from functools import partial, wraps
+from weakref import WeakValueDictionary
 from pathlib import Path as HostPath
 from pathlib import PurePosixPath as Path
 from typing import Protocol
-from contextlib import contextmanager
+from contextlib import contextmanager, asynccontextmanager, AsyncExitStack
 from dataclasses import dataclass
 
 import httpx
-import numpy as np
-import pandas as pd
-from PIL import Image
-from docx import Document
-from openpyxl import Workbook, load_workbook
-from pypdf import PdfReader, PdfWriter
-from pydantic_monty import CallbackFile, Monty, MontyError, MontyCrashedError, OSAccess
+from jiter import from_json
+from openai import AsyncOpenAI, pydantic_function_tool, LengthFinishReasonError, ContentFilterFinishReasonError
+from pydantic import BaseModel, ConfigDict
+from pydantic_monty import CallbackFile, AsyncMonty, MontyError, MontyCrashedError, OSAccess
 from dotenv import load_dotenv
 from names import num_to_name
+from wrappers import tools as library_tools
 
 load_dotenv(override=True)
 
 
 def code_prefix(arguments):
-    """Decode the complete characters of an unfinished JSON code argument."""
-    start = re.search(r'"code"\s*:\s*"', arguments)
-    if start is None:
+    """Jiter keeps incomplete strings/escapes out of the streamed code preview."""
+    try:
+        return from_json(arguments.encode(), partial_mode='trailing-strings').get('code', '')
+    except ValueError:
         return ''
-    token = re.match(r'(?:[^"\\\x00-\x1f]|\\(?:["\\/bfnrt]|u[0-9a-fA-F]{4}))*',
-                     arguments[start.end():]).group()
-    code = json.loads('"' + token + '"')
-    return code[:-1] if code and 0xD800 <= ord(code[-1]) <= 0xDBFF else code
 
 
-def sse_data(response):
-    """SSE events can span multiple data lines and arbitrary network chunks."""
-    data = []
-    for line in response.iter_lines():
-        if line.startswith('data:'):
-            data.append(line[5:].lstrip(' '))
-        elif not line and data:
-            yield '\n'.join(data)
-            data.clear()
-    if data:
-        yield '\n'.join(data)
+class PythonCode(BaseModel):
+    """Run Python in the durable Monty virtual Unix environment."""
+    model_config = ConfigDict(extra='forbid')
+    code: str
 
 HELP = """You are a code-mode assistant. Execute Python with the python tool to
 inspect and modify a persistent virtual Unix filesystem. No host shell/network.
@@ -235,96 +224,6 @@ class Unix(OSAccess):
             self.path_unlink(p)
 
 
-    def source(self, path):
-        return io.BytesIO(self.path_read_bytes(self.path(path)))
-
-    def save(self, path, writer):
-        output = io.BytesIO()
-        writer(output)
-        return self.write(path, output.getvalue())
-
-    def numpy(self, op, data, other=None, axis=None):
-        a = np.asarray(data)
-        operations = {'array': lambda: a, 'sum': lambda: a.sum(axis=axis),
-                      'mean': lambda: a.mean(axis=axis), 'min': lambda: a.min(axis=axis),
-                      'max': lambda: a.max(axis=axis), 'std': lambda: a.std(axis=axis),
-                      'median': lambda: np.median(a, axis=axis),
-                      'transpose': lambda: a.T, 'reshape': lambda: a.reshape(other),
-                      'dot': lambda: a.dot(other), 'unique': lambda: np.unique(a)}
-        value = operations[op]()
-        return value.tolist()
-
-    def pandas(self, op, data=None, path=None, columns=None):
-        if op in ('read_csv', 'read_excel'):
-            frame = (pd.read_csv(self.source(path)) if op == 'read_csv'
-                     else pd.read_excel(self.source(path)))
-        else:
-            frame = pd.DataFrame(data)
-            if op in ('to_csv', 'to_excel'):
-                writer = frame.to_csv if op == 'to_csv' else frame.to_excel
-                return self.save(path, lambda output: writer(output, index=False))
-            operations = {'head': lambda: frame.head(5 if columns is None else columns),
-                          'describe': frame.describe, 'select': lambda: frame[columns],
-                          'sort': lambda: frame.sort_values(columns),
-                          'drop_duplicates': frame.drop_duplicates}
-            frame = operations[op]()
-        return json.loads(frame.to_json(orient='records'))
-
-    def PIL(self, op, path=None, output=None, size=None, mode='RGB', color='white'):
-        if op not in ('info', 'new', 'resize', 'convert'):
-            raise ValueError('unknown image operation')
-        image = Image.new(mode, tuple(size), color) if op == 'new' else Image.open(self.source(path))
-        try:
-            if op == 'info':
-                return {'size': list(image.size), 'mode': image.mode, 'format': image.format}
-            if op == 'resize':
-                image = image.resize(tuple(size))
-            elif op == 'convert':
-                image = image.convert(mode)
-            fmt = Image.registered_extensions()[Path(output).suffix.lower()]
-            return self.save(output, lambda stream: image.save(stream, format=fmt))
-        finally:
-            image.close()
-
-    def openpyxl(self, op, path, rows=None, sheet=None):
-        if op not in ('read', 'write', 'append'):
-            raise ValueError('unknown workbook operation')
-        book = Workbook() if op == 'write' else load_workbook(self.source(path))
-        try:
-            if op == 'read':
-                return {s.title: [list(row) for row in s.values] for s in book.worksheets}
-            target = book[sheet] if sheet in book.sheetnames else book.active
-            if sheet and sheet not in book.sheetnames:
-                target = book.create_sheet(sheet)
-            for row in rows or []:
-                target.append(row)
-            return self.save(path, book.save)
-        finally:
-            book.close()
-
-    def pypdf(self, op, path, output=None, pages=None):
-        reader = PdfReader(self.source(path))
-        indices = range(len(reader.pages)) if pages is None else pages
-        if op == 'read':
-            return [reader.pages[i].extract_text() for i in indices]
-        if op != 'select':
-            raise ValueError('unknown PDF operation')
-        writer = PdfWriter()
-        for i in indices:
-            writer.add_page(reader.pages[i])
-        return self.save(output, writer.write)
-
-    def docx(self, op, path, paragraphs=None):
-        if op not in ('read', 'write', 'append'):
-            raise ValueError('unknown document operation')
-        document = Document() if op == 'write' else Document(self.source(path))
-        if op == 'read':
-            return [p.text for p in document.paragraphs]
-        for text in paragraphs or []:
-            document.add_paragraph(text)
-        return self.save(path, document.save)
-
-
 def sync_directory(path):
     descriptor = os.open(path, os.O_RDONLY | os.O_DIRECTORY)
     try:
@@ -418,86 +317,229 @@ class DirectoryStorage:
 class Session:
     id: int
     name: str
-    workspace: str
     cwd: str
     monty: bytes | None
     messages: list[dict]
-    generation: str
     pending: dict | None
-    last_event_id: int
 
 
 class ExecutionError(RuntimeError):
-    """A recorded sandbox failure; infrastructure failures remain retryable."""
+    """A recorded code failure; infrastructure failures remain retryable."""
 
 
-class CodeAgent:
-    """Commit request, run code, then atomically record objects/checkpoint/result.
+async def settled(future):
+    """Drain blocking work before cancellation releases its session/DB lock."""
+    cancelled = False
+    while True:
+        try:
+            result = await asyncio.shield(future)
+            break
+        except asyncio.CancelledError:
+            if future.cancelled():
+                raise
+            cancelled = True
+    if cancelled:
+        raise asyncio.CancelledError
+    return result
 
-    Retry pending requests; return recorded results for completed execution IDs.
-    Model requests may repeat after a crash. Committed local effects do not.
-    """
 
-    def __init__(self, database='agent.db', *, session_id=None, workspaces=None, storage: Storage | None = None,
-                 model=None, base_url=None, api_key=None, on_output=None):
-        self.on_output = on_output
-        self._streamed_calls = set()
+def serialized(method):
+    @wraps(method)
+    async def call(self, *args, **kwargs):
+        async with self.runtime.operation(), self._lock:
+            if self._closed:
+                raise RuntimeError('agent is closed')
+            return await method(self, *args, **kwargs)
+    return call
+
+
+class Runtime:
+    """One shared runtime per database, in one process. All host IO runs off-loop."""
+
+    def __init__(self, database='agent.db', *, workspaces=None, storage=None, model=None,
+                 base_url=None, api_key=None, workers=4, io_workers=8, model_concurrency=128,
+                 client=None, template=None):
+        if min(workers, io_workers, model_concurrency) < 1:
+            raise ValueError('concurrency limits must be positive')
         if storage is not None and workspaces is not None:
             raise ValueError('pass storage or workspaces, not both')
-        self.storage = storage if storage is not None else DirectoryStorage(
-            workspaces if workspaces is not None else HostPath(database).absolute().parent / 'workspaces')
-        self.db = sqlite3.connect(database, timeout=30, isolation_level=None)
+        self.database = HostPath(database).absolute()
+        self._storage = storage
+        self.db = None
+        self.workspaces = workspaces or self.database.parent / 'workspaces'
+        self.template = (HostPath(template) if template is not None else
+                         HostPath(__file__).with_name('template')).absolute()
+        self.model = model or os.environ.get('LLM_MODEL', 'gpt-6-luna')
+        self.base_url = base_url or os.environ.get('LLM_BASE_URL', 'https://api.openai.com/v1')
+        self.api_key = api_key if api_key is not None else os.environ.get('LLM_API_KEY', '')
+        self.client, self.workers, self.io_workers = client, workers, io_workers
+        self.model_concurrency = model_concurrency
+        self._model_slots, self._sandbox_slots = asyncio.Semaphore(model_concurrency), asyncio.Semaphore(workers)
+        self._creation_slots = asyncio.Semaphore(io_workers)
+        self._db_slots, self._io_slots = asyncio.Semaphore(1), asyncio.Semaphore(io_workers)
+        self._locks = WeakValueDictionary()
+        self._tasks = set()
+        self._drained = asyncio.Event()
+        self._drained.set()
+        self._closing = False
+        self._stack = None
+        self._close_task = None
+
+    def _connect(self):
+        self.db = sqlite3.connect(self.database, timeout=30, isolation_level=None, check_same_thread=False)
         self.db.execute('PRAGMA journal_mode=WAL')
         self.db.execute('PRAGMA synchronous=FULL')
         columns = [r[1] for r in self.db.execute('PRAGMA table_info(sessions)')]
-        if columns and 'last_event_id' not in columns:
-            self.db.close()
-            raise RuntimeError('unsupported database schema; use a fresh database and workspace root')
+        if columns and columns != ['id', 'name', 'cwd', 'monty', 'messages']:
+            raise RuntimeError('unsupported database schema; choose a new database and workspace root')
         self.db.executescript('''
-            CREATE TABLE IF NOT EXISTS events (
-                id INTEGER PRIMARY KEY AUTOINCREMENT, session_id INTEGER NOT NULL,
-                kind TEXT NOT NULL, execution_id TEXT, payload TEXT NOT NULL,
-                monty BLOB, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                UNIQUE(session_id,execution_id,kind));
-            CREATE INDEX IF NOT EXISTS events_session ON events(session_id,id);
-            CREATE TRIGGER IF NOT EXISTS events_no_update BEFORE UPDATE ON events
-                BEGIN SELECT RAISE(ABORT,'events are append-only'); END;
-            CREATE TRIGGER IF NOT EXISTS events_no_delete BEFORE DELETE ON events
-                BEGIN SELECT RAISE(ABORT,'events are append-only'); END;
             CREATE TABLE IF NOT EXISTS sessions (
-                id INTEGER PRIMARY KEY, name TEXT UNIQUE NOT NULL, workspace TEXT NOT NULL,
-                cwd TEXT NOT NULL, monty BLOB, messages TEXT NOT NULL,
-                generation TEXT NOT NULL, pending TEXT, last_event_id INTEGER NOT NULL);
+                id INTEGER PRIMARY KEY, name TEXT UNIQUE NOT NULL, cwd TEXT NOT NULL,
+                monty BLOB, messages TEXT NOT NULL DEFAULT '[]');
             CREATE TABLE IF NOT EXISTS files (
-                session_id INTEGER NOT NULL, path TEXT NOT NULL,
-                kind TEXT NOT NULL CHECK(kind IN ('file','directory')),
-                storage_key TEXT, size INTEGER NOT NULL, generation TEXT NOT NULL,
-                PRIMARY KEY (session_id,path));
+                session_id INTEGER NOT NULL, path TEXT NOT NULL, kind TEXT NOT NULL,
+                storage_key TEXT, size INTEGER NOT NULL, PRIMARY KEY(session_id,path));
+            CREATE TABLE IF NOT EXISTS executions (
+                session_id INTEGER NOT NULL, id TEXT NOT NULL, code TEXT NOT NULL,
+                tool_id TEXT, output TEXT, error INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY(session_id,id));
+            CREATE UNIQUE INDEX IF NOT EXISTS one_pending_execution
+                ON executions(session_id) WHERE output IS NULL;
         ''')
+
+    async def __aenter__(self):
+        if self._stack is not None or self._closing:
+            raise RuntimeError('runtime cannot be entered twice')
+        self._stack = AsyncExitStack()
+        self._loop, self._loop_thread = asyncio.get_running_loop(), threading.get_ident()
+        self._database_executor = ThreadPoolExecutor(1, thread_name_prefix='swarm-db')
+        self._io_executor = ThreadPoolExecutor(self.io_workers, thread_name_prefix='swarm-io')
+        self._stack.push_async_callback(asyncio.to_thread, self._database_executor.shutdown, wait=True)
+        self._stack.push_async_callback(asyncio.to_thread, self._io_executor.shutdown, wait=True)
         try:
-            with self._transaction():
-                if session_id is None:
-                    self.id = self.db.execute('SELECT COALESCE(MAX(session_id)+1,0) FROM events').fetchone()[0]
-                    if not 0 <= self.id < 65536:
-                        raise ValueError('names.py capacity exhausted')
-                    self.name = num_to_name(self.id)
-                    self.storage.create(self.name)
-                    fs = Unix(cwd=self.home)
-                    fs.mkdir(self.home)
-                    fs.mkdir('/tmp')
-                    payload = self._publish(fs.entries())
-                    self._append('session_created', {**payload, 'name': self.name, 'cwd': self.home})
-                else:
-                    self.id = session_id
-                    self._replay()
-                    self.name = self.state.name
-            self._checkout()
+            self.storage = await self.offload(lambda: self._storage if self._storage is not None
+                                             else DirectoryStorage(self.workspaces))
+            await self.offload(self.database.parent.mkdir, parents=True, exist_ok=True)
+            self._stack.push_async_callback(self.database_call, lambda: self.db.close() if self.db is not None else None)
+            await self.database_call(self._connect)
+            self._pool = await settled(asyncio.create_task(self._stack.enter_async_context(
+                AsyncMonty(min_processes=1, max_processes=self.workers, request_timeout=20))))
+            self.tool = await self.offload(pydantic_function_tool, PythonCode, name='python')
+            if self.client is None:
+                def make_client():
+                    self.client = AsyncOpenAI(api_key=self.api_key, base_url=self.base_url, max_retries=0,
+                        http_client=httpx.AsyncClient(timeout=120, limits=httpx.Limits(
+                            max_connections=self.model_concurrency, max_keepalive_connections=32)))
+                self._stack.push_async_callback(self._close_client)
+                await self.offload(make_client)
+            await self.offload(lambda: self.client.chat.completions)  # Warm lazy SDK imports off-loop.
+            return self
         except BaseException:
-            self.db.close()
+            await self.close()
             raise
-        self.model = model or os.environ.get('LLM_MODEL', 'gpt-6-luna')
-        self.base_url = (base_url or os.environ.get('LLM_BASE_URL', 'https://api.openai.com/v1')).rstrip('/')
-        self.api_key = api_key if api_key is not None else os.environ.get('LLM_API_KEY', '')
+
+    async def _close_client(self):
+        if self.client is not None:
+            await self.client.close()
+
+    async def __aexit__(self, *args):
+        await self.close()
+
+    @asynccontextmanager
+    async def operation(self):
+        if self._stack is None or self._closing:
+            raise RuntimeError('runtime is not running')
+        task = asyncio.current_task()
+        self._tasks.add(task)
+        self._drained.clear()
+        try:
+            yield
+        finally:
+            self._tasks.remove(task)
+            if not self._tasks:
+                self._drained.set()
+
+    async def database_call(self, function, *args, **kwargs):
+        async with self._db_slots:
+            return await settled(self._loop.run_in_executor(
+                self._database_executor, partial(function, *args, **kwargs)))
+
+    async def offload(self, function, *args, **kwargs):
+        async with self._io_slots:
+            return await settled(self._loop.run_in_executor(
+                self._io_executor, partial(function, *args, **kwargs)))
+
+    def _template_entries(self):
+        """Read trusted starter files off-loop; never import host symlinks/devices."""
+        if self.template.is_symlink():
+            raise ValueError('session template must not be a symlink')
+        if not self.template.is_dir():
+            raise NotADirectoryError(self.template)
+        entries = []
+        for path in sorted(self.template.rglob('*')):
+            if path.is_symlink():
+                raise ValueError(f'session template contains a symlink: {path}')
+            if path.is_dir():
+                content = None
+            elif path.is_file():
+                with path.open('rb') as source:
+                    content = source.read(32 * 1024**2 + 1)
+                if len(content) > 32 * 1024**2:
+                    raise ValueError(f'template file exceeds 32 MiB: {path}')
+            else:
+                raise ValueError(f'unsupported template entry: {path}')
+            entries.append((path.relative_to(self.template).as_posix(), content))
+        return entries
+
+    async def agent(self, *, session_id=None, model=None, on_output=None):
+        async with self.operation():
+            async with self._creation_slots:
+                entries = await self.offload(self._template_entries) if session_id is None else ()
+                agent = CodeAgent(self, model=model, on_output=on_output)
+                await self.database_call(agent._initialize, session_id, entries)
+                del entries
+            lock = self._locks.get(agent.id)
+            if lock is None:
+                lock = self._locks[agent.id] = asyncio.Lock()
+            agent._lock = lock
+            async with lock:
+                await agent._checkout()
+            return agent
+
+    async def close(self):
+        if asyncio.current_task() in self._tasks:
+            raise RuntimeError('cannot close a runtime inside an active operation')
+        if self._close_task is None:
+            self._closing = True
+            self._close_task = asyncio.create_task(self._close())
+        await settled(self._close_task)
+
+    async def _close(self):
+        await self._drained.wait()
+        if self._stack is not None:
+            await self._stack.aclose()
+
+
+class CodeAgent:
+    """Persist pending code, then commit its checkpoint/files/result atomically."""
+
+    def __init__(self, runtime, *, model=None, on_output=None):
+        self.runtime, self.db, self.storage = runtime, runtime.db, runtime.storage
+        self.model, self.on_output = model or runtime.model, on_output
+        self._streamed_calls = set()
+        self._closed = self._owns_runtime = False
+
+    @classmethod
+    async def open(cls, database='agent.db', *, session_id=None, model=None, on_output=None, **options):
+        """Convenience for one agent; share Runtime explicitly for many agents."""
+        runtime = await Runtime(database, model=model, **options).__aenter__()
+        try:
+            agent = await runtime.agent(session_id=session_id, on_output=on_output)
+            agent._owns_runtime = True
+            return agent
+        except BaseException:
+            await runtime.close()
+            raise
 
     @contextmanager
     def _transaction(self):
@@ -510,180 +552,180 @@ class CodeAgent:
                 self.db.execute('ROLLBACK')
             raise
 
+    def _initialize(self, session_id, entries=()):
+        with self._transaction():
+            if session_id is None:
+                self.id = self.db.execute('SELECT COALESCE(MAX(id)+1,0) FROM sessions').fetchone()[0]
+                if self.id >= 65536:
+                    raise ValueError('names.py capacity exhausted')
+                self.name = num_to_name(self.id)
+                self.storage.create(self.name)
+                fs = Unix(cwd=self.home)
+                fs.mkdir(self.home)
+                fs.mkdir('/tmp')
+                for relative, content in entries:
+                    path = str(Path(self.home) / relative)
+                    fs.mkdir(path if content is None else str(Path(path).parent))
+                    if content is not None:
+                        fs.write(path, content)
+                self.db.execute('INSERT INTO sessions(id,name,cwd) VALUES (?,?,?)', (self.id, self.name, self.home))
+                self._replace_files(self._publish(fs.entries()))
+            else:
+                self.id = session_id
+                self.name = self._state.name
+
     @property
     def home(self):
         return f'/home/{self.name}'
 
     @property
-    def state(self):
-        row = self.db.execute('SELECT id,name,workspace,cwd,monty,messages,generation,pending,last_event_id '
-                              'FROM sessions WHERE id=?', (self.id,)).fetchone()
+    def _state(self):
+        row = self.db.execute('SELECT id,name,cwd,monty,messages FROM sessions WHERE id=?', (self.id,)).fetchone()
         if row is None:
             raise ValueError(f'unknown session: {self.id}')
-        return Session(*row[:5], json.loads(row[5]), row[6],
-                       None if row[7] is None else json.loads(row[7]), row[8])
+        return Session(*row[:4], json.loads(row[4]), self._pending())
 
-    def _append(self, kind, payload, monty=None):
-        if not self.db.in_transaction:
-            raise RuntimeError('events require a transaction')
-        cursor = self.db.execute('INSERT INTO events(session_id,kind,execution_id,payload,monty) VALUES (?,?,?,?,?)',
-                                 (self.id, kind, payload.get('execution_id'), json.dumps(payload), monty))
-        self._project(cursor.lastrowid, kind, payload, monty)
+    def _pending(self):
+        row = self.db.execute('SELECT id,code,tool_id FROM executions WHERE session_id=? AND output IS NULL',
+                              (self.id,)).fetchone()
+        return dict(zip(('execution_id', 'code', 'tool_id'), row)) if row else None
 
-    def _project(self, event_id, kind, payload, monty):
-        if kind == 'session_created':
-            state = Session(self.id, payload['name'], payload['name'], payload['cwd'],
-                            None, [], payload['generation'], None, event_id)
-        else:
-            state = self.state
-        if kind == 'message_appended':
-            state.messages.append(payload['message'])
-        elif kind == 'execution_requested':
-            state.pending = payload
-        elif kind in ('execution_committed', 'execution_failed'):
-            state.pending = None
-            if payload['tool_id'] is not None:
-                state.messages.append({'role': 'tool', 'tool_call_id': payload['tool_id'], 'content': payload['output']})
-            if kind == 'execution_committed':
-                state.cwd, state.monty, state.generation = payload['cwd'], monty, payload['generation']
-        elif kind != 'session_created':
-            raise ValueError(f'unknown event kind: {kind}')
-        self.db.execute('INSERT OR REPLACE INTO sessions VALUES (?,?,?,?,?,?,?,?,?)',
-                        (state.id, state.name, state.workspace, state.cwd, state.monty,
-                         json.dumps(state.messages), state.generation,
-                         None if state.pending is None else json.dumps(state.pending), event_id))
-        if kind in ('session_created', 'execution_committed'):
-            self.db.execute('DELETE FROM files WHERE session_id=?', (self.id,))
-            self.db.executemany('INSERT INTO files VALUES (?,?,?,?,?,?)',
-                [(self.id, f['path'], f['kind'], f['storage_key'], f['size'], payload['generation'])
-                 for f in payload['files']])
+    def _message(self, message):
+        self.db.execute("UPDATE sessions SET messages=json_insert(messages,'$[#]',json(?)) WHERE id=?",
+                        (json.dumps(message), self.id))
 
-    def _replay(self):
-        row = self.db.execute('SELECT last_event_id FROM sessions WHERE id=?', (self.id,)).fetchone()
-        after = row[0] if row else 0
-        for event_id, kind, payload, monty in self.db.execute(
-                'SELECT id,kind,payload,monty FROM events WHERE session_id=? AND id>? ORDER BY id', (self.id, after)):
-            self._project(event_id, kind, json.loads(payload), monty)
-
-    def rebuild(self):
-        """Rebuild projections and live files from events, without executing code."""
+    def _append_message(self, message):
         with self._transaction():
-            self.db.execute('DELETE FROM files WHERE session_id=?', (self.id,))
-            self.db.execute('DELETE FROM sessions WHERE id=?', (self.id,))
-            self._replay()
-        self._checkout()
-
-    def _checkout(self):
-        # The directory is a cache. Interrupted copies are rebuilt on reopen/retry.
-        with self._transaction():
-            self.workspace = self.storage.checkout(self.name, self.files())
-
-    def events(self):
-        return [{'id': row[0], 'kind': row[1], 'payload': json.loads(row[2]), 'created_at': row[3]}
-                for row in self.db.execute('SELECT id,kind,payload,created_at FROM events WHERE session_id=? ORDER BY id',
-                                           (self.id,))]
-
-    def append_message(self, message, *, expected_event=None):
-        with self._transaction():
-            state = self.state
-            if state.pending is not None:
+            if self._pending():
                 raise RuntimeError('an execution is pending; resume it before appending messages')
-            if expected_event is not None and state.last_event_id != expected_event:
-                raise RuntimeError('session changed during the model request; resume the current turn')
-            self._append('message_appended', {'message': message})
-
-    def sessions(self):
-        return [dict(zip(('id', 'name', 'workspace'), row))
-                for row in self.db.execute('SELECT id,name,workspace FROM sessions ORDER BY id')]
+            self._message(message)
 
     def _publish(self, entries):
-        return {'generation': uuid.uuid4().hex, 'files': [
-            {'path': path, 'kind': 'directory' if content is None else 'file',
-             'storage_key': None if content is None else self.storage.put(self.name, content),
-             'size': 0 if content is None else len(content)} for path, content in entries]}
+        return [{'path': path, 'kind': 'directory' if content is None else 'file',
+                 'storage_key': None if content is None else self.storage.put(self.name, content),
+                 'size': 0 if content is None else len(content)} for path, content in entries]
 
-    def files(self):
-        return [dict(zip(('path', 'kind', 'storage_key', 'size', 'generation'), row)) for row in
-                self.db.execute('SELECT path,kind,storage_key,size,generation FROM files '
-                                'WHERE session_id=? ORDER BY path', (self.id,))]
+    def _replace_files(self, files):
+        self.db.execute('DELETE FROM files WHERE session_id=?', (self.id,))
+        self.db.executemany('INSERT INTO files VALUES (?,?,?,?,?)',
+            [(self.id, f['path'], f['kind'], f['storage_key'], f['size']) for f in files])
 
-    def read_file(self, path):
-        path = '/' + posixpath.normpath('/' + str(path).lstrip('/')).lstrip('/')
-        row = self.db.execute('SELECT kind,storage_key FROM files WHERE session_id=? AND path=?',
-                              (self.id, path)).fetchone()
+    def _files(self):
+        return [dict(zip(('path', 'kind', 'storage_key', 'size'), row)) for row in self.db.execute(
+            'SELECT path,kind,storage_key,size FROM files WHERE session_id=? ORDER BY path', (self.id,))]
+
+    async def _checkout(self):
+        files = await self.runtime.database_call(self._files)
+        self.workspace = await self.runtime.offload(self.storage.checkout, self.name, files)
+
+    @serialized
+    async def state(self):
+        return await self.runtime.database_call(lambda: self._state)
+
+    @serialized
+    async def files(self):
+        return await self.runtime.database_call(self._files)
+
+    @serialized
+    async def sessions(self):
+        return await self.runtime.database_call(lambda: [dict(zip(('id', 'name', 'workspace'), row))
+            for row in self.db.execute('SELECT id,name,name FROM sessions ORDER BY id')])
+
+    @serialized
+    async def append_message(self, message):
+        await self.runtime.database_call(self._append_message, message)
+
+    @serialized
+    async def read_file(self, path):
+        path = posixpath.normpath('/' + str(path).lstrip('/'))
+        row = await self.runtime.database_call(lambda: self.db.execute(
+            'SELECT kind,storage_key FROM files WHERE session_id=? AND path=?', (self.id, path)).fetchone())
         if row is None:
             raise FileNotFoundError(path)
         if row[0] != 'file':
             raise IsADirectoryError(path)
-        return self.storage.read(row[1])
+        return await self.runtime.offload(self.storage.read, row[1])
 
-    def close(self):
-        self.db.close()
+    async def close(self):
+        async with self._lock:
+            self._closed = True
+        if self._owns_runtime:
+            await self.runtime.close()
 
     def _emit(self, kind, text):
         if self.on_output is not None and (text or kind == 'result'):
-            self.on_output(kind, text)
+            if threading.get_ident() == self.runtime._loop_thread:
+                self.on_output(kind, text)
+            else:
+                self.runtime._loop.call_soon_threadsafe(self.on_output, kind, text)
 
-    def _result(self, execution_id):
-        row = self.db.execute("SELECT kind,payload FROM events WHERE session_id=? AND execution_id=? "
-                              "AND kind IN ('execution_committed','execution_failed')", (self.id, execution_id)).fetchone()
-        if row is None:
-            return None
-        payload = json.loads(row[1])
-        if row[0] == 'execution_failed':
-            raise ExecutionError(payload['output'])
-        return payload['output']
-
-    def execute(self, code=None, *, tool_id=None, execution_id=None):
-        """Resume with execute(); reuse execution_id to retrieve a committed result."""
-        self._stdout = ''
-        output = self._execute(code, tool_id, execution_id)
-        self._checkout()
-        self._emit('result', output[len(self._stdout):])
-        return output
-
-    def _execute(self, code, tool_id, execution_id):
+    def _prepare(self, code, tool_id, execution_id):
         with self._transaction():
-            pending = self.state.pending
+            pending = self._pending()
             execution_id = execution_id or ('tool:' + tool_id if tool_id is not None else
                                             pending['execution_id'] if pending else uuid.uuid4().hex)
-            requested = self.db.execute("SELECT payload FROM events WHERE session_id=? AND execution_id=? "
-                                        "AND kind='execution_requested'", (self.id, execution_id)).fetchone()
-            if requested:
-                request = json.loads(requested[0])
-                if code is not None and (request['code'] != code or request['tool_id'] != tool_id):
+            row = self.db.execute('SELECT code,tool_id,output,error FROM executions WHERE session_id=? AND id=?',
+                                   (self.id, execution_id)).fetchone()
+            if row:
+                if code is not None and (row[0] != code or row[1] != tool_id):
                     raise ValueError('execution ID was already used for another command')
+                if row[2] is not None:
+                    if row[3]:
+                        raise ExecutionError(row[2])
+                    return row[2]
             elif pending:
                 raise RuntimeError('an execution is pending; call execute() or run() to resume')
             else:
                 if not isinstance(code, str):
                     raise ValueError('code must be a string')
-                self._append('execution_requested', {'execution_id': execution_id, 'code': code, 'tool_id': tool_id})
-        # The request is now durable, independent of the transaction below.
+                self.db.execute('INSERT INTO executions(session_id,id,code,tool_id) VALUES (?,?,?,?)',
+                                (self.id, execution_id, code, tool_id))
+            return self._state, self._files()
+
+    def _commit(self, request, output, error, files=None, cwd=None, snapshot=None):
         with self._transaction():
-            result = self._result(execution_id)
-            if result is not None:
-                return result
-            request = self.state.pending
+            if not error:
+                self.db.execute('UPDATE sessions SET cwd=?,monty=? WHERE id=?', (cwd, snapshot, self.id))
+                self._replace_files(files)
+            self.db.execute('UPDATE executions SET output=?,error=? WHERE session_id=? AND id=?',
+                            (output, error, self.id, request['execution_id']))
+            if request['tool_id'] is not None:
+                self._message({'role': 'tool', 'tool_call_id': request['tool_id'], 'content': output})
+
+    @serialized
+    async def execute(self, code=None, *, tool_id=None, execution_id=None):
+        return await self._execute(code, tool_id, execution_id)
+
+    async def _execute(self, code=None, tool_id=None, execution_id=None):
+        async with self.runtime._sandbox_slots:
+            prepared = await self.runtime.database_call(self._prepare, code, tool_id, execution_id)
+            if isinstance(prepared, str):
+                await self._checkout()
+                self._emit('result', prepared)
+                return prepared
+            state, files = prepared
+            request = state.pending
             if request['tool_id'] not in self._streamed_calls:
                 self._emit('python', request['code'])
             try:
-                fs, snapshot, output = self._evaluate(request['code'])
+                fs, snapshot, output, stdout = await self._evaluate(request['code'], state, files)
             except MontyCrashedError:
-                raise  # worker failures keep the request pending
+                raise  # Infrastructure failures/cancellation leave the request pending.
             except MontyError as exc:
                 output = f'{type(exc).__name__}: {exc}'[:24000]
-                self._append('execution_failed', {**request, 'output': output})
-            else:
-                payload = self._publish(fs.entries())
-                self._append('execution_committed', {**request, **payload, 'cwd': fs.cwd, 'output': output}, snapshot)
-        return self._result(execution_id)
+                await self.runtime.database_call(self._commit, request, output, True)
+                raise ExecutionError(output) from exc
+            files = await self.runtime.offload(lambda: self._publish(fs.entries()))
+            await self.runtime.database_call(self._commit, request, output, False, files, fs.cwd, snapshot)
+            await self._checkout()
+            self._emit('result', output[len(stdout):])
+            return output
 
-    def _evaluate(self, code):
-        state = self.state
-        entries = [(f['path'], None if f['kind'] == 'directory' else self.storage.read(f['storage_key']))
-                   for f in self.files()]
-        fs = Unix(entries, state.cwd, environ={
+    async def _evaluate(self, code, state, files):
+        entries = await self.runtime.offload(lambda: [
+            (f['path'], None if f['kind'] == 'directory' else self.storage.read(f['storage_key']))
+            for f in files])
+        fs = await self.runtime.offload(Unix, entries, state.cwd, environ={
             'HOME': self.home, 'USER': self.name, 'LOGNAME': self.name,
             'PWD': state.cwd, 'TMPDIR': '/tmp', 'LANG': 'C.UTF-8',
         })
@@ -691,124 +733,115 @@ class CodeAgent:
         functions = {'pwd': fs.pwd, 'cd': fs.cd, 'ls': fs.ls, 'mkdir': fs.mkdir,
                      'read': fs.read, 'write': fs.write, 'edit': fs.edit,
                      'glob': fs.glob, 'grep': fs.grep, 'mv': fs.mv, 'rm': fs.rm,
-                     'numpy': fs.numpy, 'pandas': fs.pandas, 'PIL': fs.PIL,
-                     'openpyxl': fs.openpyxl, 'pypdf': fs.pypdf, 'docx': fs.docx}
-        with Monty(max_processes=1, request_timeout=20) as pool:
-            with pool.checkout(limits={'max_memory': 64 * 1024**2,
+                     **library_tools(fs)}
+        # AsyncMonty runs synchronous OS/library callbacks on its worker threads.
+        # Keep these synchronous so sandbox callers need not write `await numpy(...)`.
+        async with self.runtime._pool.checkout(limits={'max_memory': 64 * 1024**2,
                                        'max_feed_duration_secs': 10, 'max_suspensions': 1000}) as session:
-                if state.monty is not None:
-                    session.load_session(state.monty)
-                printed, byte_count = [], 0
-                def capture(stream, text):
-                    nonlocal byte_count
-                    byte_count += len(text.encode())
-                    if byte_count > 16000:
-                        raise MemoryError('printed output exceeds 16000 bytes')
-                    printed.append(text)
-                    self._emit('stdout', text)
-                value = session.feed_run(code, external_lookup=functions, os=fs,
-                                         cwd=fs.cwd, print_callback=capture)
-                self._stdout = ''.join(printed)
-                output = (self._stdout + (repr(value) if value is not None else ''))[:24000]
-                return fs, session.dump(), output
+            if state.monty is not None:
+                await session.load_session(state.monty)
+            printed, byte_count = [], 0
+            def capture(stream, text):
+                nonlocal byte_count
+                byte_count += len(text.encode())
+                if byte_count > 16000:
+                    raise MemoryError('printed output exceeds 16000 bytes')
+                printed.append(text)
+                self._emit('stdout', text)
+            value = await session.feed_run(code, external_lookup=functions, os=fs,
+                                     cwd=fs.cwd, print_callback=capture)
+            stdout = ''.join(printed)
+            output = (stdout + (repr(value) if value is not None else ''))[:24000]
+            return fs, await session.dump(), output, stdout
 
-    def _tool(self, call, revision):
+    async def _tool(self, call):
         try:
             if call['function']['name'] != 'python':
                 raise ValueError('unknown tool')
-            code = json.loads(call['function']['arguments'])['code']
-            if not isinstance(code, str):
-                raise ValueError('code must be a string')
+            code = PythonCode.model_validate_json(call['function']['arguments']).code
         except (ValueError, KeyError, TypeError) as exc:
-            self.append_message({'role': 'tool', 'tool_call_id': call['id'], 'content': str(exc)},
-                                expected_event=revision)
+            await self.runtime.database_call(self._append_message, {'role': 'tool', 'tool_call_id': call['id'], 'content': str(exc)})
             self._emit('error', str(exc))
             return
         try:
-            self.execute(code, tool_id=call['id'])
+            await self._execute(code, tool_id=call['id'])
         except ExecutionError as exc:
             self._emit('error', str(exc))  # The failure is already recorded.
 
-    def _response(self, client, messages, schema):
-        """Display deltas immediately; return only a complete assistant message."""
-        text, calls, shown, finish = [], {}, {}, None
-        with client.stream('POST', self.base_url + '/chat/completions',
-                           headers={'Authorization': f'Bearer {self.api_key}'},
-                           json={'model': self.model, 'stream': True, 'messages': [
-                               {'role': 'system', 'content':
-                                f'Your session ID is {self.id}; your name is {self.name}.\n' + HELP},
-                               *messages], 'tools': [schema], 'parallel_tool_calls': False}) as response:
-            response.raise_for_status()
-            for data in sse_data(response):
-                if data == '[DONE]':
-                    break
-                packet = json.loads(data)
-                if 'error' in packet:
-                    raise RuntimeError(str(packet['error']))
-                for choice in packet.get('choices', []):
-                    if choice.get('index', 0) != 0:
-                        continue
-                    delta = choice.get('delta', {})
-                    content = delta.get('content') or delta.get('refusal') or ''
-                    text.append(content)
-                    self._emit('assistant', content)
-                    for part in delta.get('tool_calls', []):
-                        index = part['index']
-                        call = calls.setdefault(index, {'id': '', 'type': 'function',
-                                                       'function': {'name': '', 'arguments': ''}})
-                        call['id'] += part.get('id', '')
-                        function = part.get('function', {})
-                        for field in ('name', 'arguments'):
-                            call['function'][field] += function.get(field, '')
-                        code = code_prefix(call['function']['arguments'])
-                        self._emit('python', code[len(shown.get(index, '')):])
-                        shown[index] = code
-                    finish = choice.get('finish_reason') or finish
-        if finish not in ('stop', 'tool_calls') or (finish == 'tool_calls' and not calls):
-            raise RuntimeError('Incomplete model response; resume to retry (partial code was not executed)')
-        if any(not call['id'] or not call['function']['name'] for call in calls.values()):
-            raise RuntimeError('Incomplete tool call; resume to retry')
-        message = {'role': 'assistant', 'content': ''.join(text)}
-        if calls:
-            message['tool_calls'] = [calls[index] for index in sorted(calls)]
-            self._streamed_calls.update(call['id'] for call in calls.values())
+    async def _response(self, client, messages):
+        """The SDK handles SSE decoding, typed events and tool-call assembly."""
+        shown = {}
+        try:
+            async with client.chat.completions.stream(
+                model=self.model, messages=[{'role': 'system', 'content':
+                    f'Your session ID is {self.id}; your name is {self.name}.\n' + HELP}, *messages],
+                tools=[self.runtime.tool], parallel_tool_calls=False,
+            ) as stream:
+                async for event in stream:
+                    if event.type in ('content.delta', 'refusal.delta'):
+                        self._emit('assistant', event.delta)
+                    elif event.type == 'tool_calls.function.arguments.delta':
+                        code = code_prefix(event.arguments)
+                        self._emit('python', code[len(shown.get(event.index, '')):])
+                        shown[event.index] = code
+                choice = (await stream.get_final_completion()).choices[0]
+        except (LengthFinishReasonError, ContentFilterFinishReasonError) as exc:
+            raise RuntimeError('Incomplete model response; resume to retry') from exc
+        if (choice.finish_reason not in ('stop', 'tool_calls') or
+                (choice.finish_reason == 'tool_calls' and not choice.message.tool_calls)):
+            raise RuntimeError('Incomplete model response; resume to retry')
+        message = choice.message.model_dump(include={'role', 'content', 'tool_calls'}, exclude_none=True)
+        message['content'] = choice.message.content or choice.message.refusal or ''
+        for call in message.get('tool_calls', []):
+            call['function'].pop('parsed_arguments', None)
+        self._streamed_calls = {call['id'] for call in message.get('tool_calls', [])}
         return message
 
-    def run(self, prompt=None, *, max_steps=20):
+    @serialized
+    async def run(self, prompt=None, *, max_steps=20):
         """Resume pending work automatically before accepting a new user turn."""
-        if self.state.pending:
+        return await self._run(prompt, max_steps=max_steps)
+
+    def _turn(self):
+        return json.loads(self.db.execute('SELECT messages FROM sessions WHERE id=?', (self.id,)).fetchone()[0])
+
+    async def _run(self, prompt=None, *, max_steps=20):
+        pending = await self.runtime.database_call(self._pending)
+        if pending:
             try:
-                self.execute()
+                await self._execute()
             except ExecutionError as exc:
                 self._emit('error', str(exc))
-        messages = self.state.messages
         if prompt is not None:
-            if messages and (messages[-1]['role'] in ('user', 'tool') or messages[-1].get('tool_calls')):
-                repeated = messages[-1]['role'] == 'user' and messages[-1]['content'] == prompt
-                answer = self.run(max_steps=max_steps)
+            async with self.runtime._model_slots:
+                messages = await self.runtime.database_call(self._turn)
+                unfinished = bool(messages and (messages[-1]['role'] in ('user', 'tool') or
+                                                messages[-1].get('tool_calls')))
+                repeated = bool(messages and messages[-1]['role'] == 'user' and messages[-1]['content'] == prompt)
+                del messages
+            if unfinished:
+                answer = await self._run(max_steps=max_steps)
                 if repeated:
                     return answer
-            self.append_message({'role': 'user', 'content': prompt})
-        if not self.state.messages:
-            return ''
-        schema = {'type': 'function', 'function': {'name': 'python',
-                  'description': 'Run Python in the durable Monty virtual Unix environment.',
-                  'parameters': {'type': 'object', 'properties': {'code': {'type': 'string'}},
-                                 'required': ['code'], 'additionalProperties': False}}}
-        with httpx.Client(timeout=120) as client:
-            for _ in range(max_steps):
-                state = self.state
-                messages = state.messages
+            await self.runtime.database_call(self._append_message, {'role': 'user', 'content': prompt})
+        for _ in range(max_steps):
+            # Acquire before loading history: thousands of waiting agents do not
+            # retain thousands of histories or interpreter checkpoints in RAM.
+            async with self.runtime._model_slots:
+                messages = await self.runtime.database_call(self._turn)
+                if not messages:
+                    return ''
                 assistant = next((m for m in reversed(messages) if m['role'] == 'assistant'), {})
                 answered = {m['tool_call_id'] for m in messages if m['role'] == 'tool'}
                 call = next((c for c in assistant.get('tool_calls', []) if c['id'] not in answered), None)
-                if call:
-                    self._tool(call, state.last_event_id)
-                    continue
-                if messages[-1]['role'] == 'assistant':
-                    return messages[-1].get('content') or ''
-                message = self._response(client, messages, schema)
-                self.append_message(message, expected_event=state.last_event_id)
-                if message['role'] == 'assistant' and not message.get('tool_calls'):
-                    return message.get('content') or ''
+                if call is None:
+                    if messages[-1]['role'] == 'assistant':
+                        return messages[-1].get('content') or ''
+                    message = await self._response(self.runtime.client, messages)
+                    await self.runtime.database_call(self._append_message, message)
+                    if not message.get('tool_calls'):
+                        return message.get('content') or ''
+                del messages, assistant, answered
+            if call is not None:
+                await self._tool(call)
         raise RuntimeError('Step budget reached; call run() to continue the durable turn')
