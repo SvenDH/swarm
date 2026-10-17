@@ -1,24 +1,11 @@
-"""Durable code-mode agent. All sandbox capabilities live in this module.
+"""Monty code agent: events + immutable objects are the durable source of truth.
 
-The SQLite database is trusted local state (Monty dumps are not safe to load
-from strangers). Each code call atomically commits files, interpreter globals,
-and its tool response; failed calls roll back all three. Native library wrappers
-accept plain data, never host paths or arbitrary Python. They are deliberately
-small APIs, not drop-in implementations of those libraries. Host library work
-is outside Monty's CPU/memory accounting; use process isolation for hostile users.
-
-The files table stores session-scoped virtual paths and opaque storage keys, not
-contents or absolute host paths. DirectoryStorage backs those keys with files in
-workspaces/. Supply CodeAgent(storage=...) with a Storage implementation to use
-another backend without changing the agent, tools, or database file references.
-
-events is the append-only source of truth. sessions has explicit runtime columns;
-sessions/files and the visible workspace are rebuildable projections. Historical
-file objects under workspaces/.objects are immutable and retained for replay.
-Write through agent tools so changes are recorded; direct edits of the visible
-workspace are not authoritative. rebuild() restores projections without running
-code. execute() resumes a pending command; execution_id makes retries idempotent.
-This schema intentionally has no migration from the earlier key/value design.
+sessions/files and visible workspaces are rebuildable views. Changes go through
+agent tools; editing a workspace directly does not change recorded state.
+execute() resumes pending work; execution_id deduplicates retries. rebuild()
+replays events without running code. Inject Storage to replace local files.
+The database and Monty snapshots must be trusted. Library wrappers expose plain
+data and virtual files; their host work is outside Monty's resource accounting.
 """
 from __future__ import annotations
 
@@ -28,12 +15,13 @@ import io
 import json
 import os
 import posixpath
+import re
 import shutil
 import sqlite3
 import uuid
 from pathlib import Path as HostPath
 from pathlib import PurePosixPath as Path
-from typing import Iterable, Protocol
+from typing import Protocol
 from contextlib import contextmanager
 from dataclasses import dataclass
 
@@ -44,11 +32,35 @@ from PIL import Image
 from docx import Document
 from openpyxl import Workbook, load_workbook
 from pypdf import PdfReader, PdfWriter
-from pydantic_monty import CallbackFile, CollectString, Monty, MontyError, MontyCrashedError, OSAccess
+from pydantic_monty import CallbackFile, Monty, MontyError, MontyCrashedError, OSAccess
 from dotenv import load_dotenv
 from names import num_to_name
 
 load_dotenv(override=True)
+
+
+def code_prefix(arguments):
+    """Decode the complete characters of an unfinished JSON code argument."""
+    start = re.search(r'"code"\s*:\s*"', arguments)
+    if start is None:
+        return ''
+    token = re.match(r'(?:[^"\\\x00-\x1f]|\\(?:["\\/bfnrt]|u[0-9a-fA-F]{4}))*',
+                     arguments[start.end():]).group()
+    code = json.loads('"' + token + '"')
+    return code[:-1] if code and 0xD800 <= ord(code[-1]) <= 0xDBFF else code
+
+
+def sse_data(response):
+    """SSE events can span multiple data lines and arbitrary network chunks."""
+    data = []
+    for line in response.iter_lines():
+        if line.startswith('data:'):
+            data.append(line[5:].lstrip(' '))
+        elif not line and data:
+            yield '\n'.join(data)
+            data.clear()
+    if data:
+        yield '\n'.join(data)
 
 HELP = """You are a code-mode assistant. Execute Python with the python tool to
 inspect and modify a persistent virtual Unix filesystem. No host shell/network.
@@ -223,12 +235,13 @@ class Unix(OSAccess):
             self.path_unlink(p)
 
 
-class Libraries:
-    def __init__(self, fs):
-        self.fs = fs
-
     def source(self, path):
-        return io.BytesIO(self.fs.path_read_bytes(self.fs.path(path)))
+        return io.BytesIO(self.path_read_bytes(self.path(path)))
+
+    def save(self, path, writer):
+        output = io.BytesIO()
+        writer(output)
+        return self.write(path, output.getvalue())
 
     def numpy(self, op, data, other=None, axis=None):
         a = np.asarray(data)
@@ -248,12 +261,8 @@ class Libraries:
         else:
             frame = pd.DataFrame(data)
             if op in ('to_csv', 'to_excel'):
-                out = io.BytesIO()
-                if op == 'to_csv':
-                    frame.to_csv(out, index=False)
-                else:
-                    frame.to_excel(out, index=False)
-                return self.fs.write(path, out.getvalue())
+                writer = frame.to_csv if op == 'to_csv' else frame.to_excel
+                return self.save(path, lambda output: writer(output, index=False))
             operations = {'head': lambda: frame.head(5 if columns is None else columns),
                           'describe': frame.describe, 'select': lambda: frame[columns],
                           'sort': lambda: frame.sort_values(columns),
@@ -272,10 +281,8 @@ class Libraries:
                 image = image.resize(tuple(size))
             elif op == 'convert':
                 image = image.convert(mode)
-            out = io.BytesIO()
             fmt = Image.registered_extensions()[Path(output).suffix.lower()]
-            image.save(out, format=fmt)
-            return self.fs.write(output, out.getvalue())
+            return self.save(output, lambda stream: image.save(stream, format=fmt))
         finally:
             image.close()
 
@@ -291,9 +298,7 @@ class Libraries:
                 target = book.create_sheet(sheet)
             for row in rows or []:
                 target.append(row)
-            out = io.BytesIO()
-            book.save(out)
-            return self.fs.write(path, out.getvalue())
+            return self.save(path, book.save)
         finally:
             book.close()
 
@@ -307,9 +312,7 @@ class Libraries:
         writer = PdfWriter()
         for i in indices:
             writer.add_page(reader.pages[i])
-        out = io.BytesIO()
-        writer.write(out)
-        return self.fs.write(output, out.getvalue())
+        return self.save(output, writer.write)
 
     def docx(self, op, path, paragraphs=None):
         if op not in ('read', 'write', 'append'):
@@ -319,9 +322,7 @@ class Libraries:
             return [p.text for p in document.paragraphs]
         for text in paragraphs or []:
             document.add_paragraph(text)
-        out = io.BytesIO()
-        document.save(out)
-        return self.fs.write(path, out.getvalue())
+        return self.save(path, document.save)
 
 
 def sync_directory(path):
@@ -332,173 +333,88 @@ def sync_directory(path):
         os.close(descriptor)
 
 
-class WorkspaceStore(Protocol):
-    """One session's storage boundary. Keys are opaque, backend-relative IDs.
-
-    publish must durably store immutable file versions before an event commits.
-    Keys must remain readable for the lifetime of the event log, even after a
-    later publication or deletion. recover repairs the live workspace view;
-    restore rebuilds that view from an event's file manifest. Blob backends can
-    use content-addressed or generation-prefixed objects. No code is replayed.
-    """
-
-    @property
-    def location(self) -> HostPath | str: ...
-    def initialize(self) -> None: ...
-    def recover(self, generation: str | None) -> None: ...
-    def publish(self, entries: Iterable[tuple[str, bytes | None]], generation: str) -> None: ...
-    def key(self, path: str, generation: str) -> str: ...
-    def read(self, key: str) -> bytes: ...
-    def restore(self, files: list[dict], generation: str) -> None: ...
-
-
 class Storage(Protocol):
-    def open(self, namespace: str) -> WorkspaceStore: ...
+    """put must durably store immutable bytes; checkout is a rebuildable view."""
+    def create(self, name: str) -> None: ...
+    def put(self, name: str, content: bytes) -> str: ...
+    def read(self, key: str) -> bytes: ...
+    def checkout(self, name: str, files: list[dict]) -> HostPath | str: ...
 
 
 class DirectoryStorage:
-    """Local implementation; replace this object to use another storage backend."""
-
-    def __init__(self, root):
-        self.root = HostPath(root).absolute()
-        missing = []
-        directory = self.root
-        while not directory.exists():
-            missing.append(directory)
-            directory = directory.parent
-        self.root.mkdir(parents=True, exist_ok=True)
-        for directory in reversed(missing):
-            sync_directory(directory.parent)
-        self.root = self.root.resolve()
-
-    def open(self, namespace):
-        if namespace in ('', '.', '..') or Path(namespace).name != namespace:
-            raise ValueError('storage namespace must be a single path component')
-        return Workspace(self.root / namespace)
-
-
-class Workspace:
-    """Disk backing for the virtual tree; never follows host symlinks.
-
-    The caller holds SQLite's write lock during recovery and publication. A
-    journal plus the session's committed generation reconciles filesystem renames
-    with the SQLite transaction after a process or machine interruption.
-    """
+    """Durable objects plus disposable workspace directories; replace for blobs."""
 
     def __init__(self, root):
         self.root = HostPath(root)
-        self.stage = self.root.with_name('.' + self.root.name + '.stage')
-        self.backup = self.root.with_name('.' + self.root.name + '.backup')
-        self.journal = self.root.with_name('.' + self.root.name + '.journal')
-        self.archive = self.root.parent / '.objects' / self.root.name
-        self._keys = {}
+        self._mkdir(self.root.absolute())
+        self.root = self.root.resolve()
 
-    @property
-    def location(self):
-        return self.root
+    def _mkdir(self, path):
+        if not path.exists():
+            self._mkdir(path.parent)
+            path.mkdir(exist_ok=True)
+            sync_directory(path.parent)
 
-    def initialize(self):
-        # Recover a creation interrupted before its session record committed.
-        self.recover(None)
-        if self.root.is_symlink() or (self.root.exists() and any(self.root.iterdir())):
-            raise FileExistsError(f'workspace already exists: {self.root}')
-        self.root.mkdir(exist_ok=True)
-        sync_directory(self.root.parent)
+    def _path(self, name):
+        if name in ('', '.', '..') or Path(name).name != name:
+            raise ValueError('invalid workspace name')
+        path = self.root / name
+        if path.is_symlink():
+            raise PermissionError('workspace symlinks are not supported')
+        return path
 
-    def key(self, path, generation):
-        return self._keys[path]
+    def create(self, name):
+        if self._path(name).exists():
+            raise FileExistsError(name)
+
+    def put(self, name, content):
+        self._path(name)
+        key = f'.objects/{name}/{hashlib.sha256(content).hexdigest()}'
+        target = self.root / key
+        self._mkdir(target.parent)
+        if target.exists():
+            self.read(key)
+        else:
+            temporary = target.with_suffix('.' + uuid.uuid4().hex)
+            with temporary.open('xb') as file:
+                file.write(content)
+                file.flush()
+                os.fsync(file.fileno())
+            temporary.replace(target)
+            sync_directory(target.parent)
+        return key
 
     def read(self, key):
         parts = Path(key).parts
-        if (len(parts) != 3 or parts[:2] != ('.objects', self.root.name)
+        if (len(parts) != 3 or parts[0] != '.objects' or parts[1] in ('.', '..')
                 or len(parts[2]) != 64 or any(c not in '0123456789abcdef' for c in parts[2])):
-            raise PermissionError('key is outside the session namespace')
-        host = self.root.parent
-        for part in parts:
-            if host.is_symlink():
-                raise PermissionError('storage symlinks are not supported')
-            host = host / part
-        if host.is_symlink():
+            raise PermissionError('invalid storage key')
+        host = self.root.joinpath(*parts)
+        if host.resolve() != host:
             raise PermissionError('storage symlinks are not supported')
         content = host.read_bytes()
         if hashlib.sha256(content).hexdigest() != parts[2]:
             raise OSError('stored object failed its content hash check')
         return content
 
-    def restore(self, files, generation):
-        self.recover(generation)
-        self.root.mkdir(exist_ok=True)
-        self.publish([(f['path'], None if f['kind'] == 'directory' else self.read(f['storage_key']))
-                      for f in files], generation)
-        self.recover(generation)
-
-    def recover(self, generation):
-        if not self.journal.exists():
-            # A crash while preparing files has no published effects.
-            if self.stage.exists():
-                shutil.rmtree(self.stage)
-            return
-        committed = self.journal.read_text() == generation
-        if self.backup.exists():
-            if committed:
-                shutil.rmtree(self.backup)
-            else:
-                if self.root.exists():
-                    shutil.rmtree(self.root)
-                self.backup.rename(self.root)
-        if self.stage.exists():
-            shutil.rmtree(self.stage)
-        sync_directory(self.root.parent)
-        self.journal.unlink()
-        sync_directory(self.root.parent)
-
-    def publish(self, entries, generation):
-        entries = list(entries)
-        self.archive.mkdir(parents=True, exist_ok=True)
-        sync_directory(self.archive.parent)
-        sync_directory(self.root.parent)
-        self._keys = {}
-        for path, content in entries:
-            if content is None:
-                continue
-            digest = hashlib.sha256(content).hexdigest()
-            self._keys[path] = f'.objects/{self.root.name}/{digest}'
-            target = self.archive / digest
-            if not target.exists():
-                temporary = self.archive / (uuid.uuid4().hex + '.tmp')
-                with temporary.open('xb') as file:
-                    file.write(content)
-                    file.flush()
-                    os.fsync(file.fileno())
-                temporary.replace(target)
-            else:
-                self.read(self._keys[path])  # detect damaged or replaced objects
-        sync_directory(self.archive)
-        self.stage.mkdir()
-        for path, content in entries:
-            target = self.stage / path.lstrip('/')
-            if content is None:
+    def checkout(self, name, files):
+        root = self._path(name)
+        if root.exists():
+            shutil.rmtree(root)
+        root.mkdir()
+        for file in files:
+            if '..' in Path(file['path']).parts:
+                raise ValueError('invalid virtual path')
+            target = root / file['path'].lstrip('/')
+            if file['kind'] == 'directory':
                 target.mkdir(parents=True, exist_ok=True)
             else:
                 target.parent.mkdir(parents=True, exist_ok=True)
-                with target.open('wb') as file:
-                    file.write(content)
-                    file.flush()
-                    os.fsync(file.fileno())
-        for directory, _, _ in os.walk(self.stage, topdown=False):
-            sync_directory(directory)
-        with self.journal.open('x') as file:
-            file.write(generation)
-            file.flush()
-            os.fsync(file.fileno())
-        sync_directory(self.root.parent)
-        self.root.rename(self.backup)
-        sync_directory(self.root.parent)
-        self.stage.rename(self.root)
-        sync_directory(self.root.parent)
+                target.write_bytes(self.read(file['storage_key']))
+        return root
 
 
-@dataclass(frozen=True)
+@dataclass
 class Session:
     id: int
     name: str
@@ -516,17 +432,16 @@ class ExecutionError(RuntimeError):
 
 
 class CodeAgent:
-    """Append-only events are authoritative; sessions/files are projections.
+    """Commit request, run code, then atomically record objects/checkpoint/result.
 
-    Requests commit before code runs. File objects are immutable and fsynced
-    before the completion event, Monty checkpoint, projections and tool response
-    commit together. Resume retries pending requests and returns recorded results
-    for completed execution IDs. Model requests can repeat after a crash; local
-    committed effects do not. SQLite serializes writers, including across agents.
+    Retry pending requests; return recorded results for completed execution IDs.
+    Model requests may repeat after a crash. Committed local effects do not.
     """
 
     def __init__(self, database='agent.db', *, session_id=None, workspaces=None, storage: Storage | None = None,
-                 model=None, base_url=None, api_key=None):
+                 model=None, base_url=None, api_key=None, on_output=None):
+        self.on_output = on_output
+        self._streamed_calls = set()
         if storage is not None and workspaces is not None:
             raise ValueError('pass storage or workspaces, not both')
         self.storage = storage if storage is not None else DirectoryStorage(
@@ -566,8 +481,7 @@ class CodeAgent:
                     if not 0 <= self.id < 65536:
                         raise ValueError('names.py capacity exhausted')
                     self.name = num_to_name(self.id)
-                    self._workspace = self.storage.open(self.name)
-                    self._workspace.initialize()
+                    self.storage.create(self.name)
                     fs = Unix(cwd=self.home)
                     fs.mkdir(self.home)
                     fs.mkdir('/tmp')
@@ -577,10 +491,7 @@ class CodeAgent:
                     self.id = session_id
                     self._replay()
                     self.name = self.state.name
-                    self._workspace = self.storage.open(self.name)
-                    self._workspace.recover(self.state.generation)
-                    self._workspace.restore(self.files(), self.state.generation)
-                self.workspace = self._workspace.location
+            self._checkout()
         except BaseException:
             self.db.close()
             raise
@@ -621,27 +532,26 @@ class CodeAgent:
 
     def _project(self, event_id, kind, payload, monty):
         if kind == 'session_created':
-            self.db.execute('INSERT INTO sessions VALUES (?,?,?,?,?,?,?,?,?)',
-                            (self.id, payload['name'], payload['name'], payload['cwd'], None,
-                             '[]', payload['generation'], None, event_id))
-        elif kind == 'message_appended':
-            messages = self.state.messages + [payload['message']]
-            self.db.execute('UPDATE sessions SET messages=?,last_event_id=? WHERE id=?',
-                            (json.dumps(messages), event_id, self.id))
-        elif kind == 'execution_requested':
-            self.db.execute('UPDATE sessions SET pending=?,last_event_id=? WHERE id=?',
-                            (json.dumps(payload), event_id, self.id))
-        elif kind in ('execution_committed', 'execution_failed'):
-            messages = self.state.messages
-            if payload['tool_id'] is not None:
-                messages.append({'role': 'tool', 'tool_call_id': payload['tool_id'], 'content': payload['output']})
-            self.db.execute('UPDATE sessions SET messages=?,pending=NULL,last_event_id=? WHERE id=?',
-                            (json.dumps(messages), event_id, self.id))
-            if kind == 'execution_committed':
-                self.db.execute('UPDATE sessions SET cwd=?,monty=?,generation=? WHERE id=?',
-                                (payload['cwd'], monty, payload['generation'], self.id))
+            state = Session(self.id, payload['name'], payload['name'], payload['cwd'],
+                            None, [], payload['generation'], None, event_id)
         else:
+            state = self.state
+        if kind == 'message_appended':
+            state.messages.append(payload['message'])
+        elif kind == 'execution_requested':
+            state.pending = payload
+        elif kind in ('execution_committed', 'execution_failed'):
+            state.pending = None
+            if payload['tool_id'] is not None:
+                state.messages.append({'role': 'tool', 'tool_call_id': payload['tool_id'], 'content': payload['output']})
+            if kind == 'execution_committed':
+                state.cwd, state.monty, state.generation = payload['cwd'], monty, payload['generation']
+        elif kind != 'session_created':
             raise ValueError(f'unknown event kind: {kind}')
+        self.db.execute('INSERT OR REPLACE INTO sessions VALUES (?,?,?,?,?,?,?,?,?)',
+                        (state.id, state.name, state.workspace, state.cwd, state.monty,
+                         json.dumps(state.messages), state.generation,
+                         None if state.pending is None else json.dumps(state.pending), event_id))
         if kind in ('session_created', 'execution_committed'):
             self.db.execute('DELETE FROM files WHERE session_id=?', (self.id,))
             self.db.executemany('INSERT INTO files VALUES (?,?,?,?,?,?)',
@@ -652,7 +562,7 @@ class CodeAgent:
         row = self.db.execute('SELECT last_event_id FROM sessions WHERE id=?', (self.id,)).fetchone()
         after = row[0] if row else 0
         for event_id, kind, payload, monty in self.db.execute(
-                'SELECT id,kind,payload,monty FROM events WHERE session_id=? AND id>? ORDER BY id', (self.id, after)).fetchall():
+                'SELECT id,kind,payload,monty FROM events WHERE session_id=? AND id>? ORDER BY id', (self.id, after)):
             self._project(event_id, kind, json.loads(payload), monty)
 
     def rebuild(self):
@@ -661,7 +571,12 @@ class CodeAgent:
             self.db.execute('DELETE FROM files WHERE session_id=?', (self.id,))
             self.db.execute('DELETE FROM sessions WHERE id=?', (self.id,))
             self._replay()
-            self._workspace.restore(self.files(), self.state.generation)
+        self._checkout()
+
+    def _checkout(self):
+        # The directory is a cache. Interrupted copies are rebuilt on reopen/retry.
+        with self._transaction():
+            self.workspace = self.storage.checkout(self.name, self.files())
 
     def events(self):
         return [{'id': row[0], 'kind': row[1], 'payload': json.loads(row[2]), 'created_at': row[3]}
@@ -670,23 +585,21 @@ class CodeAgent:
 
     def append_message(self, message, *, expected_event=None):
         with self._transaction():
-            self._replay()
-            if self.state.pending is not None:
+            state = self.state
+            if state.pending is not None:
                 raise RuntimeError('an execution is pending; resume it before appending messages')
-            if expected_event is not None and self.state.last_event_id != expected_event:
+            if expected_event is not None and state.last_event_id != expected_event:
                 raise RuntimeError('session changed during the model request; resume the current turn')
             self._append('message_appended', {'message': message})
 
     def sessions(self):
-        return [{'id': row[0], 'name': row[1], 'workspace': str(self.storage.open(row[1]).location)}
-                for row in self.db.execute('SELECT id,name FROM sessions ORDER BY id')]
+        return [dict(zip(('id', 'name', 'workspace'), row))
+                for row in self.db.execute('SELECT id,name,workspace FROM sessions ORDER BY id')]
 
     def _publish(self, entries):
-        entries, generation = list(entries), uuid.uuid4().hex
-        self._workspace.publish(entries, generation)
-        return {'generation': generation, 'files': [
+        return {'generation': uuid.uuid4().hex, 'files': [
             {'path': path, 'kind': 'directory' if content is None else 'file',
-             'storage_key': None if content is None else self._workspace.key(path, generation),
+             'storage_key': None if content is None else self.storage.put(self.name, content),
              'size': 0 if content is None else len(content)} for path, content in entries]}
 
     def files(self):
@@ -702,10 +615,14 @@ class CodeAgent:
             raise FileNotFoundError(path)
         if row[0] != 'file':
             raise IsADirectoryError(path)
-        return self._workspace.read(row[1])
+        return self.storage.read(row[1])
 
     def close(self):
         self.db.close()
+
+    def _emit(self, kind, text):
+        if self.on_output is not None and (text or kind == 'result'):
+            self.on_output(kind, text)
 
     def _result(self, execution_id):
         row = self.db.execute("SELECT kind,payload FROM events WHERE session_id=? AND execution_id=? "
@@ -719,8 +636,14 @@ class CodeAgent:
 
     def execute(self, code=None, *, tool_id=None, execution_id=None):
         """Resume with execute(); reuse execution_id to retrieve a committed result."""
+        self._stdout = ''
+        output = self._execute(code, tool_id, execution_id)
+        self._checkout()
+        self._emit('result', output[len(self._stdout):])
+        return output
+
+    def _execute(self, code, tool_id, execution_id):
         with self._transaction():
-            self._replay()
             pending = self.state.pending
             execution_id = execution_id or ('tool:' + tool_id if tool_id is not None else
                                             pending['execution_id'] if pending else uuid.uuid4().hex)
@@ -730,78 +653,134 @@ class CodeAgent:
                 request = json.loads(requested[0])
                 if code is not None and (request['code'] != code or request['tool_id'] != tool_id):
                     raise ValueError('execution ID was already used for another command')
-                result = self._result(execution_id)
-                if result is not None:
-                    return result
-            if pending:
-                if execution_id != pending['execution_id'] or (code is not None and code != pending['code']):
-                    raise RuntimeError('an execution is pending; call execute() or run() to resume')
+            elif pending:
+                raise RuntimeError('an execution is pending; call execute() or run() to resume')
             else:
                 if not isinstance(code, str):
                     raise ValueError('code must be a string')
                 self._append('execution_requested', {'execution_id': execution_id, 'code': code, 'tool_id': tool_id})
         # The request is now durable, independent of the transaction below.
-        failed = False
-        try:
-            with self._transaction():
-                self._replay()
-                result = self._result(execution_id)
-                if result is not None:
-                    return result
-                request = self.state.pending
-                self._workspace.recover(self.state.generation)
-                try:
-                    fs, snapshot, output = self._evaluate(request['code'])
-                except MontyCrashedError:
-                    raise  # worker/infrastructure failures keep the request pending
-                except MontyError as exc:
-                    output = f'{type(exc).__name__}: {exc}'[:24000]
-                    self._append('execution_failed', {**request, 'output': output})
-                    failed = True
-                else:
-                    payload = self._publish(fs.entries())
-                    self._append('execution_committed', {**request, **payload, 'cwd': fs.cwd, 'output': output}, snapshot)
-        except BaseException:
-            with self._transaction():
-                self._workspace.recover(self.state.generation)
-            raise
-        if failed:
-            raise ExecutionError(output)
-        return output
+        with self._transaction():
+            result = self._result(execution_id)
+            if result is not None:
+                return result
+            request = self.state.pending
+            if request['tool_id'] not in self._streamed_calls:
+                self._emit('python', request['code'])
+            try:
+                fs, snapshot, output = self._evaluate(request['code'])
+            except MontyCrashedError:
+                raise  # worker failures keep the request pending
+            except MontyError as exc:
+                output = f'{type(exc).__name__}: {exc}'[:24000]
+                self._append('execution_failed', {**request, 'output': output})
+            else:
+                payload = self._publish(fs.entries())
+                self._append('execution_committed', {**request, **payload, 'cwd': fs.cwd, 'output': output}, snapshot)
+        return self._result(execution_id)
 
     def _evaluate(self, code):
         state = self.state
-        entries = [(f['path'], None if f['kind'] == 'directory' else self._workspace.read(f['storage_key']))
+        entries = [(f['path'], None if f['kind'] == 'directory' else self.storage.read(f['storage_key']))
                    for f in self.files()]
         fs = Unix(entries, state.cwd, environ={
             'HOME': self.home, 'USER': self.name, 'LOGNAME': self.name,
             'PWD': state.cwd, 'TMPDIR': '/tmp', 'LANG': 'C.UTF-8',
         })
         fs.path_iterdir(Path(state.cwd))
-        libs = Libraries(fs)
         functions = {'pwd': fs.pwd, 'cd': fs.cd, 'ls': fs.ls, 'mkdir': fs.mkdir,
                      'read': fs.read, 'write': fs.write, 'edit': fs.edit,
                      'glob': fs.glob, 'grep': fs.grep, 'mv': fs.mv, 'rm': fs.rm,
-                     'numpy': libs.numpy, 'pandas': libs.pandas, 'PIL': libs.PIL,
-                     'openpyxl': libs.openpyxl, 'pypdf': libs.pypdf, 'docx': libs.docx}
+                     'numpy': fs.numpy, 'pandas': fs.pandas, 'PIL': fs.PIL,
+                     'openpyxl': fs.openpyxl, 'pypdf': fs.pypdf, 'docx': fs.docx}
         with Monty(max_processes=1, request_timeout=20) as pool:
             with pool.checkout(limits={'max_memory': 64 * 1024**2,
                                        'max_feed_duration_secs': 10, 'max_suspensions': 1000}) as session:
                 if state.monty is not None:
                     session.load_session(state.monty)
-                printed = CollectString(max_bytes=16000)
+                printed, byte_count = [], 0
+                def capture(stream, text):
+                    nonlocal byte_count
+                    byte_count += len(text.encode())
+                    if byte_count > 16000:
+                        raise MemoryError('printed output exceeds 16000 bytes')
+                    printed.append(text)
+                    self._emit('stdout', text)
                 value = session.feed_run(code, external_lookup=functions, os=fs,
-                                         cwd=fs.cwd, print_callback=printed)
-                output = (printed.output + (repr(value) if value is not None else ''))[:24000]
+                                         cwd=fs.cwd, print_callback=capture)
+                self._stdout = ''.join(printed)
+                output = (self._stdout + (repr(value) if value is not None else ''))[:24000]
                 return fs, session.dump(), output
+
+    def _tool(self, call, revision):
+        try:
+            if call['function']['name'] != 'python':
+                raise ValueError('unknown tool')
+            code = json.loads(call['function']['arguments'])['code']
+            if not isinstance(code, str):
+                raise ValueError('code must be a string')
+        except (ValueError, KeyError, TypeError) as exc:
+            self.append_message({'role': 'tool', 'tool_call_id': call['id'], 'content': str(exc)},
+                                expected_event=revision)
+            self._emit('error', str(exc))
+            return
+        try:
+            self.execute(code, tool_id=call['id'])
+        except ExecutionError as exc:
+            self._emit('error', str(exc))  # The failure is already recorded.
+
+    def _response(self, client, messages, schema):
+        """Display deltas immediately; return only a complete assistant message."""
+        text, calls, shown, finish = [], {}, {}, None
+        with client.stream('POST', self.base_url + '/chat/completions',
+                           headers={'Authorization': f'Bearer {self.api_key}'},
+                           json={'model': self.model, 'stream': True, 'messages': [
+                               {'role': 'system', 'content':
+                                f'Your session ID is {self.id}; your name is {self.name}.\n' + HELP},
+                               *messages], 'tools': [schema], 'parallel_tool_calls': False}) as response:
+            response.raise_for_status()
+            for data in sse_data(response):
+                if data == '[DONE]':
+                    break
+                packet = json.loads(data)
+                if 'error' in packet:
+                    raise RuntimeError(str(packet['error']))
+                for choice in packet.get('choices', []):
+                    if choice.get('index', 0) != 0:
+                        continue
+                    delta = choice.get('delta', {})
+                    content = delta.get('content') or delta.get('refusal') or ''
+                    text.append(content)
+                    self._emit('assistant', content)
+                    for part in delta.get('tool_calls', []):
+                        index = part['index']
+                        call = calls.setdefault(index, {'id': '', 'type': 'function',
+                                                       'function': {'name': '', 'arguments': ''}})
+                        call['id'] += part.get('id', '')
+                        function = part.get('function', {})
+                        for field in ('name', 'arguments'):
+                            call['function'][field] += function.get(field, '')
+                        code = code_prefix(call['function']['arguments'])
+                        self._emit('python', code[len(shown.get(index, '')):])
+                        shown[index] = code
+                    finish = choice.get('finish_reason') or finish
+        if finish not in ('stop', 'tool_calls') or (finish == 'tool_calls' and not calls):
+            raise RuntimeError('Incomplete model response; resume to retry (partial code was not executed)')
+        if any(not call['id'] or not call['function']['name'] for call in calls.values()):
+            raise RuntimeError('Incomplete tool call; resume to retry')
+        message = {'role': 'assistant', 'content': ''.join(text)}
+        if calls:
+            message['tool_calls'] = [calls[index] for index in sorted(calls)]
+            self._streamed_calls.update(call['id'] for call in calls.values())
+        return message
 
     def run(self, prompt=None, *, max_steps=20):
         """Resume pending work automatically before accepting a new user turn."""
         if self.state.pending:
             try:
                 self.execute()
-            except ExecutionError:
-                pass
+            except ExecutionError as exc:
+                self._emit('error', str(exc))
         messages = self.state.messages
         if prompt is not None:
             if messages and (messages[-1]['role'] in ('user', 'tool') or messages[-1].get('tool_calls')):
@@ -820,42 +799,15 @@ class CodeAgent:
             for _ in range(max_steps):
                 state = self.state
                 messages = state.messages
-                if messages[-1].get('tool_calls') or messages[-1]['role'] == 'tool':
-                    index = len(messages) - 1
-                    while messages[index]['role'] == 'tool':
-                        index -= 1
-                    done = {m['tool_call_id'] for m in messages[index+1:]}
-                    pending = [c for c in messages[index]['tool_calls'] if c['id'] not in done]
-                    if pending:
-                        call = pending[0]
-                        try:
-                            if call['function']['name'] != 'python':
-                                raise ValueError('unknown tool')
-                            code = json.loads(call['function']['arguments'])['code']
-                            if not isinstance(code, str):
-                                raise ValueError('code must be a string')
-                        except (ValueError, KeyError, TypeError) as exc:
-                            self.append_message({'role': 'tool', 'tool_call_id': call['id'],
-                                                 'content': f'{type(exc).__name__}: {exc}'[:24000]},
-                                                expected_event=state.last_event_id)
-                            continue
-                        try:
-                            self.execute(code, tool_id=call['id'])
-                        except ExecutionError:
-                            pass  # failure and tool response were committed together
-                        continue
+                assistant = next((m for m in reversed(messages) if m['role'] == 'assistant'), {})
+                answered = {m['tool_call_id'] for m in messages if m['role'] == 'tool'}
+                call = next((c for c in assistant.get('tool_calls', []) if c['id'] not in answered), None)
+                if call:
+                    self._tool(call, state.last_event_id)
+                    continue
                 if messages[-1]['role'] == 'assistant':
                     return messages[-1].get('content') or ''
-                response = client.post(self.base_url + '/chat/completions',
-                                       headers={'Authorization': f'Bearer {self.api_key}'},
-                                       json={'model': self.model, 'messages': [
-                                           {'role': 'system', 'content':
-                                            f'Your session ID is {self.id}; your name is {self.name}.\n' + HELP}, *messages],
-                                           'tools': [schema], 'parallel_tool_calls': False})
-                response.raise_for_status()
-                message = response.json()['choices'][0]['message']
-                message = {k: v for k, v in message.items()
-                           if k in ('role', 'content', 'tool_calls') and v is not None}
+                message = self._response(client, messages, schema)
                 self.append_message(message, expected_event=state.last_event_id)
                 if message['role'] == 'assistant' and not message.get('tool_calls'):
                     return message.get('content') or ''

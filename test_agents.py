@@ -9,12 +9,38 @@ import shutil
 import tempfile
 import unittest
 from unittest.mock import patch
+from contextlib import redirect_stdout
 
 import httpx
+import main as repl
 from pypdf import PdfWriter
 
-from agents import CodeAgent, DirectoryStorage, ExecutionError, Unix
+from agents import CodeAgent, DirectoryStorage, ExecutionError, Unix, code_prefix
+from main import ReplOutput
+from rich.console import Console
 from names import num_to_name
+
+
+def sse(delta, finish=None):
+    return ('data: ' + json.dumps({'choices': [{'index': 0, 'delta': delta,
+                                               'finish_reason': finish}]}) + '\n\n').encode()
+
+
+def stream_response(message):
+    delta = {k: v for k, v in message.items() if k != 'role'}
+    if delta.get('tool_calls'):
+        delta['tool_calls'] = [dict(call, index=i) for i, call in enumerate(delta['tool_calls'])]
+    return httpx.Response(200, headers={'content-type': 'text/event-stream'},
+                          content=sse(delta, 'tool_calls' if delta.get('tool_calls') else 'stop') +
+                          b'data: [DONE]\n\n')
+
+
+class ByteStream(httpx.SyncByteStream):
+    def __init__(self, chunks):
+        self.chunks = chunks
+
+    def __iter__(self):
+        yield from self.chunks
 
 
 class AgentTests(unittest.TestCase):
@@ -84,7 +110,7 @@ class AgentTests(unittest.TestCase):
         def respond(request):
             history = json.loads(request.content)['messages']
             self.assertEqual([m['tool_call_id'] for m in history if m['role'] == 'tool'], ['0', '1'])
-            return httpx.Response(200, json={'choices': [{'message': {'role': 'assistant', 'content': 'done'}}]})
+            return stream_response({'role': 'assistant', 'content': 'done'})
         client = httpx.Client(transport=httpx.MockTransport(respond))
         with patch('agents.httpx.Client', return_value=client):
             self.assertEqual(self.agent.run(), 'done')
@@ -95,8 +121,7 @@ class AgentTests(unittest.TestCase):
         requests = []
         def respond(request):
             requests.append(json.loads(request.content)['messages'])
-            return httpx.Response(200, json={'choices': [{'message': {
-                'role': 'assistant', 'content': 'hello'}}]})
+            return stream_response({'role': 'assistant', 'content': 'hello'})
         client = httpx.Client(transport=httpx.MockTransport(respond))
         with patch('agents.httpx.Client', return_value=client):
             self.assertEqual(self.agent.run('hi'), 'hello')
@@ -110,14 +135,164 @@ class AgentTests(unittest.TestCase):
         def respond(request):
             history = json.loads(request.content)['messages']
             requests.append(history)
-            return httpx.Response(200, json={'choices': [{'message': {
-                'role': 'assistant', 'content': 'answer ' + history[-1]['content']}}]})
+            return stream_response({'role': 'assistant', 'content': 'answer ' + history[-1]['content']})
         clients = [httpx.Client(transport=httpx.MockTransport(respond)) for _ in range(2)]
         with patch('agents.httpx.Client', side_effect=clients):
             self.assertEqual(self.agent.run('new'), 'answer new')
         self.assertEqual(len(requests), 2)
         self.assertEqual([m['content'] for m in self.agent.state.messages],
                          ['old', 'answer old', 'new', 'answer new'])
+
+    def test_streams_text_decoded_code_and_results_before_completion(self):
+        observed, requests = [], []
+        code = 'print("hé😀")\n21 * 2'
+        arguments = json.dumps({'code': code}, ensure_ascii=True)
+        def record(kind, text):
+            observed.append((kind, text))
+            if kind == 'stdout':
+                self.assertIsNotNone(self.agent.state.pending)
+            if kind == 'result':
+                self.assertIsNone(self.agent.state.pending)
+        self.agent.on_output = record
+
+        def first_response():
+            packet = sse({'content': 'Let me calculate.'})
+            yield b': heartbeat\n\n' + packet[:9]
+            yield packet[9:]
+            self.assertIn(('assistant', 'Let me calculate.'), observed)
+            yield sse({'tool_calls': [{'index': 0, 'id': 'calc', 'type': 'function',
+                                      'function': {'name': 'python', 'arguments': ''}}]})
+            for character in arguments:
+                yield sse({'tool_calls': [{'index': 0, 'function': {'arguments': character}}]})
+            self.assertEqual(''.join(t for k, t in observed if k == 'python'), code)
+            self.assertEqual([m['role'] for m in self.agent.state.messages], ['user'])
+            yield sse({}, 'tool_calls') + b'data: [DONE]\n\n'
+
+        def final_response():
+            yield sse({'content': 'Done'})
+            self.assertIn(('assistant', 'Done'), observed)
+            yield sse({'content': '.'}, 'stop') + b'data: [DONE]\n\n'
+
+        def respond(request):
+            body = json.loads(request.content)
+            self.assertTrue(body['stream'])
+            requests.append(body)
+            if len(requests) == 2:
+                self.assertEqual(body['messages'][-1]['content'], 'hé😀\n42')
+                self.assertIn(('result', '42'), observed)
+            return httpx.Response(200, stream=ByteStream(
+                first_response() if len(requests) == 1 else final_response()))
+
+        client = httpx.Client(transport=httpx.MockTransport(respond))
+        with patch('agents.httpx.Client', return_value=client):
+            self.assertEqual(self.agent.run('calculate'), 'Done.')
+        self.assertEqual(len(requests), 2)
+        self.assertEqual(''.join(t for k, t in observed if k == 'python'), code)
+        self.assertEqual(''.join(t for k, t in observed if k == 'stdout'), 'hé😀\n')
+        self.assertEqual(''.join(t for k, t in observed if k == 'result'), '42')
+        self.assertEqual(''.join(t for k, t in observed if k == 'assistant'),
+                         'Let me calculate.Done.')
+
+    def test_incomplete_model_stream_never_records_or_executes_partial_code(self):
+        observed = []
+        self.agent.on_output = lambda kind, text: observed.append((kind, text))
+        code = "write('unsafe', 'partial')"
+        for finish in (None, 'length'):
+            with self.subTest(finish=finish):
+                content = sse({'content': 'Starting.', 'tool_calls': [{
+                    'index': 0, 'id': 'partial', 'function': {'name': 'python',
+                    'arguments': json.dumps({'code': code})}}]}, finish)
+                if finish:
+                    content += b'data: [DONE]\n\n'
+                client = httpx.Client(transport=httpx.MockTransport(
+                    lambda request: httpx.Response(200, stream=ByteStream([content]))))
+                with patch('agents.httpx.Client', return_value=client):
+                    with self.assertRaisesRegex(RuntimeError, 'Incomplete model response'):
+                        self.agent.run('try it')
+                self.assertEqual(self.agent.state.messages, [{'role': 'user', 'content': 'try it'}])
+                self.assertIsNone(self.agent.state.pending)
+                self.assertNotIn('execution_requested', [e['kind'] for e in self.agent.events()])
+                self.assertFalse(any(f['path'].endswith('/unsafe') for f in self.agent.files()))
+        self.assertTrue(any(kind == 'python' for kind, _ in observed))
+        self.agent.close()
+        self.agent = CodeAgent(self.path, session_id=self.session_id)
+        client = httpx.Client(transport=httpx.MockTransport(
+            lambda request: stream_response({'role': 'assistant', 'content': 'Recovered.'})))
+        with patch('agents.httpx.Client', return_value=client):
+            self.assertEqual(self.agent.run(), 'Recovered.')
+
+    def test_partial_json_code_decoding_handles_split_escapes(self):
+        code = 'print("hé😀")\nvalue = "\\n"\t# tab'
+        encoded = json.dumps({'code': code}, ensure_ascii=True)
+        previous = ''
+        for end in range(len(encoded) + 1):
+            current = code_prefix(encoded[:end])
+            self.assertTrue(current.startswith(previous))
+            self.assertTrue(code.startswith(current))
+            previous = current
+        self.assertEqual(previous, code)
+
+    def test_live_output_is_provisional_and_bounded(self):
+        self.agent.execute("write('/a','before')")
+        observed = []
+        self.agent.on_output = lambda kind, text: observed.append((kind, text))
+        with self.assertRaises(ExecutionError):
+            self.agent.execute("print('preview'); write('/a','after'); raise ValueError('rollback')")
+        self.assertEqual(observed[-1], ('stdout', 'preview\n'))
+        self.assertFalse(any(kind == 'result' for kind, _ in observed))
+        self.assertEqual(self.agent.read_file('/a'), b'before')
+        observed.clear()
+        with self.assertRaises(ExecutionError):
+            self.agent.execute("print('x' * 16001)")
+        self.assertLessEqual(sum(len(text.encode()) for kind, text in observed if kind == 'stdout'), 16000)
+        self.assertIsNone(self.agent.state.pending)
+
+    def test_repl_displays_streamed_trace_without_duplicate_final_answer(self):
+        code = "print('live value')\n6 * 7"
+        messages = iter([
+            {'role': 'assistant', 'content': 'Calculating.', 'tool_calls': [{
+                'id': 'repl-calc', 'type': 'function', 'function': {
+                    'name': 'python', 'arguments': json.dumps({'code': code})}}]},
+            {'role': 'assistant', 'content': 'Final answer: 42'},
+        ])
+        client = httpx.Client(transport=httpx.MockTransport(
+            lambda request: stream_response(next(messages))))
+        output = io.StringIO()
+        with patch('sys.argv', ['main.py', '--database', self.tmp.name + '/repl.db',
+                                '--workspaces', self.tmp.name + '/repl-workspaces']), \
+             patch('builtins.input', side_effect=['calculate', '/quit']), \
+             patch('agents.httpx.Client', return_value=client), redirect_stdout(output):
+            repl.main()
+        transcript = output.getvalue()
+        self.assertIn('Assistant', transcript)
+        self.assertIn('Calculating.', transcript)
+        self.assertEqual(transcript.count("print('live value')"), 1)
+        self.assertEqual(transcript.count('6 * 7'), 1)
+        self.assertIn('Output · pending commit', transcript)
+        self.assertIn('│ live value', transcript)
+        self.assertIn('Result', transcript)
+        self.assertNotIn('[assistant]', transcript)
+        self.assertNotIn('[python]', transcript)
+        self.assertNotIn('[result]', transcript)
+        self.assertEqual(transcript.count('Final answer: 42'), 1)
+
+    def test_rich_panels_keep_streamed_blocks_and_dark_backgrounds(self):
+        buffer = io.StringIO()
+        console = Console(file=buffer, force_terminal=True, color_system='truecolor', no_color=False, width=60)
+        output = ReplOutput(console)
+        output('python', 'value = ')
+        output('python', '42')
+        self.assertEqual(output.text, 'value = 42')
+        output('result', '42')
+        self.assertIn('value', buffer.getvalue())
+        self.assertIn('48;2;17;22;29', buffer.getvalue())
+        output.finish()
+        # Repeated errors after a closed block must also start a fresh panel.
+        output('error', 'first error')
+        output.finish()
+        output('error', 'second error')
+        output.finish()
+        self.assertIn('second error', buffer.getvalue())
 
     def test_isolated_sessions_and_disk_files(self):
         self.agent.execute("write('/a','first'); x=1")
@@ -146,18 +321,17 @@ class AgentTests(unittest.TestCase):
         with self.assertRaises(ExecutionError):
             self.agent.execute("read('/escape')")
 
-    def test_filesystem_journal_recovers_uncommitted_publication(self):
+    def test_uncommitted_objects_do_not_change_session_files(self):
         self.agent.execute("write('/a','before'); x=1")
         self.agent.db.execute('BEGIN IMMEDIATE')
-        self.agent._workspace.recover(self.agent.state.generation)
-        self.agent._workspace.publish(Unix([('/a', b'uncommitted')]).entries(), 'uncommitted')
+        self.agent._publish(Unix([('/a', b'uncommitted')]).entries())
         # Closing the connection simulates loss of the process before DB commit.
         self.agent.close()
         self.agent = CodeAgent(self.path, session_id=self.session_id)
         self.assertEqual((self.agent.workspace / 'a').read_text(), 'before')
         self.assertEqual(self.agent.execute('x'), '1')
 
-    def test_failure_after_filesystem_swap_rolls_back_files_and_globals(self):
+    def test_failure_before_event_commit_preserves_files_and_globals(self):
         self.agent.execute("write('/a','before'); x=1")
         before = self.agent.files()
         append = self.agent._append
@@ -210,7 +384,7 @@ class AgentTests(unittest.TestCase):
         with self.assertRaises(IsADirectoryError):
             self.agent.read_file(self.agent.home)
         with self.assertRaises(PermissionError):
-            self.agent._workspace.read('../other/file')
+            self.agent.storage.read('../other/file')
 
     def test_storage_root_can_move_without_rewriting_database_keys(self):
         self.agent.execute("write('a','portable'); x=7")
@@ -231,7 +405,7 @@ class AgentTests(unittest.TestCase):
         try:
             agent.execute("write('a','object'); x=9")
             record = next(f for f in agent.files() if f['path'] == agent.home + '/a')
-            self.assertIn(record['generation'], record['storage_key'])
+            self.assertTrue(record['storage_key'].startswith(agent.name + '/'))
             self.assertEqual(agent.read_file(agent.home + '/a'), b'object')
             session_id = agent.id
         finally:
@@ -274,7 +448,7 @@ class AgentTests(unittest.TestCase):
         self.assertEqual(self.agent.state, state)
         self.assertEqual(self.agent.files(), files)
         self.assertEqual(self.agent.events(), events)
-        self.assertEqual(self.agent._workspace.read(old['storage_key']), b'old')
+        self.assertEqual(self.agent.storage.read(old['storage_key']), b'old')
         self.assertEqual(self.agent.read_file(self.agent.home + '/version.txt'), b'new')
         self.assertEqual((self.agent.workspace / self.agent.home.lstrip('/') / 'version.txt').read_text(), 'new')
         self.assertEqual(self.agent.execute('n'), '2')
@@ -351,20 +525,17 @@ phase = sys.argv[3]
 if phase == 'requested':
     agent._evaluate = lambda code: os._exit(91)
 elif phase == 'published':
-    publish = agent._workspace.publish
-    def crash_publish(entries, generation):
-        publish(entries, generation)
+    publish = agent._publish
+    def crash_publish(entries):
+        publish(entries)
         os._exit(91)
-    agent._workspace.publish = crash_publish
-elif phase == 'renamed':
-    from pathlib import Path
-    rename = Path.rename
-    def crash_rename(path, target):
-        result = rename(path, target)
-        if path == agent.workspace:
-            os._exit(91)
-        return result
-    Path.rename = crash_rename
+    agent._publish = crash_publish
+elif phase == 'checkout':
+    checkout = agent.storage.checkout
+    def crash_checkout(name, files):
+        checkout(name, files[:2])
+        os._exit(91)
+    agent.storage.checkout = crash_checkout
 elif phase == 'projected':
     project = agent._project
     def crash_project(event_id, kind, payload, monty):
@@ -375,7 +546,7 @@ elif phase == 'projected':
 agent.execute("n += 1; write('counter.txt', str(n)); n", tool_id='counter-tool', execution_id='crash-test')
 os._exit(91)
 '''
-        for phase in ('requested', 'renamed', 'published', 'projected', 'committed'):
+        for phase in ('requested', 'published', 'projected', 'checkout', 'committed'):
             with self.subTest(phase=phase):
                 agent = CodeAgent(self.path)
                 agent.execute("n=0; write('counter.txt','0')")
@@ -402,49 +573,27 @@ os._exit(91)
                 finally:
                     agent.close()
 class ObjectStorage:
-    """Test double using immutable object generations, with no filesystem calls."""
+    """A blob-like backend with no local filesystem operations."""
 
     def __init__(self):
+        self.objects = {}
         self.workspaces = {}
 
-    def open(self, namespace):
-        return self.workspaces.setdefault(namespace, ObjectWorkspace(namespace))
+    def create(self, name):
+        if name in self.workspaces:
+            raise FileExistsError(name)
 
-
-class ObjectWorkspace:
-    def __init__(self, namespace):
-        self.namespace = namespace
-        self.location = 'memory://' + namespace
-        self.versions = {}
-        self.current = None
-
-    def initialize(self):
-        self.recover(None)
-
-    def recover(self, generation):
-        self.current = generation
-
-    def restore(self, files, generation):
-        self.versions[generation] = [(f['path'], None if f['kind'] == 'directory' else self.read(f['storage_key']))
-                                     for f in files]
-        self.current = generation
-
-    def entries(self):
-        return self.versions[self.current]
-
-    def publish(self, entries, generation):
-        self.versions[generation] = list(entries)
-        self.current = generation
-
-    def key(self, path, generation):
-        return f'{self.namespace}/{generation}{path}'
+    def put(self, name, content):
+        key = name + '/' + hashlib.sha256(content).hexdigest()
+        self.objects[key] = content
+        return key
 
     def read(self, key):
-        for generation, entries in self.versions.items():
-            for path, content in entries:
-                if content is not None and self.key(path, generation) == key:
-                    return content
-        raise FileNotFoundError(key)
+        return self.objects[key]
+
+    def checkout(self, name, files):
+        self.workspaces[name] = files
+        return 'memory://' + name
 
 
 if __name__ == '__main__':
