@@ -15,7 +15,7 @@ from contextlib import redirect_stdout
 import httpx
 from openai import AsyncOpenAI
 import main as repl
-from pypdf import PdfWriter
+from wrappers.registry import available
 
 from agents import CodeAgent, DirectoryStorage, ExecutionError, Unix, code_prefix
 from main import ReplOutput
@@ -84,7 +84,9 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
         await self.agent.execute("rm('/new', recursive=True)")
         self.assertEqual(await self.agent.execute("ls('/')"), "['/dev/', '/empty/', '/home/', '/tmp/']")
 
+    @unittest.skipUnless(all(name in available() for name in ('numpy', 'pandas', 'PIL', 'openpyxl', 'pypdf', 'docx')), 'optional libraries not installed')
     async def test_library_roundtrips(self):
+        from pypdf import PdfWriter
         self.assertEqual(await self.agent.execute("numpy('dot', [1,2], other=[3,4])"), '11')
         await self.agent.execute("pandas('to_csv', [{'a': 2}], path='/a.csv')")
         self.assertEqual(await self.agent.execute("pandas('read_csv', path='/a.csv')"), "[{'a': 2}]")

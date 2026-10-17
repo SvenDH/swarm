@@ -1,6 +1,7 @@
 """Bind library tools to one execution's virtual filesystem."""
 from functools import partial
 from importlib import import_module
+from .registry import available
 
 
 def invoke(module, fs, *args, **kwargs):
@@ -11,4 +12,5 @@ def invoke(module, fs, *args, **kwargs):
 
 def tools(fs):
     return {name: partial(invoke, name.lower(), fs)
-            for name in ('numpy', 'pandas', 'PIL', 'openpyxl', 'pypdf', 'docx')}
+            for name in ('numpy', 'pandas', 'PIL', 'openpyxl', 'pypdf', 'docx')
+            if name in available()}

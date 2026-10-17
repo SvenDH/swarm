@@ -30,10 +30,13 @@ import httpx
 from jiter import from_json
 from openai import AsyncOpenAI, pydantic_function_tool, LengthFinishReasonError, ContentFilterFinishReasonError
 from pydantic import BaseModel, ConfigDict
-from pydantic_monty import CallbackFile, AsyncMonty, MontyError, MontyCrashedError, OSAccess
+from pydantic_monty import CallbackFile, AsyncMonty, MontyError, MontyCrashedError, MontyClassProxy, OSAccess
 from dotenv import load_dotenv
 from names import num_to_name
 from wrappers import tools as library_tools
+from wrappers.bridge import dispatch as library_dispatch
+from wrappers.imports import BOOTSTRAP, CHECK, prepare as prepare_libraries
+from wrappers.registry import help_text as library_help
 
 load_dotenv(override=True)
 
@@ -67,21 +70,13 @@ Available host functions (call directly, no imports):
   grep(pattern, path='/', glob='*', limit=100, offset=0, literal=False)
     -> {matches: [{path,line,text}], truncated}; literal searches avoid regex
   mv(source,target); rm(path, recursive=False)
-  numpy(op, data, other=None, axis=None): array, sum, mean, min, max, std,
-    median, transpose, reshape(other=shape), dot(other=array), unique
-    Arrays cross the boundary as lists; scalars as Python numbers.
-  pandas(op, data=None, path=None, columns=None): read_csv/read_excel -> records;
-    to_csv/to_excel write records to path; describe/head (columns=count, default 5),
-    select(columns=list), sort(columns=list), drop_duplicates -> plain data
-  PIL(op, path=None, output=None, size=None, mode='RGB', color='white'):
-    info, new, resize, convert. Writing requires output; format from extension.
-  openpyxl(op, path, rows=None, sheet=None): read -> {sheet: rows},
-    write -> new workbook, append -> existing workbook (sheet defaults active)
-  pypdf(op, path, output=None, pages=None): read -> page texts,
-    select -> write selected zero-based pages (default all)
-  docx(op, path, paragraphs=None): read -> paragraphs, write -> new document,
-    append -> existing document. All paths refer ONLY to virtual files.
-These are functional wrappers, not importable native modules or native objects.
+Library compatibility: write familiar imports; the agent translates them for Monty.
+Only installed host libraries are exposed, as listed below.
+These are supported subsets, not full native modules. Objects persist across calls
+and restarts. All library file paths use ONLY the virtual filesystem (no URLs).
+No wildcard imports, pickle, arbitrary callbacks/apply/query/eval, or unsupported APIs.
+Use explicit methods and assignments; context managers/custom special methods are
+not supported. Arrays are capped at 1,000,000 elements; images at 4,000,000 pixels.
 Finish with a concise answer based on actual execution results.
 """
 
@@ -711,7 +706,7 @@ class CodeAgent:
                 fs, snapshot, output, stdout = await self._evaluate(request['code'], state, files)
             except MontyCrashedError:
                 raise  # Infrastructure failures/cancellation leave the request pending.
-            except MontyError as exc:
+            except (MontyError, SyntaxError, ImportError) as exc:
                 output = f'{type(exc).__name__}: {exc}'[:24000]
                 await self.runtime.database_call(self._commit, request, output, True)
                 raise ExecutionError(output) from exc
@@ -733,13 +728,20 @@ class CodeAgent:
         functions = {'pwd': fs.pwd, 'cd': fs.cd, 'ls': fs.ls, 'mkdir': fs.mkdir,
                      'read': fs.read, 'write': fs.write, 'edit': fs.edit,
                      'glob': fs.glob, 'grep': fs.grep, 'mv': fs.mv, 'rm': fs.rm,
-                     **library_tools(fs)}
+                     **library_tools(fs), '_library_rpc': partial(library_dispatch, fs)}
         # AsyncMonty runs synchronous OS/library callbacks on its worker threads.
         # Keep these synchronous so sandbox callers need not write `await numpy(...)`.
         async with self.runtime._pool.checkout(limits={'max_memory': 64 * 1024**2,
                                        'max_feed_duration_secs': 10, 'max_suspensions': 1000}) as session:
+            active = False
+            loaded = None
             if state.monty is not None:
                 await session.load_session(state.monty)
+                loaded = await session.feed_run(CHECK, external_lookup=functions, print_callback=lambda *args: None)
+                active = loaded is not None
+            code, libraries = await self.runtime.offload(prepare_libraries, code, active, loaded or ())
+            if libraries and not active:
+                await session.feed_run(BOOTSTRAP, external_lookup=functions, print_callback=lambda *args: None)
             printed, byte_count = [], 0
             def capture(stream, text):
                 nonlocal byte_count
@@ -751,7 +753,11 @@ class CodeAgent:
             value = await session.feed_run(code, external_lookup=functions, os=fs,
                                      cwd=fs.cwd, print_callback=capture)
             stdout = ''.join(printed)
-            output = (stdout + (repr(value) if value is not None else ''))[:24000]
+            if isinstance(value, MontyClassProxy) and value.name == '_LibraryRender':
+                rendered = value.attributes['text']
+            else:
+                rendered = repr(value) if value is not None else ''
+            output = (stdout + rendered)[:24000]
             return fs, await session.dump(), output, stdout
 
     async def _tool(self, call):
@@ -774,7 +780,7 @@ class CodeAgent:
         try:
             async with client.chat.completions.stream(
                 model=self.model, messages=[{'role': 'system', 'content':
-                    f'Your session ID is {self.id}; your name is {self.name}.\n' + HELP}, *messages],
+                    f'Your session ID is {self.id}; your name is {self.name}.\n' + HELP + '\n' + library_help()}, *messages],
                 tools=[self.runtime.tool], parallel_tool_calls=False,
             ) as stream:
                 async for event in stream:

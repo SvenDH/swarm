@@ -69,10 +69,105 @@ agent. Blocking IO and native-library callbacks run off-loop. Wrappers in
 thread and should return promptly; all application printing/Rich styling is in
 `main.py`.
 
+## Library syntax
+
+Library packages are optional. Install all supported packages and run with:
+
+```sh
+uv run --extra libraries main.py
+```
+
+Alternatively install only the packages you need in the host Python environment.
+The agent discovers packages once per process, advertises only installed ones,
+and rejects imports for missing packages. Restart after installing/removing a
+package. Discovery does not import heavy libraries; actual imports remain lazy.
+The default dependency set needs none of these libraries to run the agent.
+
+Use normal import syntax in tool code:
+
+```python
+import numpy as np
+import pandas as pd
+from PIL import Image
+from openpyxl import Workbook, load_workbook
+from pypdf import PdfReader, PdfWriter
+from docx import Document
+
+array = np.arange(6).reshape(2, 3)
+frame = pd.DataFrame({'value': [1, 2, 3]})
+frame['double'] = frame['value'] * 2
+frame.to_excel('data.xlsx', index=False)
+Image.new('RGB', (100, 100), 'blue').save('image.png')
+```
+
+These are **curated compatibility APIs**, not arbitrary native imports. Monty
+1.1 does not load these packages, so `wrappers/imports.py` translates imports,
+method calls, indexing and operators. Standard-library imports remain native.
+Supported constructors include arrays, DataFrames/Series/Indexes, images,
+workbooks, PDF readers/writers and Word documents. Common reductions, slicing,
+filtering, groupby/aggregation, file conversion and document editing are exposed
+through explicit allowlists in the corresponding files under `wrappers/`.
+`np.random.default_rng(seed)` creates an independently checkpointed generator.
+
+Additional optional adapters expose these common subsets:
+
+- `matplotlib.pyplot`: `figure/subplots`, line/scatter/bar/histogram/image plots,
+  axes labels/scales/legends and PNG/SVG/PDF `savefig`.
+- `seaborn`: `scatterplot`, `lineplot`, `histplot`, `boxplot`, `barplot`,
+  `heatmap`, `violinplot`, `kdeplot`. Pass `ax=` to draw into an existing figure;
+  otherwise save through the returned axes' `.figure.savefig(...)`.
+- `scipy`: distributions and statistical tests, linear algebra, signal/FFT,
+  interpolation, linear programming, assignment and distances. No Python callbacks.
+- `pptx`: presentations, layouts/slides, text boxes, paragraphs/runs/fonts,
+  tables and pictures; `pptx.util.Inches/Cm/Pt` and virtual `save`.
+- `reportlab`: `pdfgen.canvas.Canvas`, text, standard PDF fonts, lines/shapes,
+  images, page sizes/colors and `showPage/save`.
+- `pdfplumber`: virtual-file `open`, pages, text/words/tables and cropping.
+- `pymupdf` (also `fitz`): PDF `open`, pages, text extraction/insertion,
+  bounded raster rendering, page creation and virtual `save`.
+- `bs4`: `BeautifulSoup(..., 'html.parser')`, search/CSS selectors,
+  text/attributes and tag edits. No network fetching or XML parsers.
+- `sympy`: symbols, arithmetic, equations/solving, calculus, simplification
+  and matrices. Build expressions from symbols, not strings; no `sympify`,
+  `parse_expr` or `lambdify` evaluation.
+- `sklearn`: scalers/encoders, train/test splitting, common metrics,
+  LinearRegression/Ridge/LogisticRegression, KMeans and PCA. Fitted state is
+  explicit primitive/array data, not pickle, and inference does not refit models.
+- `xlsxwriter`: workbooks, sheets, formatting, cells/rows/formulas, charts
+  and images; `close()` writes the XLSX into the virtual filesystem.
+
+Figures and write-only Canvas/XlsxWriter objects checkpoint bounded drawing/write
+recipes and render to memory on save. Matplotlib uses local `Figure` objects,
+not shared pyplot state; rendering is serialized for native thread safety.
+Figure axes collections are Python lists (nested lists for 2D subplots), not
+NumPy arrays. Artist handles, interactive displays, arbitrary styles/fonts,
+global Seaborn themes, ReportLab Platypus, and APIs not listed are not exposed.
+Recipes are limited to 1,000 operations per figure/canvas/sheet/chart.
+
+The compatibility objects store safe data/formats (not pickle or live host
+handles), so they survive calls, restarts and transaction rollbacks. Workbook
+cells, document paragraphs/runs and PDF pages remain views of their parent.
+All library file IO—including `Path` arguments—uses the virtual filesystem.
+Read-only operations avoid reserializing the original object. Libraries still
+load lazily on the Python worker pool, never through an unrestricted host importer.
+Native extensions are initialized there before Monty callback threads use them,
+including when reopening a checkpoint in a fresh process.
+
+This is intentionally not full NumPy/pandas/Python emulation: wildcard imports,
+package introspection/type checks, custom callbacks (`apply`), NumPy `out=`, `query`/`eval`,
+pickle IO and compatibility-object context managers are not supported. Imports
+inside dynamic `exec`/`eval` strings or separate Python modules are not translated.
+Names beginning `_library_` are reserved. Unsupported functions fail explicitly;
+there is no fallback to arbitrary host attributes or host filesystem access.
+Use dtype names such as `'float64'` and explicit/vectorized methods. Arrays are
+limited to 1,000,000 elements/32 MiB, images to 4,000,000 pixels and library
+iteration to 10,000 items. Native-library work remains outside Monty's resource
+accounting; these wrappers are not a separate OS-level resource sandbox.
+
 ## Tests
 
 ```sh
-uv run python -m unittest test_agents test_concurrency test_templates -q
+uv run --extra libraries python -m unittest test_agents test_concurrency test_templates test_imports test_optional -q
 ```
 
 Tests cover wrappers, streaming, recovery after abrupt process death, cancellation,
