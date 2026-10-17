@@ -100,6 +100,9 @@ def resolve(root, path, module, fs, cache=None):
             value = value[decode(step[1], cache, fs)]
         elif step[0] == 'call':
             value = member(value, step[1], module, fs)(*decode(step[2], cache, fs), **decode(step[3], cache, fs))
+        elif step[0] == 'numpy_function' and module == 'numpy':
+            value = member(backend(module).exports(fs), step[1], module, fs)(
+                value, *decode(step[2], cache, fs), **decode(step[3], cache, fs))
         else:
             raise ValueError('Invalid library object path')
     return value
@@ -184,6 +187,15 @@ def dispatch(fs, action, spec, path=(), args=(), kwargs=None):
         if module == 'numpy' and api.shares(root, result):
             return {'result': {'__library_view__': [*path[:-1],
                 ['call', path[-1][1], wire_args, wire_kwargs]]}}
+        # Module functions such as np.flip/reshape also return live array views.
+        # Retain the authenticated argument root rather than checkpointing a copy.
+        if (module == 'numpy' and spec['kind'] == 'module' and args and
+                api.shares(args[0], result) and isinstance(wire_args[0], dict) and
+                '__library_value__' in wire_args[0] and len(path) == 1):
+            original = wire_args[0]
+            return {'argument_result': {
+                'module': module, 'identity': original['__library_value__']['identity'],
+                'path': [*original['path'], ['numpy_function', path[0][1], wire_args[1:], wire_kwargs]]}}
     elif action == 'item':
         result = value[args[0]]
         result_path = [*path, ['item', wire_args[0]]]

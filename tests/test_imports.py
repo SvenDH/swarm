@@ -95,6 +95,40 @@ resized = Image.open('image.png').resize((2,2), Image.Resampling.NEAREST)
         await self.agent.execute("resized.save('small.png')")
         self.assertTrue((await self.agent.read_file(self.agent.home + '/small.png')).startswith(b'\x89PNG'))
 
+    async def test_extended_numpy_operations_and_durable_views(self):
+        self.assertEqual(await self.agent.execute('''
+import numpy as np
+from numpy.linalg import cholesky
+base = np.arange(6).reshape(2,3)
+flipped = np.flip(base, axis=1)
+flipped[0,0] = 9
+(base.tolist(), np.repeat([1,2], [2,3]).tolist(), np.eye(2).tolist(),
+ np.diag([2,3]).tolist(), np.cumsum([1,2,3]).tolist(),
+ np.quantile([1,2,3], 0.5), cholesky([[4.,0.],[0.,9.]]).tolist())
+'''), '([[0, 1, 9], [3, 4, 5]], [1, 1, 2, 2, 2], [[1.0, 0.0], [0.0, 1.0]], [[2, 0], [0, 3]], [1, 3, 6], 2.0, [[2.0, 0.0], [0.0, 3.0]])')
+        self.assertEqual(await self.agent.execute('''
+gx, gy = np.meshgrid([1,2],[3,4])
+(gx.tolist(), gy.tolist(), np.histogram([0,1,2], bins=2)[0].tolist(),
+ np.allclose(np.nan_to_num([np.nan,2]), [0,2]), base.repeat(2, axis=0).shape)
+'''), '([[1, 2], [1, 2]], [[3, 3], [4, 4]], [1, 2], True, (4, 3))')
+        session_id = self.agent.id
+        await self.runtime.close()
+        self.runtime = await Runtime(self.database, workers=2).__aenter__()
+        self.agent = await self.runtime.agent(session_id=session_id)
+        self.assertEqual(await self.agent.execute('flipped[1,0]=8; base.tolist()'), '[[0, 1, 9], [3, 4, 8]]')
+
+    async def test_extended_numpy_preflights_allocations(self):
+        from wrappers.numpy import repeat, eye, diag, meshgrid, histogram
+        cases = [('repeat', repeat, ([1,2], 1_000_000)),
+                 ('eye', eye, (2000,)), ('diag', diag, ([1], 1_000_000)),
+                 ('meshgrid', meshgrid, (list(range(1001)), list(range(1001)))),
+                 ('histogram', histogram, ([1,2], 10_000_000))]
+        for name, function, args in cases:
+            with self.subTest(name=name), patch('wrappers.numpy.np.' + name,
+                    side_effect=AssertionError('native allocation reached')):
+                with self.assertRaises(ValueError):
+                    function(*args)
+
     async def test_workbook_sheet_cell_views_and_iteration(self):
         self.assertEqual(await self.agent.execute('''
 from openpyxl import Workbook, load_workbook

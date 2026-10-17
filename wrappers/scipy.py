@@ -1,5 +1,5 @@
 """Pure numeric SciPy APIs; Python callbacks and native file IO are excluded."""
-from scipy import stats, linalg, signal, fft, interpolate, optimize
+from scipy import stats, linalg, signal, fft, interpolate, optimize, special
 from scipy.spatial import distance
 from inspect import signature
 from .bridge import descriptor
@@ -37,9 +37,18 @@ def exports(fs):
         'ttest_rel': test(stats.ttest_rel), 'pearsonr': test(stats.pearsonr),
         'spearmanr': test(stats.spearmanr), 'mannwhitneyu': test(stats.mannwhitneyu),
         'chi2_contingency': stats.chi2_contingency, 'zscore': stats.zscore,
+        'skew': stats.skew, 'kurtosis': stats.kurtosis, 'sem': stats.sem,
+        'iqr': stats.iqr, 'rankdata': stats.rankdata, 'entropy': stats.entropy,
+        'gmean': stats.gmean, 'hmean': stats.hmean,
+        'shapiro': test(stats.shapiro), 'normaltest': test(stats.normaltest),
+        'ks_2samp': test(stats.ks_2samp), 'wilcoxon': test(stats.wilcoxon),
         'describe': lambda a, **kw: Record(dict(zip(
             ('nobs', 'minmax', 'mean', 'variance', 'skewness', 'kurtosis'), stats.describe(a, **kw)))),
         'linregress': lambda *a, **kw: regression(*a, **kw)},
+        'special': {'expit': special.expit, 'logit': special.logit, 'softmax': special.softmax,
+                    'logsumexp': special.logsumexp, 'erf': special.erf, 'erfc': special.erfc,
+                    'gamma': special.gamma, 'gammaln': special.gammaln,
+                    'factorial': special.factorial, 'comb': special.comb},
         'linalg': {'solve': linalg.solve, 'inv': linalg.inv, 'det': linalg.det,
                    'norm': linalg.norm, 'svd': linalg.svd, 'eig': linalg.eig,
                    'eigh': linalg.eigh, 'lstsq': linalg.lstsq},

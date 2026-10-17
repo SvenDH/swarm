@@ -9,10 +9,16 @@ from .files import save
 
 LOCK = threading.RLock()  # Matplotlib font/render internals are not thread safe.
 PLOTS = {'plot', 'scatter', 'bar', 'barh', 'hist', 'imshow', 'pie', 'boxplot',
-         'fill_between', 'errorbar', 'axhline', 'axvline'}
+         'fill_between', 'errorbar', 'axhline', 'axvline', 'step', 'stairs',
+         'stackplot', 'fill', 'fill_betweenx', 'hlines', 'vlines', 'axhspan', 'axvspan',
+         'semilogx', 'semilogy', 'loglog', 'contour', 'contourf', 'pcolormesh',
+         'text', 'annotate'}
 LABELS = {'set_title', 'set_xlabel', 'set_ylabel', 'set_xlim', 'set_ylim',
           'set_xticks', 'set_yticks', 'set_xticklabels', 'set_yticklabels',
-          'legend', 'grid', 'set_xscale', 'set_yscale'}
+          'legend', 'grid', 'set_xscale', 'set_yscale', 'axis', 'set_aspect',
+          'invert_xaxis', 'invert_yaxis', 'tick_params', 'minorticks_on',
+          'minorticks_off', 'margins', 'set_axis_off', 'set_axis_on'}
+FIGURE = {'suptitle', 'supxlabel', 'supylabel', 'tight_layout', 'subplots_adjust', 'text'}
 
 
 class Chart:
@@ -103,7 +109,9 @@ def render(chart, fs, filename, **kwargs):
                 FUNCTIONS[name[4:]](*args, ax=target, **options)
             else:
                 functions = axis_functions(target) if index is not None else {
-                    'suptitle': figure.suptitle, 'tight_layout': figure.tight_layout}
+                    'suptitle': figure.suptitle, 'tight_layout': figure.tight_layout,
+                    'supxlabel': figure.supxlabel, 'supylabel': figure.supylabel,
+                    'subplots_adjust': figure.subplots_adjust, 'text': figure.text}
                 functions[name](*args, **options)
         try:
             return save(fs, filename, lambda stream: figure.savefig(stream, format=fmt, **kwargs))
@@ -115,6 +123,16 @@ def axis_functions(ax):
     return {'plot': ax.plot, 'scatter': ax.scatter, 'bar': ax.bar, 'barh': ax.barh,
             'hist': ax.hist, 'imshow': ax.imshow, 'pie': ax.pie, 'boxplot': ax.boxplot,
             'fill_between': ax.fill_between, 'errorbar': ax.errorbar,
+            'step': ax.step, 'stairs': ax.stairs, 'stackplot': ax.stackplot,
+            'fill': ax.fill, 'fill_betweenx': ax.fill_betweenx,
+            'hlines': ax.hlines, 'vlines': ax.vlines, 'axhspan': ax.axhspan, 'axvspan': ax.axvspan,
+            'semilogx': ax.semilogx, 'semilogy': ax.semilogy, 'loglog': ax.loglog,
+            'contour': ax.contour, 'contourf': ax.contourf, 'pcolormesh': ax.pcolormesh,
+            'text': ax.text, 'annotate': ax.annotate, 'axis': ax.axis,
+            'set_aspect': ax.set_aspect, 'invert_xaxis': ax.invert_xaxis, 'invert_yaxis': ax.invert_yaxis,
+            'tick_params': ax.tick_params, 'minorticks_on': ax.minorticks_on,
+            'minorticks_off': ax.minorticks_off, 'margins': ax.margins,
+            'set_axis_off': ax.set_axis_off, 'set_axis_on': ax.set_axis_on,
             'axhline': ax.axhline, 'axvline': ax.axvline, 'set_title': ax.set_title,
             'set_xlabel': ax.set_xlabel, 'set_ylabel': ax.set_ylabel,
             'set_xlim': ax.set_xlim, 'set_ylim': ax.set_ylim,
@@ -132,20 +150,25 @@ def members(value, fs, name=None):
                 'gca': lambda: Axis(value.chart()), 'show': lambda: None,
                 'close': lambda *args: None,
                 'savefig': lambda filename, **kw: render(value.chart(), fs, filename, **kw),
-                **{method: draw(method) for method in PLOTS | {'legend', 'grid'}},
+                **{method: draw(method) for method in PLOTS | {'legend', 'grid', 'axis', 'tick_params', 'margins', 'minorticks_on', 'minorticks_off'}},
                 **{method: draw('set_' + method) for method in ('title', 'xlabel', 'ylabel', 'xlim', 'ylim', 'xticks', 'yticks', 'xscale', 'yscale')},
-                'tight_layout': lambda **kw: value.chart().add(None, 'tight_layout', (), kw)}
+                **{method: record_method(value.chart, None, method) for method in FIGURE - {'text'}}}
     if isinstance(value, Chart):
         return {'axes': [Axis(value, i) for i in range(value.nrows * value.ncols)],
                 'savefig': lambda filename, **kw: render(value, fs, filename, **kw),
-                'suptitle': lambda *a, **kw: value.add(None, 'suptitle', a, kw),
-                'tight_layout': lambda **kw: value.add(None, 'tight_layout', (), kw)}
+                **{method: record_method(lambda: value, None, method) for method in FIGURE}}
     if isinstance(value, Axis):
         return {'figure': value.chart,
-                **{method: (lambda *a, _method=method, **kw: value.chart.add(value.index, _method, a, kw))
+                **{method: record_method(lambda: value.chart, value.index, method)
                    for method in PLOTS | LABELS},
                 'set': lambda **kw: set_axis(value, kw)}
     return {}
+
+
+def record_method(chart, index, method):
+    def invoke(*args, **kwargs):
+        return chart().add(index, method, args, kwargs)
+    return invoke
 
 
 def set_axis(axis, options):

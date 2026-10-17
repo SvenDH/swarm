@@ -71,6 +71,40 @@ class OptionalTests(unittest.IsolatedAsyncioTestCase):
         self.runtime = await Runtime(self.database, workers=2).__aenter__()
         self.agent = await self.runtime.agent(session_id=session_id)
 
+    async def test_expanded_plotting_recipes_and_scipy(self):
+        self.need('numpy', 'matplotlib', 'scipy')
+        self.assertEqual(await self.agent.execute('''
+import numpy as np
+import matplotlib.pyplot as plt
+from scipy.special import softmax, expit
+from scipy.stats import rankdata, iqr
+fig, axes = plt.subplots(2, 2, figsize=(4,3))
+axes[0][0].step([0,1,2], [1,3,2])
+axes[0][0].annotate('peak', xy=(1,3), xytext=(0,2), arrowprops={'arrowstyle':'->'})
+axes[0][0].axhspan(0,1,alpha=0.2)
+axes[0][1].stairs([2,1,3])
+axes[0][1].tick_params(axis='x', labelrotation=20)
+axes[1][0].contourf([[1,2],[3,4]])
+axes[1][0].set_aspect('equal')
+axes[1][1].stackplot([0,1,2], [1,2,3], [2,1,2])
+axes[1][1].margins(x=0)
+fig.supxlabel('shared x')
+fig.supylabel('shared y')
+fig.subplots_adjust(hspace=0.5, wspace=0.5)
+fig.text(0.5,0.98,'extended',ha='center')
+fig.savefig('extended.png')
+(np.round(softmax([0.,0.]), 2).tolist(), float(expit(0.)), rankdata([3,1,1]).tolist(), float(iqr([1,2,3,4])))
+'''), '([0.5, 0.5], 0.5, [3.0, 1.5, 1.5], 1.5)')
+        before = await self.agent.read_file(self.agent.home + '/extended.png')
+        self.assertTrue(before.startswith(b'\x89PNG'))
+        await self.restart()
+        await self.agent.execute("fig.savefig('restored.png'); fig.savefig('restored.svg')")
+        self.assertEqual(before, await self.agent.read_file(self.agent.home + '/restored.png'))
+        for code in ("axes[0][0].text(0,0,'unsafe',usetex=True)",
+                     "axes[0][0].annotate('unsafe',xy=(0,0),fontproperties={'fname':'/tmp/host.ttf'})"):
+            with self.subTest(code=code), self.assertRaises(ExecutionError):
+                await self.agent.execute(code)
+
     async def test_matplotlib_and_seaborn(self):
         self.need('matplotlib', 'seaborn')
         await self.agent.execute('''

@@ -116,13 +116,20 @@ through explicit allowlists in the corresponding files under `wrappers/`.
 
 Additional optional adapters expose these common subsets:
 
+- `numpy`: bounded `tile/repeat/eye/diag/meshgrid`, reshaping and live array views,
+  cumulative and NaN-aware reductions, quantiles, histograms, interpolation,
+  comparisons and linear algebra (SVD, QR, eigenvalues, Cholesky, least squares).
 - `matplotlib.pyplot`: `figure/subplots`, line/scatter/bar/histogram/image plots,
-  axes labels/scales/legends and PNG/SVG/PDF `savefig`.
+  step/stairs/stack/contour plots, spans, text/annotations, axes styling,
+  figure labels/layout and PNG/SVG/PDF `savefig`. Plot calls record commands;
+  native artist handles and global styles are not exposed.
 - `seaborn`: `scatterplot`, `lineplot`, `histplot`, `boxplot`, `barplot`,
   `heatmap`, `violinplot`, `kdeplot`. Pass `ax=` to draw into an existing figure;
   otherwise save through the returned axes' `.figure.savefig(...)`.
 - `scipy`: distributions and statistical tests, linear algebra, signal/FFT,
-  interpolation, linear programming, assignment and distances. No Python callbacks.
+  interpolation, linear programming, assignment and distances; ranks, spread,
+  normality tests and `special` functions (softmax, sigmoid, gamma, erf).
+  No Python callbacks.
 - `pptx`: presentations, layouts/slides, text boxes, paragraphs/runs/fonts,
   tables and pictures; `pptx.util.Inches/Cm/Pt` and virtual `save`.
 - `reportlab`: `pdfgen.canvas.Canvas`, text, standard PDF fonts, lines/shapes,
