@@ -2,9 +2,10 @@
 
 
 class _LibraryValue:
-    def __init__(self, root, path):
+    def __init__(self, root, path, auth=None):
         self.root = root
         self.path = path
+        self.auth = auth
 
 
 class _LibraryRender:
@@ -12,7 +13,6 @@ class _LibraryRender:
         self.text = text
 
 
-_library_serial = [0]
 _library_modules = {}
 
 
@@ -22,7 +22,7 @@ def _library_is_value(value):
 
 def _library_pack(value):
     if isinstance(value, _LibraryValue):
-        return {'__library_value__': value.root, 'path': value.path}
+        return {'__library_value__': value.root, 'path': value.path, 'auth': value.auth}
     if isinstance(value, slice):
         return {'__library_slice__': [value.start, value.stop, value.step]}
     if isinstance(value, list):
@@ -42,13 +42,13 @@ def _library_pack(value):
 
 def _library_unpack(value, root):
     if isinstance(value, dict):
+        if '__library_dict__' in value:
+            return {key: _library_unpack(item, root) for key, item in value['__library_dict__']}
         if '__library_object__' in value:
             spec = value['__library_object__']
-            _library_serial[0] += 1
-            spec['identity'] = _library_serial[0]
             return _LibraryValue(spec, [])
         if '__library_view__' in value:
-            return _LibraryValue(root, value['__library_view__'])
+            return _LibraryValue(root, value['__library_view__'], value['auth'])
         return {key: _library_unpack(item, root) for key, item in value.items()}
     if isinstance(value, list):
         return [_library_unpack(item, root) for item in value]
@@ -59,10 +59,10 @@ def _library_unpack(value, root):
 
 def _library_request(_lib_receiver, _lib_action, *args, **kwargs):
     value, action = _lib_receiver, _lib_action
-    response = _library_rpc(action, value.root, value.path, _library_pack(args), _library_pack(kwargs))
+    response = _library_rpc(action, value.root, value.path, _library_pack(args), _library_pack(kwargs), value.auth)
     if 'state' in response:
         state = response['state']
-        value.root['data'] = state['data']
+        value.root.update(state)
     if response.get('updates'):
         _library_update(args, response['updates'])
         _library_update(kwargs, response['updates'])
@@ -70,7 +70,7 @@ def _library_request(_lib_receiver, _lib_action, *args, **kwargs):
         spec = response['argument_result']
         original = _library_find((args, kwargs), spec)
         if original is not None:
-            return _LibraryValue(original.root, spec['path'])
+            return _LibraryValue(original.root, spec['path'], spec['auth'])
     return _library_unpack(response.get('result'), value.root)
 
 
@@ -91,7 +91,7 @@ def _library_update(value, updates):
     if isinstance(value, _LibraryValue):
         for update in updates:
             if value.root['module'] == update['module'] and value.root['identity'] == update['identity']:
-                value.root['data'] = update['data']
+                value.root.update(update['state'])
     elif isinstance(value, (list, tuple)):
         for item in value:
             _library_update(item, updates)
@@ -108,19 +108,18 @@ def _library_invoke(function, *args, **kwargs):
 
 def _library_import(module):
     if module not in _library_modules:
-        _library_serial[0] += 1
-        _library_modules[module] = {'module': module, 'kind': 'module', 'data': None, 'identity': _library_serial[0]}
+        _library_modules[module] = _library_rpc('import', module)
     return _LibraryValue(_library_modules[module], [])
 
 
 def _library_get(value, name):
     if not isinstance(value, _LibraryValue):
         return getattr(value, name)
-    response = _library_rpc('get', value.root, value.path, [name], {})
+    response = _library_rpc('get', value.root, value.path, [name], {}, value.auth)
     if 'state' in response:
-        value.root['data'] = response['state']['data']
+        value.root.update(response['state'])
     if response.get('call'):
-        target = _LibraryValue(value.root, value.path + [['attr', name]])
+        target = _LibraryValue(value.root, response['path'], response['auth'])
         def invoke(*args, **kwargs):
             return _library_request(target, 'call', *args, **kwargs)
         return invoke

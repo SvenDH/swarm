@@ -1,6 +1,7 @@
 """Pure numeric SciPy APIs; Python callbacks and native file IO are excluded."""
 from scipy import stats, linalg, signal, fft, interpolate, optimize
 from scipy.spatial import distance
+from inspect import signature
 from .bridge import descriptor
 from .common import Record, freeze, thaw, view, iterate, assign
 
@@ -58,6 +59,9 @@ def exports(fs):
 
 
 def linear_program(*args, **kwargs):
+    bound = signature(optimize.linprog).bind(*args, **kwargs)
+    kwargs = bound.arguments
+    args = ()
     if kwargs.get('callback') is not None:
         raise ValueError('Python callbacks are not supported')
     if kwargs.get('method', 'highs') not in ('highs', 'highs-ds', 'highs-ipm'):

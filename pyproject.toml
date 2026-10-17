@@ -10,7 +10,6 @@ dependencies = [
     "pydantic>=2.12",
     "pydantic-monty==1.1.0",
     "python-dotenv==1.2.1",
-    "regex>=2026.9.29",
     "rich>=14.3.2",
 ]
 

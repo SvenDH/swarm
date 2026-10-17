@@ -1,5 +1,7 @@
 """Symbolic expressions without sympify/parse_expr's Python evaluation."""
 import sympy as sp
+from fractions import Fraction
+from keyword import iskeyword
 from .bridge import descriptor
 from .common import is_view, view, iterate, assign
 
@@ -12,18 +14,27 @@ CONSTRUCTORS = {name: value for name, value in (
     ('GreaterThan', sp.Ge), ('Tuple', sp.Tuple))}
 
 
+def validate(value, depth=0):
+    if depth > 64:
+        raise ValueError('Symbolic values are nested too deeply')
+    if isinstance(value, str):
+        raise ValueError('Use Symbol/symbols and expressions, not expression strings')
+    if value is None or type(value) in (bool, int, float, complex) or isinstance(value, (sp.Basic, sp.MatrixBase)):
+        return
+    if isinstance(value, (list, tuple)):
+        for item in value:
+            validate(item, depth + 1)
+        return
+    if isinstance(value, dict):
+        for key, item in value.items():
+            validate(key, depth + 1)
+            validate(item, depth + 1)
+        return
+    raise TypeError('Unsupported symbolic argument')
+
+
 def checked(function):
     def invoke(*args, **kwargs):
-        def validate(value):
-            if isinstance(value, str):
-                raise ValueError('Use Symbol/symbols and expressions, not expression strings')
-            if isinstance(value, (list, tuple)):
-                for item in value:
-                    validate(item)
-            if isinstance(value, dict):
-                for key, item in value.items():
-                    validate(key)
-                    validate(item)
         validate(args)
         for value in kwargs.values():
             validate(value)
@@ -31,9 +42,40 @@ def checked(function):
     return invoke
 
 
+def named(factory, names, **assumptions):
+    if not isinstance(names, str) or any(type(flag) not in (bool, type(None)) or key.startswith('_')
+                                          for key, flag in assumptions.items()):
+        raise ValueError('Symbols need a name string and boolean assumptions')
+    result = factory(names, **assumptions)
+    symbols = result if isinstance(result, (tuple, list)) else (result,)
+    if any(not isinstance(symbol, sp.Symbol) or not symbol.name.isidentifier()
+           or symbol.name.startswith('__') or iskeyword(symbol.name) for symbol in symbols):
+        raise ValueError('Symbol names must be ordinary identifiers')
+    return result
+
+
+def number(factory, *args, **kwargs):
+    for item in args:
+        if isinstance(item, str):
+            if factory is sp.Rational:
+                Fraction(item)
+            elif factory is sp.Integer:
+                int(item)
+            else:
+                float(item)
+        else:
+            validate(item)
+    if set(kwargs) - {'dps', 'precision'} or any(type(value) is not int or not 1 <= value <= 10000 for value in kwargs.values()):
+        raise ValueError('Unsupported numeric precision options')
+    return factory(*args, **kwargs)
+
+
 def exports(fs):
-    return {'Symbol': sp.Symbol, 'symbols': sp.symbols, 'Integer': sp.Integer,
-            'Float': sp.Float, 'Rational': sp.Rational,
+    return {'Symbol': lambda name, **kw: named(sp.Symbol, name, **kw),
+            'symbols': lambda names, **kw: named(sp.symbols, names, **kw),
+            'Integer': lambda *a, **kw: number(sp.Integer, *a, **kw),
+            'Float': lambda *a, **kw: number(sp.Float, *a, **kw),
+            'Rational': lambda *a, **kw: number(sp.Rational, *a, **kw),
             **{name: checked(function) for name, function in (
                 ('Eq', sp.Eq), ('solve', sp.solve), ('expand', sp.expand), ('factor', sp.factor),
                 ('simplify', sp.simplify), ('diff', sp.diff), ('integrate', sp.integrate),
@@ -45,7 +87,7 @@ def exports(fs):
 def members(value, fs, name=None):
     if isinstance(value, sp.MatrixBase):
         return {'shape': value.shape, 'T': value.T, 'det': value.det, 'inv': value.inv,
-                'tolist': value.tolist, 'eigenvals': value.eigenvals}
+                'tolist': value.tolist, 'eigenvals': checked(value.eigenvals)}
     if isinstance(value, sp.Basic):
         return {'free_symbols': list(value.free_symbols), 'args': value.args,
                 'subs': checked(value.subs), 'evalf': checked(value.evalf),
@@ -75,16 +117,37 @@ def tree(value):
     raise TypeError(f'Unsupported symbolic expression: {type(value).__name__}')
 
 
-def untree(data):
+def untree(data, depth=0):
+    if depth > 64 or type(data) not in (list, tuple) or not data:
+        raise ValueError('Invalid symbolic tree')
     name = data[0]
     if name == 'bool':
+        if len(data) != 2 or type(data[1]) is not bool:
+            raise ValueError('Invalid symbolic boolean')
         return sp.true if data[1] else sp.false
     if name == 'constant':
+        if len(data) != 2 or type(data[1]) is not str:
+            raise ValueError('Invalid symbolic constant')
         return {'pi': sp.pi, 'E': sp.E, 'I': sp.I, 'oo': sp.oo, '-oo': -sp.oo}[data[1]]
+    if len(data) != 3 or type(data[1]) not in (list, tuple):
+        raise ValueError('Invalid symbolic tree arguments')
+    args, options = data[1:]
+    if name == 'Symbol':
+        if len(args) != 1 or type(options) is not dict:
+            raise ValueError('Invalid symbol')
+        return named(sp.Symbol, args[0], **options)
+    if name in ('Integer', 'Rational'):
+        if len(args) != (1 if name == 'Integer' else 2) or options != {} or any(type(item) is not int for item in args):
+            raise ValueError('Invalid symbolic number')
+        return CONSTRUCTORS[name](*args)
     if name == 'Float':
-        return sp.Float(data[1][0], precision=data[1][1])
-    args = [untree(item) for item in data[1]] if data[2] is None else data[1]
-    return CONSTRUCTORS[name](*args, **(data[2] or {}))
+        if len(args) != 2 or type(args[0]) is not str or type(args[1]) is not int or not 1 <= args[1] <= 10000:
+            raise ValueError('Invalid symbolic float')
+        float(args[0])  # Numeric text only, never a symbolic expression string.
+        return sp.Float(args[0], precision=args[1])
+    if options is not None or name not in CONSTRUCTORS:
+        raise ValueError('Composite symbolic nodes require typed child trees')
+    return CONSTRUCTORS[name](*(untree(item, depth + 1) for item in args))
 
 
 def pack(value):

@@ -7,9 +7,9 @@ operate on virtual bytes/plain data outside Monty's resource accounting.
 """
 from __future__ import annotations
 
-import fnmatch
 import asyncio
 import hashlib
+import hmac
 import json
 import os
 import posixpath
@@ -34,7 +34,8 @@ from pydantic_monty import CallbackFile, AsyncMonty, MontyError, MontyCrashedErr
 from dotenv import load_dotenv
 from names import num_to_name
 from wrappers import tools as library_tools
-from wrappers.bridge import dispatch as library_dispatch
+from wrappers.protocol import Bridge
+from wrappers.bridge import backend as library_backend
 from wrappers.imports import BOOTSTRAP, CHECK, prepare as prepare_libraries
 from wrappers.registry import help_text as library_help
 
@@ -55,25 +56,15 @@ class PythonCode(BaseModel):
     code: str
 
 HELP = """You are a code-mode assistant. Execute Python with the python tool to
-inspect and modify a persistent virtual Unix filesystem. No host shell/network.
+inspect and modify your persistent filesystem. No host shell/network.
 Globals persist after successful calls. Failed calls roll back globals and files.
 Use print for observations. Batch related work; avoid dumping large files.
 Paths are POSIX; cwd starts at /home/<your-name>/. pathlib.Path and open use
-the same virtual filesystem as the tools. /tmp and /dev/null are available.
-HOME, USER, LOGNAME, PWD and TMPDIR describe your isolated virtual environment.
-cd() changes tool paths immediately and native open/Path cwd on the NEXT call.
-Available host functions (call directly, no imports):
-  pwd(); cd(path); ls(path='.'); mkdir(path, parents=True)
-  read(path, offset=1, limit=200) -> numbered lines (1-based)
-  write(path, content: str|bytes); edit(path, old, new, all=False)
-  glob(pattern='*', path='/', limit=200) -> recursive matching file paths
-  grep(pattern, path='/', glob='*', limit=100, offset=0, literal=False)
-    -> {matches: [{path,line,text}], truncated}; literal searches avoid regex
-  mv(source,target); rm(path, recursive=False)
-Library compatibility: write familiar imports; the agent translates them for Monty.
-Only installed host libraries are exposed, as listed below.
+the filesystem. Use open() and pathlib.Path for all file operations.
+/tmp and /dev/null are available.
+HOME, USER, LOGNAME, PWD and TMPDIR describe your environment.
 These are supported subsets, not full native modules. Objects persist across calls
-and restarts. All library file paths use ONLY the virtual filesystem (no URLs).
+and restarts. All library file paths use ONLY the filesystem (no URLs).
 No wildcard imports, pickle, arbitrary callbacks/apply/query/eval, or unsupported APIs.
 Use explicit methods and assignments; context managers/custom special methods are
 not supported. Arrays are capped at 1,000,000 elements; images at 4,000,000 pixels.
@@ -82,7 +73,7 @@ Finish with a concise answer based on actual execution results.
 
 
 class Unix(OSAccess):
-    """Monty's in-memory Unix tree plus bounded code-agent conveniences."""
+    """Monty's in-memory Unix tree and internal persistence/library IO helpers."""
 
     def __init__(self, entries=(), cwd='/', environ=None):
         # Like Bashkit, the runtime and tools share a VFS, including virtual
@@ -114,29 +105,8 @@ class Unix(OSAccess):
         return [(str(p), self.path_read_bytes(p) if self.path_is_file(p) else None)
                 for p in self.walk()]
 
-    def pwd(self):
-        return self.cwd
-
-    def cd(self, path):
-        p = self.path(path)
-        self.path_iterdir(p)  # validates directory
-        self.cwd = str(p)
-        self.environ['PWD'] = self.cwd
-        return self.cwd
-
-    def ls(self, path='.'):
-        return [str(p) + ('/' if self.path_is_dir(p) else '')
-                for p in sorted(self.path_iterdir(self.path(path)))][:1000]
-
     def mkdir(self, path, parents=True):
         self.path_mkdir(self.path(path), parents, True)
-
-    def read(self, path, offset=1, limit=200):
-        if offset < 1 or not 1 <= limit <= 2000:
-            raise ValueError('offset >= 1 and 1 <= limit <= 2000 required')
-        lines = self.path_read_text(self.path(path)).splitlines()
-        return '\n'.join(f'{i + 1}: {line[:4000]}' for i, line in
-                         enumerate(lines[offset-1:offset-1+limit], offset-1))
 
     def write(self, path, content):
         if isinstance(content, str):
@@ -144,59 +114,6 @@ class Unix(OSAccess):
         if len(content) > 32 * 1024 * 1024:
             raise ValueError('file exceeds 32 MiB')
         return self.path_write_bytes(self.path(path), content)
-
-    def edit(self, path, old, new, all=False):
-        text = self.path_read_text(self.path(path))
-        count = text.count(old)
-        if not old or not count or (count != 1 and not all):
-            raise ValueError('old must be nonempty and match once, or use all=True')
-        self.write(path, text.replace(old, new, -1 if all else 1))
-        return count
-
-    def glob(self, pattern='*', path='/', limit=200):
-        if not 1 <= limit <= 2000:
-            raise ValueError('limit must be 1..2000')
-        root = self.path(path)
-        result = []
-        for p in self.walk(str(root)):
-            if self.path_is_file(p) and (fnmatch.fnmatch(str(p.relative_to(root)), pattern)
-                                         or fnmatch.fnmatch(p.name, pattern)):
-                result.append(str(p))
-                if len(result) == limit:
-                    break
-        return result
-
-    def grep(self, pattern, path='/', glob='*', limit=100, offset=0, literal=False):
-        # Host regex needs its own timeout: Monty's budget does not cover callbacks.
-        import regex
-        if not 1 <= limit <= 1000 or offset < 0:
-            raise ValueError('limit must be 1..1000; offset >= 0')
-        matcher = None if literal else regex.compile(pattern)
-        result, skipped = [], 0
-        for p in self.walk(path):
-            if not self.path_is_file(p) or not fnmatch.fnmatch(p.name, glob):
-                continue
-            data = self.path_read_bytes(p)
-            if b'\x00' in data:
-                continue
-            for number, line in enumerate(data.decode('utf-8', 'replace').splitlines(), 1):
-                found = pattern in line if literal else matcher.search(line, timeout=0.05)
-                if found:
-                    if skipped < offset:
-                        skipped += 1
-                    elif len(result) == limit:
-                        return {'matches': result, 'truncated': True}
-                    else:
-                        result.append({'path': str(p), 'line': number, 'text': line[:4000]})
-        return {'matches': result, 'truncated': False}
-
-    def mv(self, source, target):
-        src, dst = self.path(source), self.path(target)
-        if src == Path('/') or src == dst or src in dst.parents:
-            raise ValueError('invalid move')
-        self.path_rename(src, dst)
-        if self.cwd == str(src) or src in Path(self.cwd).parents:
-            self.cwd = str(dst / Path(self.cwd).relative_to(src))
 
     def path_rename(self, path, target):
         # Monty 1.1 OSAccess moves a file's tree entry but leaves its name stale.
@@ -206,17 +123,6 @@ class Unix(OSAccess):
             self._get_file(target).path = Path(target)
             self._get_file(target).name = Path(target).name
 
-    def rm(self, path, recursive=False):
-        p = self.path(path)
-        if p == Path('/') or p == Path(self.cwd) or p in Path(self.cwd).parents:
-            raise ValueError('cannot remove root or cwd ancestor')
-        if self.path_is_dir(p):
-            if recursive:
-                for child in self.path_iterdir(p):
-                    self.rm(str(child), True)
-            self.path_rmdir(p)
-        else:
-            self.path_unlink(p)
 
 
 def sync_directory(path):
@@ -398,9 +304,13 @@ class Runtime:
                 session_id INTEGER NOT NULL, id TEXT NOT NULL, code TEXT NOT NULL,
                 tool_id TEXT, output TEXT, error INTEGER NOT NULL DEFAULT 0,
                 PRIMARY KEY(session_id,id));
+            CREATE TABLE IF NOT EXISTS runtime_secrets (
+                id INTEGER PRIMARY KEY CHECK(id=1), library_key BLOB NOT NULL);
             CREATE UNIQUE INDEX IF NOT EXISTS one_pending_execution
                 ON executions(session_id) WHERE output IS NULL;
         ''')
+        self.db.execute('INSERT OR IGNORE INTO runtime_secrets VALUES (1, ?)', (os.urandom(32),))
+        self._library_key = self.db.execute('SELECT library_key FROM runtime_secrets WHERE id=1').fetchone()[0]
 
     async def __aenter__(self):
         if self._stack is not None or self._closing:
@@ -725,10 +635,9 @@ class CodeAgent:
             'PWD': state.cwd, 'TMPDIR': '/tmp', 'LANG': 'C.UTF-8',
         })
         fs.path_iterdir(Path(state.cwd))
-        functions = {'pwd': fs.pwd, 'cd': fs.cd, 'ls': fs.ls, 'mkdir': fs.mkdir,
-                     'read': fs.read, 'write': fs.write, 'edit': fs.edit,
-                     'glob': fs.glob, 'grep': fs.grep, 'mv': fs.mv, 'rm': fs.rm,
-                     **library_tools(fs), '_library_rpc': partial(library_dispatch, fs)}
+        functions = {**library_tools(fs), '_library_rpc': Bridge(fs,
+                         hmac.digest(self.runtime._library_key, f'library-session:{self.id}'.encode(), 'sha256'),
+                         lambda module: self.runtime._io_executor.submit(library_backend, module).result())}
         # AsyncMonty runs synchronous OS/library callbacks on its worker threads.
         # Keep these synchronous so sandbox callers need not write `await numpy(...)`.
         async with self.runtime._pool.checkout(limits={'max_memory': 64 * 1024**2,

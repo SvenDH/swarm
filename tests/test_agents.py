@@ -63,26 +63,29 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
         self.tmp.cleanup()
 
     async def test_restart_and_atomic_rollback(self):
-        await self.agent.execute("mkdir('/w'); cd('/w'); write('a', 'original'); x=42")
+        await self.agent.execute("from pathlib import Path; Path('/w').mkdir(); open('a','w').write('original'); x=42")
         with self.assertRaises(Exception):
-            await self.agent.execute("write('a','broken'); x=0; raise ValueError('abort')")
+            await self.agent.execute("open('a','w').write('broken'); x=0; raise ValueError('abort')")
         await self.agent.close()
         self.agent = await CodeAgent.open(self.path, session_id=self.session_id)
-        self.assertEqual(await self.agent.execute("(x, read('a'), pwd())"), "(42, '1: original', '/w')")
+        self.assertEqual(await self.agent.execute("(x, open('a').read(), str(Path.cwd()))"), repr((42, 'original', self.agent.home)))
         self.assertEqual(await self.agent.execute("from pathlib import Path; Path('a').read_text()"), "'original'")
 
-    async def test_native_fs_and_tools(self):
+    async def test_native_filesystem_operations(self):
         await self.agent.execute("from pathlib import Path; Path('/w').mkdir(); Path('/w/a.py').write_text('a\\nb\\na'); Path('/empty').mkdir()")
-        out = await self.agent.execute("grep('a', '/w', limit=1)")
-        self.assertIn("'truncated': True", out)
-        self.assertIn("'line': 3", await self.agent.execute("grep('a', '/w', offset=1)"))
-        await self.agent.execute("mv('/w','/new'); edit('/new/a.py', 'b', 'c')")
-        await self.agent.execute("mv('/new/a.py','/new/b.py'); rm('/new/b.py'); write('/new/a.py','c')")
-        self.assertIn('/new/a.py', await self.agent.execute("glob('*.py')"))
+        self.assertEqual(await self.agent.execute("[i+1 for i,line in enumerate(Path('/w/a.py').read_text().splitlines()) if 'a' in line]"), '[1, 3]')
+        await self.agent.execute("Path('/w').rename('/new'); p=Path('/new/a.py'); p.write_text(p.read_text().replace('b','c'))")
+        await self.agent.execute("Path('/new/a.py').rename('/new/b.py'); Path('/new/b.py').unlink(); open('/new/a.py','w').write('c')")
+        self.assertIn('/new/a.py', await self.agent.execute("[str(p) for p in Path('/new').iterdir() if p.suffix == '.py']"))
         self.assertEqual(await self.agent.execute("Path('/empty').is_dir()"), 'True')
         self.assertEqual(await self.agent.execute("Path('/etc/passwd').exists()"), 'False')
-        await self.agent.execute("rm('/new', recursive=True)")
-        self.assertEqual(await self.agent.execute("ls('/')"), "['/dev/', '/empty/', '/home/', '/tmp/']")
+        await self.agent.execute("Path('/new/a.py').unlink(); Path('/new').rmdir()")
+        self.assertEqual(await self.agent.execute("sorted(str(p) for p in Path('/').iterdir())"), "['/dev', '/empty', '/home', '/tmp']")
+
+    async def test_custom_filesystem_host_functions_are_unavailable(self):
+        for name in ('pwd', 'cd', 'ls', 'mkdir', 'read', 'write', 'edit', 'glob', 'grep', 'mv', 'rm'):
+            with self.subTest(name=name), self.assertRaisesRegex(ExecutionError, 'NameError'):
+                await self.agent.execute(f'{name}()')
 
     @unittest.skipUnless(all(name in available() for name in ('numpy', 'pandas', 'PIL', 'openpyxl', 'pypdf', 'docx')), 'optional libraries not installed')
     async def test_library_roundtrips(self):
@@ -102,19 +105,19 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
         writer.add_blank_page(100, 100)
         out = io.BytesIO()
         writer.write(out)
-        await self.agent.execute(f"write('/a.pdf', {out.getvalue()!r})")
+        await self.agent.execute(f"open('/a.pdf','wb').write({out.getvalue()!r})")
         await self.agent.execute("pypdf('select','/a.pdf',output='/b.pdf',pages=[0])")
         self.assertEqual(await self.agent.execute("pypdf('read','/b.pdf')"), "['']")
 
     async def test_resume_partial_batch_without_repeating_effects(self):
         calls = [{'id': str(i), 'type': 'function', 'function': {'name': 'python',
                   'arguments': json.dumps({'code': code})}} for i, code in enumerate([
-                      "write('/a', 'once')", "edit('/a', 'once', 'twice')"])]
+                      "open('/a','w').write('once')", "from pathlib import Path; p=Path('/a'); p.write_text(p.read_text().replace('once','twice'))"])]
         messages = [{'role': 'user', 'content': 'edit a'},
                     {'role': 'assistant', 'tool_calls': calls}]
         for message in messages:
             await self.agent.append_message(message)
-        await self.agent.execute("write('/a', 'once')", tool_id='0')
+        await self.agent.execute("open('/a','w').write('once')", tool_id='0')
         await self.agent.close()
         self.agent = await CodeAgent.open(self.path, session_id=self.session_id)
         def respond(request):
@@ -124,7 +127,7 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
         client = httpx.AsyncClient(transport=httpx.MockTransport(respond))
         with patch.object(self.agent.runtime, 'client', model_client(client)):
             self.assertEqual(await self.agent.run(), 'done')
-        self.assertEqual(await self.agent.execute("read('/a')"), "'1: twice'")
+        self.assertEqual(await self.agent.execute("open('/a').read()"), "'twice'")
 
     async def test_retry_pending_user_prompt(self):
         await self.agent.append_message({'role': 'user', 'content': 'hi'})
@@ -206,7 +209,7 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
     async def test_incomplete_model_stream_never_records_or_executes_partial_code(self):
         observed = []
         self.agent.on_output = lambda kind, text: observed.append((kind, text))
-        code = "write('unsafe', 'partial')"
+        code = "open('unsafe','w').write('partial')"
         for finish in (None, 'length'):
             with self.subTest(finish=finish):
                 content = sse({'role': 'assistant', 'content': 'Starting.', 'tool_calls': [{
@@ -243,11 +246,11 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(previous, code)
 
     async def test_live_output_is_provisional_and_bounded(self):
-        await self.agent.execute("write('/a','before')")
+        await self.agent.execute("open('/a','w').write('before')")
         observed = []
         self.agent.on_output = lambda kind, text: observed.append((kind, text))
         with self.assertRaises(ExecutionError):
-            await self.agent.execute("print('preview'); write('/a','after'); raise ValueError('rollback')")
+            await self.agent.execute("print('preview'); open('/a','w').write('after'); raise ValueError('rollback')")
         self.assertEqual(observed[-1], ('stdout', 'preview\n'))
         self.assertFalse(any(kind == 'result' for kind, _ in observed))
         self.assertEqual(await self.agent.read_file('/a'), b'before')
@@ -305,16 +308,17 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn('second error', buffer.getvalue())
 
     async def test_isolated_sessions_and_disk_files(self):
-        await self.agent.execute("write('/a','first'); x=1")
+        await self.agent.execute("open('/a','w').write('first'); x=1")
         await self.agent.append_message({'role': 'user', 'content': 'first'})
         second = await CodeAgent.open(self.path)
         try:
             self.assertNotEqual(second.id, self.agent.id)
             self.assertEqual(second.name, num_to_name(second.id))
             self.assertEqual(second.workspace.name, second.name)
-            self.assertEqual(await second.execute("ls()"), repr([second.home + '/README.md']))
+            with self.assertRaises(ExecutionError):
+                await second.execute("open('/a').read()")
             self.assertEqual((await second.state()).messages, [])
-            await second.execute("write('/a','second'); x=2")
+            await second.execute("open('/a','w').write('second'); x=2")
             self.assertEqual((second.workspace / 'a').read_text(), 'second')
             self.assertEqual((self.agent.workspace / 'a').read_text(), 'first')
             self.assertEqual(await self.agent.execute('x'), '1')
@@ -329,10 +333,10 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
     async def test_symlink_cannot_escape_workspace(self):
         (self.agent.workspace / 'escape').symlink_to('/etc/passwd')
         with self.assertRaises(ExecutionError):
-            await self.agent.execute("read('/escape')")
+            await self.agent.execute("open('/escape').read()")
 
     async def test_uncommitted_objects_do_not_change_session_files(self):
-        await self.agent.execute("write('/a','before'); x=1")
+        await self.agent.execute("open('/a','w').write('before'); x=1")
         self.agent.db.execute('BEGIN IMMEDIATE')
         self.agent._publish(Unix([('/a', b'uncommitted')]).entries())
         # Closing the connection simulates loss of the process before DB commit.
@@ -342,7 +346,7 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(await self.agent.execute('x'), '1')
 
     async def test_failed_checkpoint_commit_preserves_files_and_globals(self):
-        await self.agent.execute("write('/a','before'); x=1")
+        await self.agent.execute("open('/a','w').write('before'); x=1")
         before, snapshot = await self.agent.files(), (await self.agent.state()).monty
         replace = self.agent._replace_files
         def fail_commit(files):
@@ -350,7 +354,7 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
             raise OSError('simulated checkpoint write failure')
         with patch.object(self.agent, '_replace_files', side_effect=fail_commit):
             with self.assertRaises(OSError):
-                await self.agent.execute("write('/a','after'); x=2")
+                await self.agent.execute("open('/a','w').write('after'); x=2")
         self.assertEqual(await self.agent.files(), before)
         self.assertEqual((await self.agent.state()).monty, snapshot)
         self.assertEqual((self.agent.workspace / 'a').read_text(), 'before')
@@ -360,34 +364,34 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_home_environment_and_native_io_share_virtual_filesystem(self):
         home = self.agent.home
-        self.assertEqual(await self.agent.execute('pwd()'), repr(home))
+        self.assertEqual(await self.agent.execute('from pathlib import Path; str(Path.cwd())'), repr(home))
         result = await self.agent.execute("import os; from pathlib import Path; (str(Path.cwd()), os.getenv('HOME'), os.getenv('USER'), os.getenv('TMPDIR'), os.getenv('PWD'))")
         self.assertEqual(result, repr((home, home, self.agent.name, '/tmp', home)))
-        await self.agent.execute("write('relative.txt','tools'); Path('relative.txt').write_text('native')")
-        self.assertEqual(await self.agent.execute("read('relative.txt')"), "'1: native'")
+        await self.agent.execute("open('relative.txt','w').write('tools'); Path('relative.txt').write_text('native')")
+        self.assertEqual(await self.agent.execute("open('relative.txt').read()"), "'native'")
         self.assertEqual((self.agent.workspace / home.lstrip('/') / 'relative.txt').read_text(), 'native')
         await self.agent.execute("with open('/dev/null','wb') as f:\n    f.write(b'discard me')")
         self.assertEqual(await self.agent.execute("Path('/dev/null').read_bytes()"), "b''")
-        await self.agent.execute("cd('/tmp'); write('file','temp')")
+        await self.agent.execute("open('/tmp/file','w').write('temp')")
         await self.agent.close()
         self.agent = await CodeAgent.open(self.path, session_id=self.session_id)
-        self.assertEqual(await self.agent.execute("(pwd(), str(Path.cwd()), os.getenv('PWD'), read('file'))"),
-                         "('/tmp', '/tmp', '/tmp', '1: temp')")
+        self.assertEqual(await self.agent.execute("(str(Path.cwd()), os.getenv('PWD'), open('/tmp/file').read())"),
+                         repr((home, home, 'temp')))
         self.assertEqual(await self.agent.execute("os.getenv('LLM_API_KEY')"), '')
 
     async def test_database_links_follow_file_changes(self):
-        await self.agent.execute("write('a.txt','hé'); mkdir('empty')")
+        await self.agent.execute("from pathlib import Path; open('a.txt','w').write('hé'); Path('empty').mkdir()")
         path = self.agent.home + '/a.txt'
         record = next(f for f in await self.agent.files() if f['path'] == path)
         self.assertEqual(record['storage_key'], f'.objects/{self.agent.name}/' + hashlib.sha256('hé'.encode()).hexdigest())
         self.assertEqual(record['size'], len('hé'.encode()))
         self.assertEqual(await self.agent.read_file(path), 'hé'.encode())
         self.assertNotIn('content', [r[1] for r in self.agent.db.execute('PRAGMA table_info(files)')])
-        await self.agent.execute("mv('a.txt','b.txt')")
+        await self.agent.execute("Path('a.txt').rename('b.txt')")
         with self.assertRaises(FileNotFoundError):
             await self.agent.read_file(path)
         self.assertEqual(await self.agent.read_file(self.agent.home + '/b.txt'), 'hé'.encode())
-        await self.agent.execute("rm('b.txt'); rm('empty')")
+        await self.agent.execute("Path('b.txt').unlink(); Path('empty').rmdir()")
         self.assertNotIn(path, [f['path'] for f in await self.agent.files()])
         with self.assertRaises(IsADirectoryError):
             await self.agent.read_file(self.agent.home)
@@ -395,7 +399,7 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
             self.agent.storage.read('../other/file')
 
     async def test_storage_root_can_move_without_rewriting_database_keys(self):
-        await self.agent.execute("write('a','portable'); x=7")
+        await self.agent.execute("open('a','w').write('portable'); x=7")
         records = await self.agent.files()
         old_root = self.agent.storage.root
         await self.agent.close()
@@ -404,14 +408,14 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
         self.agent = await CodeAgent.open(self.path, session_id=self.session_id, storage=DirectoryStorage(new_root))
         self.assertEqual(await self.agent.files(), records)
         self.assertEqual(await self.agent.read_file(self.agent.home + '/a'), b'portable')
-        self.assertEqual(await self.agent.execute("(x, read('a'))"), "(7, '1: portable')")
+        self.assertEqual(await self.agent.execute("(x, open('a').read())"), "(7, 'portable')")
 
     async def test_replaceable_object_storage_backend(self):
         storage = ObjectStorage()
         path = self.tmp.name + '/objects.db'
         agent = await CodeAgent.open(path, storage=storage)
         try:
-            await agent.execute("write('a','object'); x=9")
+            await agent.execute("open('a','w').write('object'); x=9")
             record = next(f for f in await agent.files() if f['path'] == agent.home + '/a')
             self.assertTrue(record['storage_key'].startswith(agent.name + '/'))
             self.assertEqual(await agent.read_file(agent.home + '/a'), b'object')
@@ -420,23 +424,23 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
             await agent.close()
         agent = await CodeAgent.open(path, session_id=session_id, storage=storage)
         try:
-            self.assertEqual(await agent.execute("(x, read('a'))"), "(9, '1: object')")
+            self.assertEqual(await agent.execute("(x, open('a').read())"), "(9, 'object')")
             before = await agent.files()
             with patch.object(agent, '_commit', side_effect=OSError('failed after object upload')):
                 with self.assertRaises(OSError):
-                    await agent.execute("write('a','uncommitted')")
+                    await agent.execute("open('a','w').write('uncommitted')")
             self.assertEqual(await agent.files(), before)
             self.assertEqual(await agent.read_file(agent.home + '/a'), b'object')
             await agent.execute()
             self.assertEqual(await agent.read_file(agent.home + '/a'), b'uncommitted')
             with self.assertRaises(Exception):
-                await agent.execute("write('a','bad'); raise ValueError('rollback')")
+                await agent.execute("open('a','w').write('bad'); raise ValueError('rollback')")
             self.assertEqual(await agent.read_file(agent.home + '/a'), b'uncommitted')
         finally:
             await agent.close()
 
     async def test_restart_repairs_workspace_without_reexecuting_code(self):
-        await self.agent.execute("write('version.txt','new'); mkdir('empty'); n=2")
+        await self.agent.execute("from pathlib import Path; open('version.txt','w').write('new'); Path('empty').mkdir(); n=2")
         state, files, workspace = await self.agent.state(), await self.agent.files(), self.agent.workspace
         await self.agent.close()
         shutil.rmtree(workspace)
@@ -447,7 +451,7 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((workspace / self.agent.home.lstrip('/') / 'version.txt').read_text(), 'new')
         self.assertEqual(await self.agent.execute('n'), '2')
         tables = {r[0] for r in self.agent.db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
-        self.assertEqual(tables, {'sessions', 'files', 'executions'})
+        self.assertEqual(tables, {'sessions', 'files', 'executions', 'runtime_secrets'})
 
     async def test_execution_ids_are_idempotent(self):
         await self.agent.execute('n=0')
@@ -501,8 +505,8 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(db.execute('SELECT * FROM sessions').fetchall(), [(7, 'saved', 42)])
 
     async def test_recorded_failure_is_not_executed_again(self):
-        await self.agent.execute("n=0; write('a','before')")
-        command = "n=1; write('a','bad'); raise ValueError('failure')"
+        await self.agent.execute("n=0; open('a','w').write('before')")
+        command = "n=1; open('a','w').write('bad'); raise ValueError('failure')"
         with self.assertRaises(ExecutionError):
             await self.agent.execute(command, execution_id='failed-command')
         with patch.object(self.agent, '_evaluate', side_effect=AssertionError('retried failed code')):
@@ -527,13 +531,13 @@ asyncio.run(CodeAgent.open(sys.argv[1], workspaces=sys.argv[2]))
 '''
         path, root = self.tmp.name + '/creation.db', self.tmp.name + '/creation-workspaces'
         result = await asyncio.to_thread(subprocess.run, [sys.executable, '-c', script, path, root],
-                                cwd=os.path.dirname(__file__), timeout=30,
+                                cwd=os.path.dirname(os.path.dirname(os.path.abspath(__file__))), timeout=30,
                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         self.assertEqual(result.returncode, 92)
         agent = await CodeAgent.open(path, workspaces=root)
         try:
             self.assertEqual(agent.id, 0)
-            self.assertEqual(await agent.execute('pwd()'), repr(agent.home))
+            self.assertEqual(await agent.execute('from pathlib import Path; str(Path.cwd())'), repr(agent.home))
             self.assertEqual(agent.db.execute('SELECT COUNT(*) FROM sessions').fetchone()[0], 1)
         finally:
             await agent.close()
@@ -565,22 +569,22 @@ async def main():
             replace(files)
             os._exit(91)
         agent._replace_files = crash_replace
-    await agent.execute("n += 1; write('counter.txt', str(n)); n", tool_id='counter-tool', execution_id='crash-test')
+    await agent.execute("n += 1; open('counter.txt','w').write(str(n)); n", tool_id='counter-tool', execution_id='crash-test')
     os._exit(91)
 asyncio.run(main())
 '''
         for phase in ('requested', 'published', 'projected', 'checkout', 'committed'):
             with self.subTest(phase=phase):
                 agent = await CodeAgent.open(self.path)
-                await agent.execute("n=0; write('counter.txt','0')")
+                await agent.execute("n=0; open('counter.txt','w').write('0')")
                 await agent.append_message({'role': 'user', 'content': 'increment the counter'})
                 await agent.append_message({'role': 'assistant', 'tool_calls': [{
                     'id': 'counter-tool', 'type': 'function', 'function': {'name': 'python',
-                    'arguments': json.dumps({'code': "n += 1; write('counter.txt', str(n)); n"})}}]})
+                    'arguments': json.dumps({'code': "n += 1; open('counter.txt','w').write(str(n)); n"})}}]})
                 session_id = agent.id
                 await agent.close()
                 result = await asyncio.to_thread(subprocess.run, [sys.executable, '-c', script, self.path, str(session_id), phase],
-                                        cwd=os.path.dirname(__file__), timeout=30,
+                                        cwd=os.path.dirname(os.path.dirname(os.path.abspath(__file__))), timeout=30,
                                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
                 self.assertEqual(result.returncode, 91)
                 agent = await CodeAgent.open(self.path, session_id=session_id)

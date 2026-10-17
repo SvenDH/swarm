@@ -58,7 +58,7 @@ class OptionalTests(unittest.IsolatedAsyncioTestCase):
         registry.available.cache_clear()
         try:
             with patch.object(registry, 'find_spec', return_value=None):
-                self.assertEqual(await self.agent.execute("write('plain.txt','works'); read('plain.txt')"), "'1: works'")
+                self.assertEqual(await self.agent.execute("open('plain.txt','w').write('works'); open('plain.txt').read()"), "'works'")
                 with self.assertRaisesRegex(ExecutionError, 'host package'):
                     await self.agent.execute('import numpy')
                 self.assertEqual(await self.agent.execute('2+3'), '5')
@@ -127,7 +127,7 @@ asyncio.run(run())
 '''
         result = await asyncio.to_thread(subprocess.run,
             [sys.executable, '-X', 'faulthandler', '-c', program, self.database, str(session_id)],
-            cwd=Path(__file__).parent, capture_output=True, text=True, timeout=30)
+            cwd=Path(__file__).resolve().parents[1], capture_output=True, text=True, timeout=30)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout.strip(), '[1.0, 1.0]')
 
@@ -135,7 +135,7 @@ asyncio.run(run())
         self.need('matplotlib', 'reportlab', 'pptx', 'xlsxwriter')
         host = Path(self.tmp.name) / 'host-secret.txt'
         host.write_bytes(b'secret')
-        await self.agent.execute(f"mkdir({str(host.parent)!r})")
+        await self.agent.execute(f"from pathlib import Path; Path({str(host.parent)!r}).mkdir(parents=True,exist_ok=True)")
         await self.agent.execute(f'''
 import matplotlib.pyplot as plt
 from pptx import Presentation

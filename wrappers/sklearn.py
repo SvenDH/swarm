@@ -49,7 +49,7 @@ class Estimator:
             methods['predict_proba'] = model.predict_proba
         result = methods[name](*args, **kwargs)
         if name.startswith('fit'):
-            self.state = freeze({field: model.__dict__[field] for field in FIELDS[self.name] if field in model.__dict__})
+            self.state = {field: freeze(model.__dict__[field]) for field in FIELDS[self.name] if field in model.__dict__}
         return self if result is model else result
 
 

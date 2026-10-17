@@ -7,7 +7,8 @@ from .registry import available
 def invoke(module, fs, *args, **kwargs):
     # Called on Monty's callback workers: heavy optional imports stay off-loop
     # and hosts that never use a library do not pay its startup/RAM cost.
-    return import_module('.' + module, __name__).run(fs, *args, **kwargs)
+    from .protocol import plain
+    return import_module('.' + module, __name__).run(fs, *plain(args), **plain(kwargs))
 
 
 def tools(fs):

@@ -14,7 +14,7 @@ REQUIRES = {'pandas': ('numpy',), 'matplotlib': ('numpy', 'PIL'),
             'seaborn': ('numpy', 'pandas', 'matplotlib'),
             'scipy': ('numpy',), 'sklearn': ('numpy', 'scipy')}
 SUMMARIES = {
-    'numpy': 'arrays, slicing/operators, reductions, linalg, random.default_rng, load/save',
+    'numpy': 'arrays, tile, slicing/operators, reductions, linalg, random.default_rng, load/save',
     'pandas': 'DataFrame/Series, loc/iloc, groupby, merge, CSV/Excel IO',
     'PIL': 'Image.open/new/fromarray, resize/crop/rotate/convert, pixels, save',
     'openpyxl': 'Workbook/load_workbook, sheets/cells/rows, save',

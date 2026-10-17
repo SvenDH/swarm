@@ -35,6 +35,7 @@ class Chart:
             elif isinstance(value, (list, tuple)):
                 for item in value:
                     check(item)
+        check(args)
         check(kwargs)
         record(self.commands, [index, name], args, kwargs)
 

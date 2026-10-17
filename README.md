@@ -26,6 +26,10 @@ continues an interrupted turn. `execute(code)` runs code without a model request
 `await agent.close()`. Use one shared `Runtime` per database for concurrent agents.
 Multi-process hosting is not supported.
 
+Use Python's `open()` and `pathlib.Path` for virtual filesystem operations.
+There are no direct `pwd`, `cd`, `ls`, `mkdir`, `read`, `write`, `edit`, `glob`,
+`grep`, `mv` or `rm` host functions. The working directory remains the session home.
+
 ## Crash recovery
 
 There is no event log or replay layer. SQLite stores only:
@@ -33,6 +37,7 @@ There is no event log or replay layer. SQLite stores only:
 - `sessions`: the latest interpreter checkpoint, working directory and conversation.
 - `files`: current paths and immutable storage keys, not file contents.
 - `executions`: pending commands and their results, allowing safe retries.
+- `runtime_secrets`: one host-only key used to authenticate library state across restarts.
 
 A command is saved before execution. Its interpreter checkpoint, file links and
 model-tool result commit in one SQLite transaction. Failed code rolls back its
@@ -164,10 +169,36 @@ limited to 1,000,000 elements/32 MiB, images to 4,000,000 pixels and library
 iteration to 10,000 items. Native-library work remains outside Monty's resource
 accounting; these wrappers are not a separate OS-level resource sandbox.
 
+## Native-library boundary
+
+Native packages deliberately execute in the host process, outside Monty. The
+bridge authenticates serialized objects and view paths before restoring or
+replaying them. Its HMAC key stays on the host in SQLite, with separate derived
+keys for each session. Knowing or overwriting the `_library_` Python helpers does
+not grant permission to forge native state. Keep the database and backups private.
+
+User dictionaries are escaped separately from protocol/recipe markers. Native
+callbacks cannot be smuggled through object references, and Monty class proxies
+are rejected before they reach native constructors (including legacy helpers).
+Symbolic trees require typed nodes and ordinary identifier symbol names. SymPy
+expression strings are rejected in constructors, matrix writes and operators.
+Positional options receive the same checks as keyword
+options. Legacy Pillow helpers use the same restricted image formats as imports.
+
+Old, unsigned library checkpoints are deliberately rejected; create a new session
+to use libraries after this upgrade. Saved databases/files are not deleted or
+silently trusted/re-signed. New authenticated checkpoints survive normal restarts.
+
+These checks restrict the exposed capability API, not the operating system.
+Native-code vulnerabilities, parser/decompression bombs, and CPU/memory exhaustion
+can still affect the host process. Use OS-isolated workers with resource limits
+if executing actively hostile workloads; passing regression tests is not a
+formal security guarantee.
+
 ## Tests
 
 ```sh
-uv run --extra libraries python -m unittest test_agents test_concurrency test_templates test_imports test_optional -q
+uv run --extra libraries python -m unittest discover -s tests -q
 ```
 
 Tests cover wrappers, streaming, recovery after abrupt process death, cancellation,

@@ -2,6 +2,7 @@
 import asyncio
 import tempfile
 import unittest
+from unittest.mock import patch
 from pathlib import Path
 
 from agents import Runtime, ExecutionError
@@ -58,6 +59,28 @@ df.groupby('g')['y'].sum().to_dict()
                          '[{0: 1, 1: 2}, {0: 3, 1: 4}]')
         self.assertEqual(await self.agent.execute('[row["x"] for index,row in df.iterrows()]'), '[1, 2, 3]')
         self.assertEqual(await self.agent.execute('list(df)'), "['g', 'x', 'y']")
+
+    async def test_numpy_tile_imports_shapes_restart_and_allocation_limits(self):
+        import numpy as np
+        for data, reps in (([1,2], 3), ([1,2], (2,3)), ([[1],[2]], (2,3)),
+                           (7, (2,3)), ([1,2], (0,2)), ([1,2], ())):
+            with self.subTest(data=data, reps=reps):
+                expected = np.tile(data, reps).tolist()
+                self.assertEqual(await self.agent.execute(
+                    f'import numpy as np; np.tile({data!r},{reps!r}).tolist()'), repr(expected))
+        await self.agent.execute('from numpy import tile; tiled=tile(np.array([1,2],dtype="int32"),[2,1])')
+        session_id = self.agent.id
+        await self.runtime.close()
+        self.runtime = await Runtime(self.database, workers=2).__aenter__()
+        self.agent = await self.runtime.agent(session_id=session_id)
+        self.assertEqual(await self.agent.execute('(tiled.tolist(),tiled.dtype.name)'), "([[1, 2], [1, 2]], 'int32')")
+        from wrappers.numpy import tile
+        with patch('wrappers.numpy.np.tile', side_effect=AssertionError('allocation reached')):
+            for reps in (1_000_001, (1_000_001,0), -1, 1.5):
+                with self.subTest(reps=reps), self.assertRaises((ValueError, TypeError)):
+                    tile([1,2], reps)
+        with self.assertRaises(ExecutionError):
+            await self.agent.execute('np.tile([1,2],1000001)')
 
     async def test_pillow_images_mutate_persist_and_save(self):
         self.assertEqual(await self.agent.execute('''
@@ -202,7 +225,7 @@ Path('standard.txt').write_text('ok')
                 await self.agent.execute(snippet)
         self.assertEqual(secret.read_text(), 'secret')
         self.assertIsNone((await self.agent.state()).pending)
-        await self.agent.execute(f"mkdir({str(secret.parent)!r}); import pandas as pd; pd.DataFrame({{'x':[1]}}).to_csv({str(secret)!r},index=False)")
+        await self.agent.execute(f"from pathlib import Path; Path({str(secret.parent)!r}).mkdir(parents=True,exist_ok=True); import pandas as pd; pd.DataFrame({{'x':[1]}}).to_csv({str(secret)!r},index=False)")
         self.assertEqual(await self.agent.read_file(str(secret)), b'x\n1\n')
         self.assertEqual(secret.read_text(), 'secret')
 

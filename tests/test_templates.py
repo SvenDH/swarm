@@ -27,11 +27,11 @@ class TemplateTests(unittest.IsolatedAsyncioTestCase):
     async def test_nested_binary_and_empty_directories_are_durable_and_private(self):
         a, b = await asyncio.gather(self.runtime.agent(), self.runtime.agent())
         for agent in (a, b):
-            self.assertEqual(await agent.execute("read('notes/hello.txt')"), "'1: hello'")
+            self.assertEqual(await agent.execute("open('notes/hello.txt').read()"), "'hello'")
             self.assertEqual(await agent.read_file(agent.home + '/.settings'), b'\x00\xff')
-            self.assertIn(agent.home + '/empty/', await agent.execute('ls()'))
+            self.assertEqual(await agent.execute("from pathlib import Path; Path('empty').is_dir()"), 'True')
             self.assertEqual((agent.workspace / agent.home.lstrip('/') / '.settings').read_bytes(), b'\x00\xff')
-        await a.execute("write('notes/hello.txt', 'changed')")
+        await a.execute("open('notes/hello.txt','w').write('changed')")
         self.assertEqual(await b.read_file(b.home + '/notes/hello.txt'), b'hello')
         self.assertEqual((self.template / 'notes' / 'hello.txt').read_text(), 'hello')
         entry = next(f for f in await b.files() if f['path'].endswith('/notes/hello.txt'))
@@ -43,7 +43,7 @@ class TemplateTests(unittest.IsolatedAsyncioTestCase):
         second = await self.runtime.agent()
         self.assertEqual(await first.read_file(first.home + '/notes/hello.txt'), b'hello')
         self.assertEqual(await second.read_file(second.home + '/notes/hello.txt'), b'updated')
-        await first.execute("write('notes/hello.txt', 'my edit')")
+        await first.execute("open('notes/hello.txt','w').write('my edit')")
         shutil.rmtree(self.template)
         reopened = await self.runtime.agent(session_id=first.id)
         self.assertEqual(await reopened.read_file(first.home + '/notes/hello.txt'), b'my edit')

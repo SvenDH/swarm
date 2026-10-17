@@ -21,11 +21,16 @@ def assign(value, name, item):
 def freeze(value):
     """Native arrays/frames in recipes become safe descriptors, never pickle."""
     if isinstance(value, PRIMITIVES):
+        # NumPy scalar subclasses cross Monty as builtin primitives. Canonicalize
+        # before signing, so native values and restored values authenticate alike.
+        for kind in (bool, int, float, complex, str, bytes):
+            if isinstance(value, kind):
+                return kind(value)
         return value
     if isinstance(value, (list, tuple)):
         return type(value)(freeze(item) for item in value)
     if isinstance(value, dict):
-        return {key: freeze(item) for key, item in value.items()}
+        return {'__recipe_dict__': [[freeze(key), freeze(item)] for key, item in value.items()]}
     from .bridge import backend
     from .registry import available
     for name in ('numpy', 'pandas'):
@@ -44,6 +49,8 @@ def freeze(value):
 
 def thaw(value):
     if isinstance(value, dict):
+        if set(value) == {'__recipe_dict__'}:
+            return {thaw(key): thaw(item) for key, item in value['__recipe_dict__']}
         if set(value) == {'__recipe_labels__'}:
             from .numpy import np, checked_size
             shape, items = value['__recipe_labels__']
@@ -52,6 +59,8 @@ def thaw(value):
         if set(value) == {'__recipe_value__'}:
             from .bridge import backend
             spec = value['__recipe_value__']
+            if spec['module'] not in ('numpy', 'pandas'):
+                raise ValueError('Recipes may contain only numeric/frame descriptors')
             return backend(spec['module']).restore(spec['kind'], spec['data'])
         return {key: thaw(item) for key, item in value.items()}
     if isinstance(value, (tuple, list)):

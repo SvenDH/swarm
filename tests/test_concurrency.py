@@ -60,7 +60,7 @@ class ConcurrencyTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_cancel_during_publication_drains_worker_and_leaves_resumable_request(self):
         a = await self.runtime.agent()
-        await a.execute("n=0; write('a', 'before')")
+        await a.execute("n=0; open('a','w').write('before')")
         started, release = threading.Event(), threading.Event()
         put = self.runtime.storage.put
 
@@ -71,7 +71,7 @@ class ConcurrencyTests(unittest.IsolatedAsyncioTestCase):
             return put(*args)
 
         with patch.object(self.runtime.storage, 'put', slow_put):
-            running = asyncio.create_task(a.execute("n += 1; write('a', str(n)); n", execution_id='cancelled'))
+            running = asyncio.create_task(a.execute("n += 1; open('a','w').write(str(n)); n", execution_id='cancelled'))
             try:
                 self.assertTrue(await asyncio.to_thread(started.wait, 5))
                 running.cancel()
@@ -176,7 +176,7 @@ class ConcurrencyTests(unittest.IsolatedAsyncioTestCase):
                 active -= 1
 
         with patch('agents.CodeAgent._evaluate', counted):
-            results = await asyncio.gather(*[a.execute(f"n={a.id}; write('id', str(n)); n") for a in agents])
+            results = await asyncio.gather(*[a.execute(f"n={a.id}; open('id','w').write(str(n)); n") for a in agents])
         self.assertEqual(results, [str(a.id) for a in agents])
         self.assertGreater(peak, 1)
         self.assertLessEqual(peak, self.runtime.workers)

@@ -70,7 +70,10 @@ def decode(value, cache=None, fs=None):
             identity = (root['module'], root['identity'])
             if identity not in cache:
                 cache[identity] = backend(root['module']).restore(root['kind'], root['data'])
-            return resolve(cache[identity], value['path'], root['module'], fs, cache)
+            result = resolve(cache[identity], value['path'], root['module'], fs, cache)
+            if callable(result):
+                raise TypeError('Native library callbacks cannot be passed as data')
+            return result
         if set(value) == {'__library_slice__'}:
             return slice(*value['__library_slice__'])
         return {key: decode(item, cache, fs) for key, item in value.items()}
@@ -115,7 +118,8 @@ def encode(value, module, root=None, path=None):
     if isinstance(value, dict):
         if module == 'sympy' and any(not isinstance(key, PRIMITIVES) for key in value):
             return {'__library_object__': backend(module).pack(value)}
-        return {key: encode(item, module, root) for key, item in value.items()}
+        # User mappings must never be confused with host-created protocol tags.
+        return {'__library_dict__': [[key, encode(item, module, root)] for key, item in value.items()]}
     result = backend(module).pack(value)
     if result is None:
         # Scientific/plotting results often belong to another supported library.
@@ -182,10 +186,12 @@ def dispatch(fs, action, spec, path=(), args=(), kwargs=None):
                 ['call', path[-1][1], wire_args, wire_kwargs]]}}
     elif action == 'item':
         result = value[args[0]]
-        result_path = [*path, ['item', encode_key(args[0])]]
+        result_path = [*path, ['item', wire_args[0]]]
         if api.is_view(result):
             return {'result': {'__library_view__': api.view(root, result) or result_path}}
     elif action == 'setitem':
+        if module == 'sympy':
+            api.validate(args[1])
         value[args[0]] = args[1]
         result = None
     elif action == 'setattr':
@@ -210,10 +216,14 @@ def dispatch(fs, action, spec, path=(), args=(), kwargs=None):
         result = {'float': float, 'int': int, 'bool': bool}[args[0]](value)
     elif action == 'binary':
         name, other, reverse = args
+        if module == 'sympy':
+            api.validate(other)
         result = OPERATORS[name](other, value) if reverse else OPERATORS[name](value, other)
     elif action == 'unary':
         result = OPERATORS[args[0]](value)
     elif action == 'inplace':
+        if module == 'sympy':
+            api.validate(args[1])
         result = INPLACE[args[0]](value, args[1])
     else:
         raise ValueError(f'Unknown library action: {action}')
@@ -238,11 +248,3 @@ def dispatch(fs, action, spec, path=(), args=(), kwargs=None):
                     response['argument_result'] = {'module': owner, 'identity': identity, 'path': result_view}
                     break
     return response
-
-
-def encode_key(key):
-    if isinstance(key, slice):
-        return {'__library_slice__': [key.start, key.stop, key.step]}
-    if isinstance(key, tuple):
-        return tuple(encode_key(item) for item in key)
-    return key

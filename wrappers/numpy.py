@@ -2,6 +2,7 @@ import numpy as np
 import io
 import math
 import json
+import operator
 
 from .bridge import descriptor
 from .files import source, save
@@ -54,6 +55,27 @@ def linspace(start, stop, num=50, **kwargs):
     return np.linspace(start, stop, num=num, **kwargs)
 
 
+def tile(A, reps):
+    value = np.asarray(A)
+    checked_size(value.shape, value.dtype)
+    try:
+        repetitions = (operator.index(reps),)
+    except TypeError:
+        repetitions = tuple(operator.index(item) for item in reps)
+    rank = max(value.ndim, len(repetitions))
+    if rank > 64 or any(item < 0 for item in repetitions):
+        raise ValueError('tile requires nonnegative repetitions and at most 64 dimensions')
+    shape = (1,) * (rank - value.ndim) + value.shape
+    repetitions = (1,) * (rank - len(repetitions)) + repetitions
+    # NumPy repeats axes sequentially: a later zero must not hide an oversized
+    # intermediate allocation. Check the conservative peak before calling tile.
+    peak = tuple(size * max(count, 1) for size, count in zip(shape, repetitions))
+    if any(size > np.iinfo(np.intp).max for size in peak):
+        raise ValueError('tile dimension exceeds platform limits')
+    checked_size(peak, value.dtype)
+    return np.tile(value, repetitions)
+
+
 def exports(fs):
     def load(path, *, allow_pickle=False):
         if allow_pickle:
@@ -70,7 +92,7 @@ def exports(fs):
             'zeros_like': np.zeros_like, 'ones_like': np.ones_like, 'sum': np.sum,
             'mean': np.mean, 'median': np.median, 'min': np.min, 'max': np.max,
             'std': np.std, 'var': np.var, 'dot': np.dot, 'matmul': np.matmul,
-            'reshape': np.reshape, 'transpose': np.transpose, 'concatenate': np.concatenate,
+            'reshape': np.reshape, 'transpose': np.transpose, 'tile': tile, 'concatenate': np.concatenate,
             'stack': np.stack, 'vstack': np.vstack, 'hstack': np.hstack, 'unique': np.unique,
             'where': np.where, 'clip': np.clip, 'sqrt': np.sqrt, 'abs': np.abs,
             'exp': np.exp, 'log': np.log, 'sin': np.sin, 'cos': np.cos, 'isnan': np.isnan,
