@@ -881,6 +881,10 @@ class CodeAgent:
             raise RuntimeError('Context summary is empty or too long; resume to retry')
         compacted = [{**summary, 'content': 'Session continuation memory (summarized history):\n' + content},
                      *messages[split:]]
+        if repair:
+            compacted.append({'role': 'user', 'content':
+                'Continue the outstanding task from this continuation memory. '
+                'Files and Python globals are unchanged; do not repeat completed actions.'})
         await self.runtime.database_call(self._save_compaction, messages, compacted, not repair)
         return compacted
 
