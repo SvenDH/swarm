@@ -1,6 +1,8 @@
 """Translate library syntax, leaving ordinary code alone until libraries are used."""
 import ast
 import builtins
+import hashlib
+import textwrap
 from pathlib import Path
 
 from .registry import MODULES, ALIASES, require
@@ -19,7 +21,66 @@ def _library_name(name, value):
         raise NameError("name '" + name + "' is not defined")
     return value
 def _library_method(_lib_receiver, _lib_method_name, /, *args, **kwargs):
+    if (_lib_receiver.root['module'] == 'importlib' and not _lib_receiver.path and
+            _lib_method_name == 'import_module'):
+        return _library_import_module(*args, **kwargs)
     return _library_request(_lib_receiver, 'method', _lib_method_name, *args, **kwargs)
+def _library_import_module(name, package=None):
+    if not isinstance(name, str):
+        raise TypeError('module name must be a string')
+    if name.startswith('.'):
+        raise ImportError('Relative imports are not supported')
+    parts = name.split('.')
+    if parts[0] == 'math':
+        import math
+        result = math
+    elif parts[0] == 'pathlib':
+        import pathlib
+        result = pathlib
+    elif parts[0] == 'datetime':
+        import datetime
+        result = datetime
+    else:
+        result = _library_import(parts[0])
+    for part in parts[1:]:
+        result = _library_get(result, part)
+        if not isinstance(result, _LibraryValue) or result.root['kind'] != 'module':
+            raise ModuleNotFoundError("No module named '" + name + "'")
+    return result
+def _library_getattr(value, name, *default):
+    try:
+        if isinstance(value, _LibraryValue):
+            if name == 'root':
+                return value.root
+            if name == 'path':
+                return value.path
+            if name == 'auth':
+                return value.auth
+            return _library_get(value, name)
+        return getattr(value, name)
+    except AttributeError:
+        if default:
+            return default[0]
+        raise
+def _library_hasattr(value, name):
+    try:
+        _library_getattr(value, name)
+        return True
+    except AttributeError:
+        return False
+def _library_callable(value):
+    if isinstance(value, _LibraryValue):
+        return _library_request(value, 'callable')
+    return (type(value) == type(int) or type(value) == type(_LibraryValue) or type(value) == type(_library_callable) or
+            type(value) == type(len) or type(value) == type(_library_rpc) or hasattr(value, '__call__'))
+def _library_vars(value):
+    if isinstance(value, _LibraryValue):
+        return {name: _library_get(value, name) for name in _library_request(value, 'dir')}
+    return {name: getattr(value, name) for name in _object_fields(value, True)}
+def _library_dir(value):
+    if isinstance(value, _LibraryValue):
+        return _library_request(value, 'dir')
+    return sorted(_object_fields(value, False))
 def _library_delitem(value, key):
     if isinstance(value, _LibraryValue):
         return _library_request(value, 'delitem', key)
@@ -34,6 +95,18 @@ def _library_delitem(value, key):
     else:
         raise TypeError("object does not support item deletion")
 '''
+# Refresh helper definitions on restored sessions without resetting objects.
+DELETE_BOOTSTRAP += '\n' + '\n'.join(ast.unparse(node) for node in ast.parse(BOOTSTRAP).body
+    if isinstance(node, ast.FunctionDef) and node.name in ('_library_get', '_library_request'))
+# Defining functions on every call retains old interpreter code in checkpoints.
+# Refresh once per helper revision, including sessions restored after an update.
+_revision = hashlib.sha256(DELETE_BOOTSTRAP.encode()).hexdigest()
+CHECK += ("\ntry:\n    _library_revision\nexcept NameError:\n    _library_revision=None\n"
+          f"(_library_ready, _library_revision == {_revision!r})")
+DELETE_BOOTSTRAP = ("try:\n    _library_revision\nexcept NameError:\n    _library_revision=None\n"
+                    f"if _library_revision != {_revision!r}:\n" +
+                    textwrap.indent(DELETE_BOOTSTRAP, '    ') +
+                    f"\n    _library_revision={_revision!r}\n")
 
 
 def call(name, *args):
@@ -189,7 +262,12 @@ class LibrarySyntax(ast.NodeTransformer):
         if isinstance(node.func, ast.Name) and node.func.id == 'display':
             node.args = [call('pack', arg) for arg in node.args]
             return node
-        if isinstance(node.func, ast.Name) and node.func.id in ('len', 'list', 'tuple', 'print', 'str', 'float', 'int', 'bool'):
+        if isinstance(node.func, ast.Name) and node.func.id in ('vars', 'dir') and not node.args:
+            listing = node.func.id == 'dir'
+            node = ast.Call(ast.Name('locals', ast.Load()), [], [])
+            return ast.Call(ast.Name('sorted', ast.Load()), [node], []) if listing else node
+        if isinstance(node.func, ast.Name) and node.func.id in ('len', 'list', 'tuple', 'print', 'str', 'float', 'int', 'bool',
+                                                              'getattr', 'hasattr', 'callable', 'vars', 'dir'):
             node.func = ast.Name('_library_' + node.func.id, ast.Load())
         if isinstance(node.func, ast.Name) and node.func.id in BUILTINS:
             return node
@@ -214,7 +292,7 @@ def prepare(source, active=False, loaded=()):
             backend(name)
     tree = ast.parse(source)
     active = active or any(
-        isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == 'exec' or
+        isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id in ('exec','getattr','hasattr','callable','vars','dir') or
         isinstance(node, ast.Delete) or
         isinstance(node, ast.Import) and any(alias.name.split('.')[0] in (*MODULES, *ALIASES) for alias in node.names) or
         isinstance(node, ast.ImportFrom) and node.module and node.module.split('.')[0] in (*MODULES, *ALIASES)

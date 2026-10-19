@@ -1,5 +1,28 @@
 # Monty agents
 
+Standard-library compatibility is session-scoped:
+
+- `os`/`os.path` and `stat`: path operations, directory listing/walking, file status,
+  removal/rename and the session environment. `chdir`, process APIs and host file
+  descriptors are not supported. Environment snapshots are read-only.
+- `shutil`: `copyfile`, `copy`, `copytree`, `move`, `rmtree`, over the same files as
+  `open()`/`Path`. Timestamp/ownership preservation (`copy2`) is not implemented.
+- `tempfile`: `gettempdir`, `gettempprefix`, `mkdtemp`, using session `/tmp`.
+- `importlib`: `import_module` and `util.find_spec` for the supported registry,
+  plus native `math`, `pathlib`, `datetime`. No unrestricted host imports.
+- `resource`: read-only `RLIMIT_AS` reports the configured session budget, not a
+  real process address-space quota. Limit changes and `getrusage` are unsupported.
+- `platform.system()` reports the Linux execution profile. No host machine details
+  are exposed. `gc.collect()` explicitly reports unsupported; it does not collect
+  the shared host process or fabricate counters. Native `sys` remains unchanged.
+
+`getattr`, `hasattr`, `callable`, `dir`, and `vars` understand supported library
+objects; basic object-field discovery and caller-local `vars()`/`dir()` are also
+available. These are partial compatibility APIs: live global namespace mutation,
+CPython code objects (`compile`) and buffer-protocol `memoryview` remain unsupported.
+Operations use the existing checkpoint/rollback and filesystem isolation. Filesystem
+metadata is the current filesystem's metadata, not host inode/ownership information.
+
 Reusable code can live in session files and run with `exec(open("script.py").read())`.
 Dynamic `exec()` source, including nested calls, receives the same import and
 library-operation translation as top-level code. Execution remains in the
@@ -365,7 +388,7 @@ Native extensions are initialized there before Monty callback threads use them,
 including when reopening a checkpoint in a fresh process.
 
 This is intentionally not full NumPy/pandas/Python emulation: wildcard imports,
-package introspection/type checks, custom callbacks (`apply`), `query`/`eval`,
+full package introspection/type checks, custom callbacks (`apply`), `query`/`eval`,
 pickle IO and compatibility-object context managers are not supported. Imports
 inside dynamic `exec` strings are translated; imports inside `eval` strings or
 separate Python modules are not supported.

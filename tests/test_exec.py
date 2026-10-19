@@ -11,6 +11,21 @@ class ExecTests(unittest.IsolatedAsyncioTestCase):
     asyncSetUp = test_agents.AgentTests.asyncSetUp
     asyncTearDown = test_agents.AgentTests.asyncTearDown
 
+    async def test_failed_block_preserves_stdout_and_rolls_back(self):
+        await self.agent.execute('x=1')
+        with self.assertRaisesRegex(ExecutionError, 'before error\nValueError: abort'):
+            await self.agent.execute('print("before error"); x=2; raise ValueError("abort")')
+        self.assertEqual(await self.agent.execute('x'), '1')
+
+    async def test_repeated_calls_do_not_redefine_helpers(self):
+        await self.agent.execute('import numpy as np; a=np.zeros(1000)')
+        await self.agent.execute('del a')
+        sizes = []
+        for _ in range(4):
+            await self.agent.execute('a=np.zeros(1000); del a')
+            sizes.append(len((await self.agent.state()).monty))
+        self.assertLess(sizes[-1] - sizes[0], 10000)
+
     async def test_file_imports_use_same_translation_and_persist(self):
         source = "from PIL import Image\nimport numpy as np\na=np.arange(6).reshape(2,3)\nImage.new('RGB',(3,2),'red').save('out.png')\nanswer=a.sum()"
         await self.agent.execute(f"open('draw.py','w').write({source!r})")

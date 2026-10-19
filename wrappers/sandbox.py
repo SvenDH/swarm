@@ -117,6 +117,8 @@ def _library_import(module):
 def _library_get(value, name):
     if not isinstance(value, _LibraryValue):
         return getattr(value, name)
+    if value.root['module'] == 'importlib' and not value.path and name == 'import_module':
+        return _library_import_module
     response = _library_rpc('get', value.root, value.path, [name], {}, value.auth)
     if 'state' in response:
         value.root.update(response['state'])

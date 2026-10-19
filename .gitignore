@@ -19,4 +19,4 @@ agent.worker*
 
 .env*
 
-workspaces/
+workspaces/*

@@ -12,6 +12,14 @@ class NumpyEfficiencyTests(unittest.IsolatedAsyncioTestCase):
     asyncSetUp = test_agents.AgentTests.asyncSetUp
     asyncTearDown = test_agents.AgentTests.asyncTearDown
 
+    def test_array_buffer_serialization_layouts(self):
+        import numpy as np
+        from wrappers.numpy import pack, restore
+        base = np.arange(24).reshape(4, 6)
+        for value in (base, base.T, base[:, ::2], np.zeros((0, 2)), np.array(3)):
+            with self.subTest(shape=value.shape, strides=value.strides):
+                np.testing.assert_array_equal(restore('array', pack(value)['data']), value)
+
     async def test_callable_scalar_types_dtype_arguments_and_restart(self):
         result = await self.agent.execute('''
 import numpy as np

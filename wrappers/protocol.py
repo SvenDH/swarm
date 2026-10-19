@@ -10,7 +10,7 @@ from datetime import date, time, timedelta
 from pathlib import PurePath
 
 from .bridge import dispatch, backend
-from .registry import require
+from .registry import require, ALIASES
 from .limits import memory_scope, memory_errors
 
 
@@ -140,6 +140,7 @@ class Bridge:
         if action == 'import':
             if type(spec) is not str:
                 raise ValueError('Expected a library name')
+            spec = ALIASES.get(spec, spec)
             require(spec)
             self.initialize(spec)
             return self.seal({'module': spec, 'kind': 'module', 'data': None})

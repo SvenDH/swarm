@@ -2,6 +2,8 @@
 from importlib.util import find_spec
 from functools import lru_cache
 
+STDLIB = {'os', 'stat', 'shutil', 'tempfile', 'importlib', 'platform', 'resource', 'gc'}
+
 MODULES = {
     'numpy': 'numpy', 'pandas': 'pandas', 'PIL': 'pil', 'openpyxl': 'openpyxl',
     'pypdf': 'pypdf', 'docx': 'docx', 'matplotlib': 'matplotlib', 'scipy': 'scipy',
@@ -9,6 +11,7 @@ MODULES = {
     'pdfplumber': 'pdfplumber', 'pymupdf': 'pymupdf', 'bs4': 'bs4',
     'sympy': 'sympy', 'sklearn': 'sklearn', 'xlsxwriter': 'xlsxwriter',
 }
+MODULES.update({name: 'stdlib' for name in STDLIB})
 ALIASES = {'fitz': 'pymupdf'}
 REQUIRES = {'pandas': ('numpy',), 'matplotlib': ('numpy', 'PIL'),
             'seaborn': ('numpy', 'pandas', 'matplotlib'),

@@ -518,7 +518,12 @@ def pack(value):
     if isinstance(value, np.ndarray):
         checked_size(value.shape, value.dtype)
         output = io.BytesIO()
-        np.save(output, value, allow_pickle=False)
+        # Write the buffer directly: np.save's file-like path builds temporary
+        # byte chunks in addition to the final serialized array.
+        np.lib.format.write_array_header_1_0(output, np.lib.format.header_data_from_array_1_0(value))
+        contiguous = value if value.flags.c_contiguous else np.ascontiguousarray(value.T if value.flags.f_contiguous else value)
+        if contiguous.nbytes:
+            output.write(memoryview(contiguous).cast('B'))
         return descriptor('numpy', 'array', output.getvalue())
     if isinstance(value, np.dtype):
         return descriptor('numpy', 'dtype', value.str)

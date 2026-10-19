@@ -62,11 +62,12 @@ class PythonCode(BaseModel):
 HELP = """Use the python tool to work with code and files. Variables and files persist
 between successful calls; failed calls roll back. Your working directory is
 /home/<your-name>/. Avoid too many library calls per code block; prefer vectorized operations or
-split work across blocks. Stay within your memory budget and release unused
+split work across blocks. Stay within the memory budget (~50mb) and release unused
 large variables with del. Use print for observations; keep output concise.
 Reuse code in Python files via exec(). Use display(image_or_path) to inspect images.
 Keep durable preferences and lessons in your home MEMORY.md using Python file IO;
-keep it brief, correct stale notes, and never store api secrets.
+keep it brief, correct stale notes, and never store api secrets. Some parts of the python 
+implementation might be broken.
 """
 
 
@@ -665,8 +666,9 @@ class CodeAgent:
             request = state.pending
             if request['tool_id'] not in self._streamed_calls:
                 self._emit('python', request['code'])
+            printed = []
             try:
-                fs, snapshot, output, stdout, images = await self._evaluate(request['code'], state, files)
+                fs, snapshot, output, stdout, images = await self._evaluate(request['code'], state, files, printed)
             except MontyCrashedError:
                 raise  # Infrastructure failures/cancellation leave the request pending.
             except (MontyError, SyntaxError, ImportError, MemoryError) as exc:
@@ -676,6 +678,7 @@ class CodeAgent:
                     output = 'MemoryError' + (f': {text}' if text else '')
                 else:
                     output = f'{type(error).__name__}: {error}'[:24000]
+                output = (''.join(printed) + output)[:24000]
                 await self.runtime.database_call(self._commit, request, output, True)
                 raise ExecutionError(output) from exc
             files = await self.runtime.offload(lambda: self._publish(fs.entries()))
@@ -687,7 +690,7 @@ class CodeAgent:
                 self._emit('result', f'\nDisplayed {len(images)} image(s) for visual inspection.')
             return output
 
-    async def _evaluate(self, code, state, files):
+    async def _evaluate(self, code, state, files, printed):
         fs = await self.runtime.offload(lambda: Unix([
             (f['path'], None if f['kind'] == 'directory' else self.storage.read(f['storage_key']))
             for f in files], state.cwd, environ={
@@ -717,24 +720,33 @@ class CodeAgent:
             if len(source) > self.memory_budget:
                 raise MemoryError('source exceeds the session memory budget')
             return self.runtime._io_executor.submit(prepare_libraries, source, True).result()[0]
+        def object_fields(value, fields_only):
+            if isinstance(value, MontyClassProxy):
+                return list(value.attributes)
+            if fields_only:
+                raise TypeError('vars() argument must have __dict__ attribute')
+            if type(value) in (list, tuple, dict, str, bytes, bool, int, float, complex, type(None)):
+                return [name for name in dir(value) if not name.startswith('_')]
+            raise TypeError('Object does not support attribute discovery')
         functions = {**library_tools(fs), '_library_rpc': bridge, 'display': display,
-                     '_prepare_exec': prepare_exec}
+                     '_prepare_exec': prepare_exec, '_object_fields': object_fields}
         # AsyncMonty runs synchronous OS/library callbacks on its worker threads.
         # Keep these synchronous so sandbox callers need not write `await numpy(...)`.
         async with self.runtime._pool.checkout(limits={'max_memory': self.memory_budget,
                                        'max_feed_duration_secs': 10, 'max_suspensions': 1000}) as session:
             active = False
+            helpers_ready = False
             loaded = None
             if state.monty is not None:
                 await session.load_session(state.monty)
-                loaded = await session.feed_run(CHECK, external_lookup=functions, print_callback=lambda *args: None)
+                loaded, helpers_ready = await session.feed_run(CHECK, external_lookup=functions, print_callback=lambda *args: None)
                 active = loaded is not None
             code, libraries = await self.runtime.offload(prepare_libraries, code, active, loaded or ())
             if libraries and not active:
                 await session.feed_run(BOOTSTRAP, external_lookup=functions, print_callback=lambda *args: None)
-            if libraries:
+            if libraries and not helpers_ready:
                 await session.feed_run(DELETE_BOOTSTRAP, external_lookup=functions, print_callback=lambda *args: None)
-            printed, byte_count = [], 0
+            byte_count = 0
             def capture(stream, text):
                 nonlocal byte_count
                 byte_count += len(text.encode())

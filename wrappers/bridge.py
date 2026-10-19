@@ -5,7 +5,7 @@ from functools import lru_cache
 from importlib.metadata import version
 from itertools import islice
 from datetime import date, time, timedelta
-from .registry import MODULES, REQUIRES, require
+from .registry import MODULES, REQUIRES, STDLIB, require
 
 PRIMITIVES = (str, bytes, bool, int, float, complex, date, time, timedelta, type(None))
 
@@ -70,7 +70,8 @@ def _backend(module):
     # with the requested backend on the Python IO worker, never during replay.
     for dependency in REQUIRES.get(module, ()):
         backend(dependency)
-    return import_module('.' + MODULES[module], 'wrappers')
+    api = import_module('.' + MODULES[module], 'wrappers')
+    return api.Adapter(module) if module in STDLIB else api
 
 
 def descriptor(module, kind, data):
@@ -104,7 +105,7 @@ def decode(value, cache=None, fs=None):
 
 
 def member(value, name, module, fs):
-    if name == '__version__' and type(value) is dict:
+    if name == '__version__' and type(value) is dict and module not in STDLIB:
         distribution = {'PIL': 'Pillow', 'docx': 'python-docx', 'pptx': 'python-pptx',
                         'bs4': 'beautifulsoup4', 'sklearn': 'scikit-learn'}.get(module, module)
         return version(distribution)
@@ -269,6 +270,11 @@ def dispatch(fs, action, spec, path=(), args=(), kwargs=None):
         result = None
     elif action == 'len':
         result = len(value)
+    elif action == 'callable':
+        result = callable(value)
+    elif action == 'dir':
+        result = sorted(key for key in (value if type(value) is dict else api.members(value, fs))
+                        if not key.startswith('_'))
     elif action == 'iterate':
         items = list(islice(api.iterate(value), 10_001))
         if len(items) > 10_000:
@@ -281,7 +287,7 @@ def dispatch(fs, action, spec, path=(), args=(), kwargs=None):
             result.append({'__library_view__': view} if view is not None else encode(item, module, root))
         return {'result': result}
     elif action == 'repr':
-        result = repr(value)
+        result = f"<module '{module}'>" if module in STDLIB and spec['kind'] == 'module' and not path else repr(value)
     elif action == 'convert':
         result = {'float': float, 'int': int, 'bool': bool}[args[0]](value)
     elif action == 'binary':
