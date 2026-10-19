@@ -131,6 +131,8 @@ def _library_get(value, name):
 
 
 def _library_item(value, key):
+    if isinstance(value, _LibraryGlobals):
+        return value._values[key]
     if isinstance(value, _LibraryValue):
         return _library_request(value, 'item', key)
     return value[key]
@@ -149,12 +151,16 @@ def _library_setattr(value, name, item):
 
 
 def _library_len(value):
+    if isinstance(value, _LibraryGlobals):
+        return len(value._values)
     if isinstance(value, _LibraryValue):
         return _library_request(value, 'len')
     return len(value)
 
 
 def _library_iter(value):
+    if isinstance(value, _LibraryGlobals):
+        return value._values
     if isinstance(value, _LibraryValue):
         return _library_request(value, 'iterate')
     return value

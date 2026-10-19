@@ -20,6 +20,42 @@ def _library_name(name, value):
     if value is _library_deleted:
         raise NameError("name '" + name + "' is not defined")
     return value
+class _LibraryGlobals:
+    def __init__(self, values):
+        self._values = values
+    def __getitem__(self, key):
+        return self._values[key]
+    def __iter__(self):
+        return iter(self._values)
+    def __len__(self):
+        return len(self._values)
+    def __contains__(self, key):
+        return key in self._values
+    def keys(self):
+        return self._values.keys()
+    def values(self):
+        return self._values.values()
+    def items(self):
+        return self._values.items()
+    def get(self, key, default=None):
+        return self._values.get(key, default)
+    def copy(self):
+        return self._values.copy()
+def _library_globals():
+    _lib_global_values = {}
+    for _lib_global_key in _library_global_names:
+        if not _lib_global_key.startswith(('_library_', '_Library', '_lib_global_', '_prepare_exec', '_object_fields')):
+            try:
+                _lib_global_value = eval(_lib_global_key)
+            except NameError:
+                continue
+            if _lib_global_value is not _library_deleted:
+                _lib_global_values[_lib_global_key] = _lib_global_value
+    return _LibraryGlobals(_lib_global_values)
+def _library_contains(container, item):
+    if isinstance(container, _LibraryGlobals):
+        return item in container._values
+    return item in container
 def _library_method(_lib_receiver, _lib_method_name, /, *args, **kwargs):
     if (_lib_receiver.root['module'] == 'importlib' and not _lib_receiver.path and
             _lib_method_name == 'import_module'):
@@ -97,7 +133,7 @@ def _library_delitem(value, key):
 '''
 # Refresh helper definitions on restored sessions without resetting objects.
 DELETE_BOOTSTRAP += '\n' + '\n'.join(ast.unparse(node) for node in ast.parse(BOOTSTRAP).body
-    if isinstance(node, ast.FunctionDef) and node.name in ('_library_get', '_library_request'))
+    if isinstance(node, ast.FunctionDef) and node.name in ('_library_get', '_library_request', '_library_item', '_library_len', '_library_iter'))
 # Defining functions on every call retains old interpreter code in checkpoints.
 # Refresh once per helper revision, including sessions restored after an update.
 _revision = hashlib.sha256(DELETE_BOOTSTRAP.encode()).hexdigest()
@@ -149,6 +185,26 @@ class LibrarySyntax(ast.NodeTransformer):
     def __init__(self, tree):
         self.names = {node.id for node in ast.walk(tree) if isinstance(node, ast.Name)}
         self.counter = 0
+
+    def visit_Module(self, node):
+        node = self.generic_visit(node)
+        names = set()
+        def collect(item):
+            if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                names.add(item.name)
+                return
+            if isinstance(item, ast.Name) and isinstance(item.ctx, ast.Store):
+                names.add(item.id)
+            if isinstance(item, (ast.Import, ast.ImportFrom)):
+                names.update(alias.asname or alias.name.split('.')[0] for alias in item.names)
+            for child in ast.iter_child_nodes(item):
+                collect(child)
+        collect(node)
+        for item in ast.walk(node):
+            if isinstance(item, ast.Global):
+                names.update(item.names)
+        node.body[:0] = ast.parse('_library_global_names = list(set(list(locals()) + ' + repr(sorted(names)) + '))').body
+        return node
 
     def visit_Name(self, node):
         if (isinstance(node.ctx, ast.Load) and node.id not in BUILTINS and
@@ -232,11 +288,18 @@ class LibrarySyntax(ast.NodeTransformer):
 
     def visit_Compare(self, node):
         self.generic_visit(node)
+        if len(node.ops) == 1 and isinstance(node.ops[0], (ast.In, ast.NotIn)):
+            result = call('contains', node.comparators[0], node.left)
+            return ast.UnaryOp(ast.Not(), result) if isinstance(node.ops[0], ast.NotIn) else result
         if len(node.ops) == 1 and type(node.ops[0]).__name__ in ('Eq', 'NotEq', 'Lt', 'LtE', 'Gt', 'GtE'):
             return call('binary', ast.Constant(type(node.ops[0]).__name__), node.left, node.comparators[0])
         return node
 
     def visit_Call(self, node):
+        if isinstance(node.func, ast.Name) and node.func.id == 'globals':
+            node.func = ast.Name('_library_globals', ast.Load())
+            node.args = [self.visit(arg) for arg in node.args]
+            return node
         if isinstance(node.func, ast.Attribute):
             # Monty can CALL builtin methods but cannot get their bound value
             # (even getattr([], 'append') fails). Leave native method calls intact.
@@ -292,7 +355,7 @@ def prepare(source, active=False, loaded=()):
             backend(name)
     tree = ast.parse(source)
     active = active or any(
-        isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id in ('exec','getattr','hasattr','callable','vars','dir') or
+        isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id in ('exec','getattr','hasattr','callable','vars','dir','globals') or
         isinstance(node, ast.Delete) or
         isinstance(node, ast.Import) and any(alias.name.split('.')[0] in (*MODULES, *ALIASES) for alias in node.names) or
         isinstance(node, ast.ImportFrom) and node.module and node.module.split('.')[0] in (*MODULES, *ALIASES)

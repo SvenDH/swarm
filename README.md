@@ -20,6 +20,10 @@ Standard-library compatibility is session-scoped:
 objects; basic object-field discovery and caller-local `vars()`/`dir()` are also
 available. These are partial compatibility APIs: live global namespace mutation,
 CPython code objects (`compile`) and buffer-protocol `memoryview` remain unsupported.
+`globals()` returns a read-only snapshot of module bindings, including inside
+functions. It supports lookup, membership, iteration, `len`, `get`, `keys`,
+`values`, `items`, and `copy`. Internal helper names and deleted names are omitted.
+Snapshots retain their original bindings; referenced mutable values are not frozen.
 Operations use the existing checkpoint/rollback and filesystem isolation. Filesystem
 metadata is the current filesystem's metadata, not host inode/ownership information.
 

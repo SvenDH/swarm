@@ -10,6 +10,25 @@ class StdlibTests(unittest.IsolatedAsyncioTestCase):
     asyncSetUp = test_agents.AgentTests.asyncSetUp
     asyncTearDown = test_agents.AgentTests.asyncTearDown
 
+    async def test_readonly_globals_snapshot_and_restart(self):
+        self.assertEqual(await self.agent.execute('''
+x=7
+def inspect_globals():
+    local_only=99
+    return globals()['x'], 'local_only' in globals()
+snapshot=globals()
+x=8
+(snapshot['x'],inspect_globals(),snapshot.get('missing',42))
+'''), '(7, (8, False), 42)')
+        self.assertEqual(await self.agent.execute("('x' in list(globals()),len(globals())>0,'x' in globals().keys())"), '(True, True, True)')
+        self.assertEqual(await self.agent.execute("any(name.startswith(('_library_', '_Library')) for name in globals().keys())"), 'False')
+        for source in ("globals()['x']=9", "del globals()['x']", "globals().clear()"):
+            with self.subTest(source=source), self.assertRaises(ExecutionError):
+                await self.agent.execute(source)
+        await self.agent.close()
+        self.agent = await CodeAgent.open(self.path, session_id=self.session_id)
+        self.assertEqual(await self.agent.execute("del x; ('x' in globals(),snapshot['x'])"), '(False, 7)')
+
     async def test_file_operations_stat_and_restart(self):
         result = await self.agent.execute('''
 import os, stat, shutil, tempfile
