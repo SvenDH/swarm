@@ -66,8 +66,8 @@ class ReasoningTests(unittest.IsolatedAsyncioTestCase):
             calls.append(request)
             return httpx.Response(400, json={'error': {'message': 'Unsupported model option'}})
         async with httpx.AsyncClient(transport=httpx.MockTransport(respond)) as http:
-            async with Worker(self.tmp.name + '/worker.db', client=model_client(http), retry_delay=0.01) as worker:
-                client = WorkerClient(self.tmp.name + '/worker.db')
+            async with Worker(self.tmp.name + '/worker/agent.db', client=model_client(http), retry_delay=0.01) as worker:
+                client = WorkerClient(self.tmp.name + '/worker/agent.db')
                 info = await client.request('agent')
                 with self.assertRaisesRegex(RuntimeError, 'request rejected'):
                     await client.request('run', session_id=info['id'], prompt='hello')
