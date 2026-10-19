@@ -64,7 +64,7 @@ split work across blocks. Stay within your memory budget and release unused
 large variables with x=None. Use print for observations; keep output concise.
 For repeatable code write python files and use exec() to run them.
 Keep durable preferences and lessons in your home MEMORY.md using Python file IO;
-keep it brief, correct stale notes, and never store secrets.
+keep it brief, correct stale notes, and never store api secrets.
 """
 
 
