@@ -114,7 +114,7 @@ async def main():
     parser.add_argument('--workers', type=int, default=4, help='shared Monty workers in this host process')
     parser.add_argument('--model-concurrency', type=int, default=128)
     parser.add_argument('--context-chars', type=int, default=120_000, help='conversation compaction threshold')
-    parser.add_argument('--memory-mb', type=int, help='memory budget per new session in MiB (default: 50)')
+    parser.add_argument('--memory-mb', type=int, help='shared worker execution budget in MiB (default: 1024)')
     args = parser.parse_args()
     if args.worker or args.with_worker:
         async with Worker(args.database, socket=args.socket, workspaces=args.workspaces,

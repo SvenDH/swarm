@@ -19,6 +19,7 @@ import shutil
 import sqlite3
 import stat
 import threading
+import textwrap
 import uuid
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
@@ -40,7 +41,7 @@ from names import num_to_name
 from wrappers import tools as library_tools
 from wrappers.protocol import Bridge
 from wrappers.bridge import backend as library_backend
-from wrappers.imports import BOOTSTRAP, CHECK, DELETE_BOOTSTRAP, prepare as prepare_libraries
+from wrappers.imports import BOOTSTRAP, CHECK, DELETE_BOOTSTRAP, prepare as prepare_libraries, cleanup as cleanup_libraries
 from wrappers.limits import memory_bytes, memory_scope, check_memory, memory_message, memory_errors
 
 load_dotenv(override=True)
@@ -62,8 +63,8 @@ class PythonCode(BaseModel):
 HELP = """Use the python tool to work with code and files. Variables and files persist
 between successful calls; failed calls roll back. Your working directory is
 /home/<your-name>/. Avoid too many library calls per code block; prefer vectorized operations or
-split work across blocks. Stay within the memory budget (~50mb) and release unused
-large variables with del. Use print for observations; keep output concise.
+split work across blocks. Release unused
+large variables with del. Use print for concise observations.
 Reuse code in Python files via exec(). Use display(image_or_path) to inspect images.
 Keep durable preferences and lessons in your home MEMORY.md using Python file IO;
 keep it brief, correct stale notes, and never store api secrets. Some parts of the python 
@@ -285,7 +286,9 @@ class Runtime:
         self.api_key = api_key if api_key is not None else os.environ.get('LLM_API_KEY', '')
         self.client, self.workers, self.io_workers = client, workers, io_workers
         self.model_concurrency = model_concurrency
-        self._model_slots, self._sandbox_slots = asyncio.Semaphore(model_concurrency), asyncio.Semaphore(workers)
+        # Idle sessions stay on disk. Reserve the shared heap before loading
+        # checkpoints; network/model requests still run concurrently.
+        self._model_slots, self._sandbox_slots = asyncio.Semaphore(model_concurrency), asyncio.Semaphore(1)
         self._creation_slots = asyncio.Semaphore(io_workers)
         self._db_slots, self._io_slots = asyncio.Semaphore(1), asyncio.Semaphore(io_workers)
         self._locks = WeakValueDictionary()
@@ -420,6 +423,8 @@ class Runtime:
     async def agent(self, *, session_id=None, model=None, on_output=None, memory_budget=None):
         if memory_budget is not None and (session_id is not None or type(memory_budget) is not int or memory_budget < 1024**2):
             raise ValueError('memory_budget must be at least 1 MiB and can only be set for new sessions')
+        if memory_budget is not None and memory_budget > self.memory_budget:
+            raise ValueError('session cap cannot exceed the shared worker memory budget')
         async with self.operation():
             async with self._creation_slots:
                 entries = await self.offload(self._template_entries) if session_id is None else ()
@@ -668,6 +673,8 @@ class CodeAgent:
                 self._emit('python', request['code'])
             printed = []
             try:
+                if self.memory_budget > self.runtime.memory_budget:
+                    raise MemoryError()
                 fs, snapshot, output, stdout, images = await self._evaluate(request['code'], state, files, printed)
             except MontyCrashedError:
                 raise  # Infrastructure failures/cancellation leave the request pending.
@@ -712,14 +719,23 @@ class CodeAgent:
                 check_memory(sum(map(len, images)) + len(data))
             images.append(data)
         @memory_errors
-        def prepare_exec(source):
+        def prepare_exec(source, isolated=False):
             # Transform source, never execute it on the host. The builtin exec
             # stays in the caller's interpreter scope with the same IO/limits.
             if not isinstance(source, (str, bytes)):
                 raise TypeError('exec() arg 1 must be a string or bytes')
             if len(source) > self.memory_budget:
                 raise MemoryError('source exceeds the session memory budget')
-            return self.runtime._io_executor.submit(prepare_libraries, source, True).result()[0]
+            translated = self.runtime._io_executor.submit(prepare_libraries, source, True).result()[0]
+            if isolated:
+                bootstrap = ("try:\n    _library_import\nexcept NameError:\n" +
+                             textwrap.indent(BOOTSTRAP, '    ') + '\n' + DELETE_BOOTSTRAP)
+                # Populate the globals dictionary even when exec has a distinct
+                # locals mapping: definitions resolve globals, not those locals.
+                first, _, rest = translated.partition('\n')
+                return (f'exec({bootstrap!r}, _library_exec_scope)\n' + first + '\n' +
+                        "_library_exec_scope['_library_global_names'] = _library_global_names\n" + rest)
+            return translated
         def object_fields(value, fields_only):
             if isinstance(value, MontyClassProxy):
                 return list(value.attributes)
@@ -737,11 +753,19 @@ class CodeAgent:
             active = False
             helpers_ready = False
             loaded = None
+            cleanup = await self.runtime.offload(cleanup_libraries, code)
             if state.monty is not None:
                 await session.load_session(state.monty)
+            if cleanup is not None:
+                # Free first; do not spend the remaining heap on helper refresh.
+                await session.feed_run(cleanup, external_lookup=functions, print_callback=lambda *args: None)
+            if state.monty is not None or cleanup is not None:
                 loaded, helpers_ready = await session.feed_run(CHECK, external_lookup=functions, print_callback=lambda *args: None)
                 active = loaded is not None
-            code, libraries = await self.runtime.offload(prepare_libraries, code, active, loaded or ())
+            if cleanup is None:
+                code, libraries = await self.runtime.offload(prepare_libraries, code, active, loaded or ())
+            else:
+                code, libraries = '', True
             if libraries and not active:
                 await session.feed_run(BOOTSTRAP, external_lookup=functions, print_callback=lambda *args: None)
             if libraries and not helpers_ready:
@@ -762,7 +786,12 @@ class CodeAgent:
             else:
                 rendered = repr(value) if value is not None else ''
             output = (stdout + rendered)[:24000]
-            return fs, await session.dump(), output, stdout, images
+            snapshot = await session.dump()
+            # Checkpoint/restore needs another serialized copy. Reserve that
+            # copy plus 25% of the budget for the next feed and cleanup.
+            if len(snapshot) * 2 > min(self.memory_budget, self.runtime.memory_budget) * 3 // 4:
+                raise MemoryError()
+            return fs, snapshot, output, stdout, images
 
     def _vision_messages(self, messages):
         """Expand durable object references only at the provider boundary."""
@@ -801,7 +830,6 @@ class CodeAgent:
         shown = {}
         reasoning = {}
         system = f'Your session ID is {self.id}; your name is {self.name}.\n' + HELP
-        system += f'\nYour session memory budget is {self.memory_budget:,} bytes.'
         options = {'tools': [self.runtime.tool], 'parallel_tool_calls': False}
         if summary_chars is None:
             messages = await self.runtime.offload(self._vision_messages, messages)

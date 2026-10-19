@@ -27,6 +27,10 @@ def unsupported(*args, **kwargs):
 
 
 def exports(module, fs):
+    if module == 'traceback':
+        # Exception objects stay in the interpreter. Its facade handles these
+        # functions without exposing host frames or native traceback objects.
+        return {'format_exception_only': unsupported}
     def status(path, *, follow_symlinks=True):
         item = fs.path_stat(fs.path(path))
         fields = {name: getattr(item, name) for name in (

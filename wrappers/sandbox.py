@@ -1,19 +1,28 @@
 """Executed INSIDE Monty. These plain classes/closures survive session dumps."""
 
 
-class _LibraryValue:
-    def __init__(self, root, path, auth=None):
-        self.root = root
-        self.path = path
-        self.auth = auth
+try:
+    _LibraryValue
+except NameError:
+    class _LibraryValue:
+        def __init__(self, root, path, auth=None):
+            self.root = root
+            self.path = path
+            self.auth = auth
 
 
-class _LibraryRender:
-    def __init__(self, text):
-        self.text = text
+try:
+    _LibraryRender
+except NameError:
+    class _LibraryRender:
+        def __init__(self, text):
+            self.text = text
 
 
-_library_modules = {}
+try:
+    _library_modules
+except NameError:
+    _library_modules = {}
 
 
 def _library_is_value(value):
@@ -119,6 +128,8 @@ def _library_get(value, name):
         return getattr(value, name)
     if value.root['module'] == 'importlib' and not value.path and name == 'import_module':
         return _library_import_module
+    if value.root['module'] == 'traceback' and not value.path and name == 'format_exception_only':
+        return _library_exception_only
     response = _library_rpc('get', value.root, value.path, [name], {}, value.auth)
     if 'state' in response:
         value.root.update(response['state'])

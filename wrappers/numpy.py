@@ -13,6 +13,12 @@ from .common import Record, freeze, thaw
 
 # Initialize native FFT code on the Python import worker, not a Monty callback.
 np.fft.fft([0.0])
+
+
+class Session:
+    def __init__(self, rng=None):
+        self.rng = np.random.RandomState() if rng is None else rng
+
 SCALARS = {name: np.dtype(name).type for name in (
     'bool', 'uint8', 'uint16', 'uint32', 'uint64', 'int8', 'int16', 'int32', 'int64',
     'float16', 'float32', 'float64', 'complex64', 'complex128')}
@@ -342,7 +348,7 @@ def fft_frequencies(function):
     return frequencies
 
 
-def exports(fs):
+def exports(fs, rng=None):
     def load(path, *, allow_pickle=False):
         if allow_pickle:
             raise ValueError('pickle-backed arrays are not supported')
@@ -400,7 +406,8 @@ def exports(fs):
                                       'qr': np.linalg.qr, 'cholesky': np.linalg.cholesky,
                                       'pinv': np.linalg.pinv, 'lstsq': np.linalg.lstsq,
                                       'matrix_rank': np.linalg.matrix_rank, 'cond': np.linalg.cond},
-            'random': {'default_rng': np.random.default_rng},
+            'random': {'default_rng': np.random.default_rng, 'RandomState': np.random.RandomState,
+                       **(members(rng, fs) if rng is not None else {})},
             'fft': {'fft': fft_transform(np.fft.fft), 'ifft': fft_transform(np.fft.ifft),
                     'rfft': fft_transform(np.fft.rfft), 'irfft': fft_transform(np.fft.irfft, True),
                     'fftfreq': fft_frequencies(np.fft.fftfreq),
@@ -410,6 +417,28 @@ def exports(fs):
 
 
 def members(value, fs, name=None):
+    if isinstance(value, Session):
+        return exports(fs, value.rng)
+    if isinstance(value, np.random.RandomState):
+        def bounded(function, size_position=0):
+            def generate(*args, **kwargs):
+                size = kwargs.get('size', args[size_position] if len(args) > size_position else None)
+                if size is None:
+                    params = [*args[:size_position], *(v for k, v in kwargs.items() if k != 'size')]
+                    size = np.broadcast_shapes(*(np.shape(v) for v in params))
+                checked_size(size, 'float64')
+                return function(*args, **kwargs)
+            return generate
+        def dimensions(function):
+            def generate(*shape):
+                checked_size(shape, 'float64')
+                return function(*shape)
+            return generate
+        return {'rand': dimensions(value.rand), 'randn': dimensions(value.randn),
+                'random': bounded(value.random_sample), 'random_sample': bounded(value.random_sample),
+                'sample': bounded(value.random_sample), 'randint': bounded(value.randint, 2),
+                'normal': bounded(value.normal, 2), 'uniform': bounded(value.uniform, 2),
+                'standard_normal': bounded(value.standard_normal), 'seed': value.seed}
     if isinstance(value, Record):
         return value.fields
     if isinstance(value, Ufunc):
@@ -458,8 +487,8 @@ def members(value, fs, name=None):
         def distribution(function, size_position):
             def generate(*args, **kwargs):
                 size = kwargs.get('size', args[size_position] if len(args) > size_position else None)
-                if kwargs.get('out') is not None:
-                    raise ValueError('out arrays are not supported')
+                if kwargs.get('out') is not None and size is None:
+                    size = kwargs['out'].shape
                 if size is None:
                     params = [*args[:size_position],
                               *(v for k, v in kwargs.items() if k not in ('size', 'dtype', 'out', 'method'))]
@@ -505,6 +534,11 @@ def members(value, fs, name=None):
 
 
 def pack(value):
+    if isinstance(value, Session):
+        return descriptor('numpy', 'module', pack(value.rng)['data'])
+    if isinstance(value, np.random.RandomState):
+        name, keys, pos, gaussian, cached = value.get_state()
+        return descriptor('numpy', 'random_state', [name, keys.tolist(), pos, gaussian, cached])
     if isinstance(value, type) and value in SCALARS.values():
         return descriptor('numpy', 'scalar_type', np.dtype(value).name)
     if isinstance(value, Record):
@@ -532,6 +566,13 @@ def pack(value):
 
 
 def restore(kind, data, *, copy=True):
+    if kind == 'module':
+        return Session(restore('random_state', data)) if data is not None else Session()
+    if kind == 'random_state':
+        name, keys, pos, gaussian, cached = data
+        value = np.random.RandomState(0)
+        value.set_state((name, np.asarray(keys, dtype=np.uint32), pos, gaussian, cached))
+        return value
     if kind == 'scalar_type' and data in SCALARS:
         return SCALARS[data]
     if kind == 'record':

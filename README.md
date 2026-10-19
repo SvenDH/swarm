@@ -28,6 +28,10 @@ Operations use the existing checkpoint/rollback and filesystem isolation. Filesy
 metadata is the current filesystem's metadata, not host inode/ownership information.
 
 Reusable code can live in session files and run with `exec(open("script.py").read())`.
+Explicit dictionary namespaces (`exec(code, namespace)`) also receive the reviewed
+helpers and import support. Passing the read-only `globals()` snapshot executes
+against a copy; it does not mutate the module namespace. `__import__` uses the
+same approved registry, never arbitrary host imports.
 Dynamic `exec()` source, including nested calls, receives the same import and
 library-operation translation as top-level code. Execution remains in the
 interpreter with the same caller scope, filesystem isolation, resource limits,
@@ -35,6 +39,14 @@ and atomic rollback; source is never executed by host Python. NumPy/PIL version
 queries work, and agent-facing failures use normal Python exception names rather
 than interpreter-specific prefixes. This is still a supported Python subset,
 not a promise of full CPython compatibility.
+
+NumPy's legacy `random.rand`, `randn`, `randint`, `seed`, and `RandomState` use
+session-local, checkpointed random state. Generator `random`/`standard_normal`
+support authenticated `out=` buffers. Pillow `Image.point` callbacks are evaluated
+inside the interpreter into lookup tables for byte-channel images; Python
+callbacks are never forwarded to native libraries. `traceback.format_exception_only`
+can format caught exceptions; host frames and native traceback objects remain
+unavailable.
 
 General allocation failures raise `MemoryError` with no message. NumPy allocation
 failures retain NumPy's standard requested-size, shape and dtype message, including
@@ -399,35 +411,41 @@ separate Python modules are not supported.
 Names beginning `_library_` are reserved. Unsupported functions fail explicitly;
 there is no fallback to arbitrary host attributes or host filesystem access.
 Use numeric dtype constructors or names such as `'float64'`, and vectorized methods. There are
-no fixed element-count or pixel-count caps: each session gets a byte budget,
-50 MiB by default. Set the default for **new** sessions with:
+no fixed element-count or pixel-count caps. The worker has one shared execution
+budget of **1 GiB** by default. Idle agent checkpoints stay on disk. Code blocks
+run one at a time, reserving the budget before loading their state; model requests
+remain concurrent. Configure the worker with:
 
 ```sh
-uv run main.py --with-worker --memory-mb 512
+uv run main.py --with-worker --memory-mb 1024
 ```
 
-Or set `SWARM_MEMORY_BYTES=536870912` in the worker environment/`.env`.
-Embedded callers can use `Runtime(..., memory_budget=512 * 1024**2)` and override
-individual new sessions with `await runtime.agent(memory_budget=128 * 1024**2)`.
-`WorkerClient.request('agent', memory_budget=...)` also accepts bytes for a new
-session. Budgets are saved in SQLite and survive restarts; reopening an existing
-session retains its budget. Existing databases gain this field without losing
-sessions or checkpoints. The old ARRAY/IMAGE/MONTY size settings are removed.
+Or set `SWARM_MEMORY_BYTES=1073741824` in the worker environment/`.env`.
+Embedded callers can use `Runtime(..., memory_budget=1024**3)`. Optional smaller
+new-session caps remain available through `runtime.agent(memory_budget=...)`
+and the worker `agent` request, but cannot exceed the shared worker budget.
+Monty embeds limits in snapshots: existing saved sessions retain their embedded
+limits, even after worker configuration changes. Start a new session to use a
+higher limit; existing checkpoints are never discarded or replayed to change it.
+Sessions with embedded limits above the current worker budget cannot execute;
+restore the previous worker configuration to continue them safely.
 
 Monty enforces the budget across its live heap, including globals and serialized
 library descriptors. Copies, wrapper overhead and checkpointing need headroom;
 the sum of array `nbytes` is not all the memory required. Free unused variables
 with `del`, reuse buffers and prefer smaller dtypes or chunks. Wrapper
-allocation preflights use this same session budget, based on dtype/sample bytes,
-not arbitrary array/image dimensions. Context-local checks isolate concurrent
-sessions. Object dtypes remain prohibited; native shape constraints and iteration
+allocation preflights use the active execution budget, based on dtype/sample bytes,
+not arbitrary array/image dimensions. Checkpoints reserve room for two serialized
+copies plus 25% of the budget for future code and cleanup. Oversized checkpoints
+roll back atomically, including file writes, and prior committed state is retained.
+Object dtypes remain prohibited; native shape constraints and iteration
 limits remain in place.
 
 This is **not a hard process RSS quota**. Native extension scratch allocations,
 Python-side decoding/serialization, shared package caches and virtual-filesystem
 buffers are outside Monty's heap accounting. Native preflights cover known
-allocation shapes, not every temporary. Concurrent sessions can therefore use
-more host memory than their interpreter heaps; use OS isolation/resource limits
+allocation shapes, not every temporary. Host memory can therefore exceed the
+execution budget; use OS isolation/resource limits
 when hard memory enforcement is required.
 
 Direct library method calls use one authenticated bridge operation rather than

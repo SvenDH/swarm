@@ -203,7 +203,7 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
                 self.assertNotIn(implementation_detail, json.dumps(body['tools']).lower())
             self.assertNotIn('suspension', system.lower())
             self.assertIn('too many library calls per code block', system)
-            self.assertIn('session memory budget', system)
+            self.assertNotIn('session memory budget', system)
             requests.append(body)
             if len(requests) == 2:
                 self.assertEqual(body['messages'][-1]['content'], 'hé😀\n42')

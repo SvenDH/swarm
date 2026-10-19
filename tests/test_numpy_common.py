@@ -84,9 +84,9 @@ add.at(a,[0,0,2],1)
         self.assertEqual(await self.agent.execute('view=a[1:]; add.at(view,[0],5); a.tolist()'), '[3, 7, 4]')
         self.assertEqual(await self.agent.execute('(add.reduce(a,0),add.reduceat(a,[0,2]).tolist(),np.logical_and.reduce([True,False]))'), '(14, [10, 4], False)')
         for code in ('add(a,1,a)', 'add.reduce(a,out=a)', 'add(a,1,where=[False,True,True])',
-                     'add.outer(np.ones(10001),np.ones(10001))',
-                     'add(np.ones((10001,1)),1,where=np.ones((1,10001),dtype=bool))',
-                     'add.at(np.zeros((2,2)),(np.zeros((10001,1),dtype=int),np.zeros((1,10001),dtype=int)),1)'):
+                     'add.outer(np.ones(50001),np.ones(50001))',
+                     'add(np.ones((50001,1)),1,where=np.ones((1,50001),dtype=bool))',
+                     'add.at(np.zeros((2,2)),(np.zeros((50001,1),dtype=int),np.zeros((1,50001),dtype=int)),1)'):
             with self.subTest(code=code), self.assertRaises(ExecutionError):
                 await self.agent.execute(code)
         self.assertEqual(await self.agent.execute('a.tolist()'), '[3, 7, 4]')

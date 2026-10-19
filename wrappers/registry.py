@@ -2,7 +2,7 @@
 from importlib.util import find_spec
 from functools import lru_cache
 
-STDLIB = {'os', 'stat', 'shutil', 'tempfile', 'importlib', 'platform', 'resource', 'gc'}
+STDLIB = {'os', 'stat', 'shutil', 'tempfile', 'importlib', 'platform', 'resource', 'gc', 'traceback'}
 
 MODULES = {
     'numpy': 'numpy', 'pandas': 'pandas', 'PIL': 'pil', 'openpyxl': 'openpyxl',

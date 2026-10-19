@@ -20,27 +20,30 @@ def _library_name(name, value):
     if value is _library_deleted:
         raise NameError("name '" + name + "' is not defined")
     return value
-class _LibraryGlobals:
-    def __init__(self, values):
-        self._values = values
-    def __getitem__(self, key):
-        return self._values[key]
-    def __iter__(self):
-        return iter(self._values)
-    def __len__(self):
-        return len(self._values)
-    def __contains__(self, key):
-        return key in self._values
-    def keys(self):
-        return self._values.keys()
-    def values(self):
-        return self._values.values()
-    def items(self):
-        return self._values.items()
-    def get(self, key, default=None):
-        return self._values.get(key, default)
-    def copy(self):
-        return self._values.copy()
+try:
+    _LibraryGlobals
+except NameError:
+    class _LibraryGlobals:
+        def __init__(self, values):
+            self._values = values
+        def __getitem__(self, key):
+            return self._values[key]
+        def __iter__(self):
+            return iter(self._values)
+        def __len__(self):
+            return len(self._values)
+        def __contains__(self, key):
+            return key in self._values
+        def keys(self):
+            return self._values.keys()
+        def values(self):
+            return self._values.values()
+        def items(self):
+            return self._values.items()
+        def get(self, key, default=None):
+            return self._values.get(key, default)
+        def copy(self):
+            return self._values.copy()
 def _library_globals():
     _lib_global_values = {}
     for _lib_global_key in _library_global_names:
@@ -56,10 +59,43 @@ def _library_contains(container, item):
     if isinstance(container, _LibraryGlobals):
         return item in container._values
     return item in container
+def _library_exec_namespace(value):
+    if isinstance(value, _LibraryGlobals):
+        value = value.copy()
+    if isinstance(value, dict):
+        value['_library_exec_scope'] = value
+        value['_LibraryValue'] = _LibraryValue
+        value['_LibraryRender'] = _LibraryRender
+        value['_LibraryGlobals'] = _LibraryGlobals
+        value['_LibraryDeleted'] = _LibraryDeleted
+        value['_library_deleted'] = _library_deleted
+        value['_library_modules'] = _library_modules
+        value['_library_rpc'] = _library_rpc
+        value['_prepare_exec'] = _prepare_exec
+        value['_object_fields'] = _object_fields
+        value['display'] = display
+    return value
+def _library_dunder_import(name, globals=None, locals=None, fromlist=(), level=0):
+    if level:
+        raise ImportError('Relative imports are not supported')
+    module = _library_import_module(name)
+    return module if fromlist else _library_import_module(name.split('.')[0])
+def _library_exception_only(exc, value=None, **kwargs):
+    if value is not None:
+        exc = value
+    text = str(exc)
+    return [type(exc).__name__ + (': ' + text if text else '') + '\\n']
 def _library_method(_lib_receiver, _lib_method_name, /, *args, **kwargs):
     if (_lib_receiver.root['module'] == 'importlib' and not _lib_receiver.path and
             _lib_method_name == 'import_module'):
         return _library_import_module(*args, **kwargs)
+    if _lib_receiver.root['module'] == 'traceback' and _lib_method_name == 'format_exception_only':
+        return _library_exception_only(*args, **kwargs)
+    if _lib_receiver.root['module'] == 'PIL' and _lib_method_name == 'point' and args and _library_callable(args[0]):
+        # Evaluate callbacks in the interpreter; native code receives only a LUT.
+        table = [args[0](i) for i in range(256)]
+        bands = _library_request(_lib_receiver, 'method', 'getbands')
+        args = (table * len(bands), *args[1:])
     return _library_request(_lib_receiver, 'method', _lib_method_name, *args, **kwargs)
 def _library_import_module(name, package=None):
     if not isinstance(name, str):
@@ -296,6 +332,10 @@ class LibrarySyntax(ast.NodeTransformer):
         return node
 
     def visit_Call(self, node):
+        if isinstance(node.func, ast.Name) and node.func.id == '__import__':
+            return ast.Call(ast.Name('_library_dunder_import', ast.Load()),
+                            [self.visit(arg) for arg in node.args],
+                            [self.visit(item) for item in node.keywords])
         if isinstance(node.func, ast.Name) and node.func.id == 'globals':
             node.func = ast.Name('_library_globals', ast.Load())
             node.args = [self.visit(arg) for arg in node.args]
@@ -320,7 +360,10 @@ class LibrarySyntax(ast.NodeTransformer):
             return ast.Call(ast.Lambda(arguments, body), [receiver], [])
         self.generic_visit(node)
         if isinstance(node.func, ast.Name) and node.func.id == 'exec' and node.args:
-            node.args[0] = ast.Call(ast.Name('_prepare_exec', ast.Load()), [node.args[0]], [])
+            isolated = len(node.args) > 1
+            node.args[0] = ast.Call(ast.Name('_prepare_exec', ast.Load()), [node.args[0], ast.Constant(isolated)], [])
+            if isolated:
+                node.args[1] = call('exec_namespace', node.args[1])
             return node
         if isinstance(node.func, ast.Name) and node.func.id == 'display':
             node.args = [call('pack', arg) for arg in node.args]
@@ -355,7 +398,7 @@ def prepare(source, active=False, loaded=()):
             backend(name)
     tree = ast.parse(source)
     active = active or any(
-        isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id in ('exec','getattr','hasattr','callable','vars','dir','globals') or
+        isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id in ('exec','getattr','hasattr','callable','vars','dir','globals','__import__') or
         isinstance(node, ast.Delete) or
         isinstance(node, ast.Import) and any(alias.name.split('.')[0] in (*MODULES, *ALIASES) for alias in node.names) or
         isinstance(node, ast.ImportFrom) and node.module and node.module.split('.')[0] in (*MODULES, *ALIASES)
@@ -366,3 +409,27 @@ def prepare(source, active=False, loaded=()):
     if tree.body and isinstance(tree.body[-1], ast.Expr):
         tree.body[-1].value = call('result', tree.body[-1].value)
     return ast.unparse(ast.fix_missing_locations(tree)), True
+
+
+def cleanup(source):
+    """Minimal native feed for releasing names even from a nearly full heap."""
+    tree = ast.parse(source)
+    names = []
+    for statement in tree.body:
+        if not isinstance(statement, ast.Delete):
+            return None
+        for target in statement.targets:
+            if not isinstance(target, ast.Name) or target.id.startswith('_library_'):
+                return None
+            names.append(target.id)
+    if not names:
+        return None
+    lines = ['try:', '    _library_deleted', 'except NameError:',
+             '    _library_had_deleted=False', 'else:', '    _library_had_deleted=True']
+    for name in names:
+        lines.extend([name, f'if _library_had_deleted and {name} is _library_deleted:',
+                      f'    raise NameError("name {name!r} is not defined")', f'{name}=None'])
+        lines.extend(['if not _library_had_deleted:', '    class _LibraryDeleted:', '        pass',
+                      '    _library_deleted=_LibraryDeleted()', '    _library_had_deleted=True',
+                      f'{name}=_library_deleted'])
+    return '\n'.join(lines)

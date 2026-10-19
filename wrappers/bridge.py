@@ -22,7 +22,7 @@ INPLACE = {'Add': operator.iadd, 'Sub': operator.isub, 'Mult': operator.imul,
            'Pow': operator.ipow, 'MatMult': operator.imatmul, 'BitAnd': operator.iand,
            'BitOr': operator.ior, 'BitXor': operator.ixor, 'LShift': operator.ilshift,
            'RShift': operator.irshift}
-MUTATING = {'numpy': {'sort', 'random', 'normal', 'uniform', 'integers', 'standard_normal',
+MUTATING = {'numpy': {'sort', 'random', 'rand', 'randn', 'randint', 'random_sample', 'sample', 'seed', 'normal', 'uniform', 'integers', 'standard_normal',
                 'exponential', 'standard_exponential', 'gamma', 'beta', 'poisson', 'binomial',
                 'lognormal', 'logistic', 'laplace', 'chisquare', 'standard_t', 'weibull', 'geometric', 'triangular'},
             'pandas': set(), 'PIL': {'putpixel', 'putalpha', 'paste', 'thumbnail', 'line', 'rectangle',
@@ -105,7 +105,8 @@ def decode(value, cache=None, fs=None):
 
 
 def member(value, name, module, fs):
-    if name == '__version__' and type(value) is dict and module not in STDLIB:
+    if name == '__version__' and module not in STDLIB and (type(value) is dict or
+            (module == 'numpy' and isinstance(value, backend(module).Session))):
         distribution = {'PIL': 'Pillow', 'docx': 'python-docx', 'pptx': 'python-pptx',
                         'bs4': 'beautifulsoup4', 'sklearn': 'scikit-learn'}.get(module, module)
         return version(distribution)
@@ -171,9 +172,9 @@ def dispatch(fs, action, spec, path=(), args=(), kwargs=None):
     """Every attribute/call is resolved through explicit backend member maps."""
     module = spec['module']
     api = backend(module)
-    stateful = module == 'matplotlib'
+    stateful = module == 'matplotlib' or (module == 'numpy' and spec['kind'] == 'module')
     if spec['kind'] == 'module':
-        root = api.restore('module', spec['data']) if stateful and spec['data'] is not None else api.exports(fs)
+        root = api.restore('module', spec['data']) if stateful and (spec['data'] is not None or module == 'numpy') else api.exports(fs)
     elif module == 'numpy' and spec['kind'] == 'array':
         writable = action in ('setitem', 'inplace') or (action == 'call' and
             (kwargs.get('out') is not None or (path and path[-1][1] in MUTATING['numpy'])))
@@ -192,7 +193,7 @@ def dispatch(fs, action, spec, path=(), args=(), kwargs=None):
             return {'call': True}
         result_path = [*path, ['attr', name]]
         # Constants/distributions are independent values, not views of namespaces.
-        if spec['kind'] == 'module' and not stateful and api.pack(result) is not None:
+        if spec['kind'] == 'module' and (not stateful or module == 'numpy') and api.pack(result) is not None:
             return {'result': encode(result, module)}
         # Learned/statistical arrays belong to NumPy, not to the estimator backend.
         if module in ('scipy', 'sklearn'):
@@ -224,9 +225,12 @@ def dispatch(fs, action, spec, path=(), args=(), kwargs=None):
         result = value(*args, **kwargs)
         if module == 'numpy' and out is not None:
             target = out['__library_value__']
-            return {'updates': [{'module': 'numpy', 'identity': target['identity'],
+            response = {'updates': [{'module': 'numpy', 'identity': target['identity'],
                                  'data': api.pack(cache[('numpy', target['identity'])])['data']}],
                     'argument_result': {'module': 'numpy', 'identity': target['identity'], 'path': out['path']}}
+            if stateful or spec['kind'] == 'rng':
+                response['state'] = api.pack(root)
+            return response
         if module == 'PIL' and spec['kind'] == 'module':
             for (owner, identity), obj in cache.items():
                 view = api.view(obj, result) if owner == module else None

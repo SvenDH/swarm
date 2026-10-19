@@ -1,6 +1,6 @@
-"""Session-local byte budget, including native allocation preflight checks.
+"""Shared execution budget, with context-local native preflight checks.
 
-Monty enforces aggregate live heap usage. Native extensions cannot be given a
+The worker serializes active heaps; Monty bounds each active heap. Native extensions cannot be given a
 hard RSS limit inside this shared host process; these checks bound known output
 allocations, not all of a native library's transient/scratch memory.
 """
@@ -31,7 +31,7 @@ def memory_errors(function):
             raise (MemoryError(text) if text else MemoryError()) from None
     return call
 
-DEFAULT_MEMORY = 50 * 1024**2
+DEFAULT_MEMORY = 1024**3
 _memory = ContextVar('session_memory_budget', default=None)
 
 

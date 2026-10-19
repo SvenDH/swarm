@@ -79,7 +79,7 @@ class MemoryTests(unittest.IsolatedAsyncioTestCase):
     async def test_invalid_budgets_and_suspension_prompt(self):
         with patch.dict('os.environ') as environment:
             environment.pop('SWARM_MEMORY_BYTES', None)
-            self.assertEqual(Runtime(self.database).memory_budget, 50*MiB)
+            self.assertEqual(Runtime(self.database).memory_budget, 1024*MiB)
         for budget in (0, -1, True, 1.5):
             with self.subTest(budget=budget), self.assertRaises(ValueError):
                 Runtime(self.database, memory_budget=budget)

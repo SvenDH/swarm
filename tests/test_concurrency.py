@@ -21,7 +21,7 @@ class ConcurrencyTests(unittest.IsolatedAsyncioTestCase):
         await self.runtime.close()
         self.tmp.cleanup()
 
-    async def test_slow_library_does_not_block_other_agents_or_event_loop(self):
+    async def test_slow_library_keeps_loop_responsive_and_other_code_waits_for_budget(self):
         a, b = await asyncio.gather(self.runtime.agent(), self.runtime.agent())
         started, release = threading.Event(), threading.Event()
         loop_thread = threading.get_ident()
@@ -37,13 +37,17 @@ class ConcurrencyTests(unittest.IsolatedAsyncioTestCase):
 
         with patch('agents.library_tools', lambda fs: {'numpy': lambda *args: slow_numpy(fs, *args)}):
             running = asyncio.create_task(a.execute("print('start'); numpy('sum', [1])"))
+            queued = None
             try:
                 self.assertTrue(await asyncio.to_thread(started.wait, 5))
-                self.assertEqual(await asyncio.wait_for(b.execute('21 * 2'), 2), '42')
+                queued = asyncio.create_task(b.execute('21 * 2'))
+                await asyncio.sleep(.02)
+                self.assertFalse(queued.done())
                 self.assertFalse(running.done())
             finally:
                 release.set()
             self.assertEqual(await running, 'start\n7')
+            self.assertEqual(await queued, '42')
         self.assertTrue(observed)
         self.assertEqual(set(observed), {loop_thread})
 
@@ -178,8 +182,7 @@ class ConcurrencyTests(unittest.IsolatedAsyncioTestCase):
         with patch('agents.CodeAgent._evaluate', counted):
             results = await asyncio.gather(*[a.execute(f"n={a.id}; open('id','w').write(str(n)); n") for a in agents])
         self.assertEqual(results, [str(a.id) for a in agents])
-        self.assertGreater(peak, 1)
-        self.assertLessEqual(peak, self.runtime.workers)
+        self.assertEqual(peak, 1)  # One shared heap reservation, not 1 GiB per agent.
         self.assertTrue(all('_evaluation' not in a.__dict__ for a in agents))
         for a in agents[::100]:
             reopened = await self.runtime.agent(session_id=a.id)
