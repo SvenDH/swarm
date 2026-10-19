@@ -9,6 +9,11 @@ queries work, and agent-facing failures use normal Python exception names rather
 than interpreter-specific prefixes. This is still a supported Python subset,
 not a promise of full CPython compatibility.
 
+General allocation failures raise `MemoryError` with no message. NumPy allocation
+failures retain NumPy's standard requested-size, shape and dtype message, including
+preflight rejections. Internal session-budget/worker details are not exposed;
+other exception types and saved history are unchanged.
+
 `del` supports variable names (including multiple/unpacked targets), list/dict
 entries, list slices and pandas columns, including inside `exec()`. Name deletion
 releases the value and subsequent translated reads raise `NameError`; deletion
@@ -83,7 +88,13 @@ not stop agents. Reconnect with `--session ID`. `/new`, `/sessions`, `/use ID`,
 `--socket`; execution settings such as `--workers`, `--template` and
 `--context-chars` belong on the worker command.
 
-The worker resumes every unfinished session at startup, not just the session
+Press Escape during a REPL run to stop that session's worker task. The session
+stays paused across worker restarts and reconnects; use `/resume` (or submit a new
+prompt) to continue. Committed state is preserved. An in-flight native operation
+may need to settle before cancellation finishes. Arrow/function keys do not
+normally trigger a stop. Ordinary client disconnection still leaves work running.
+
+The worker resumes every unfinished, non-paused session at startup, not just the session
 selected in a REPL. Prompts are durably queued per session and run in order;
 different sessions share the runtime's concurrency limits. Model/infrastructure
 failures retry with backoff (up to 30 seconds); step budgets automatically yield
@@ -289,8 +300,10 @@ Additional optional adapters expose these common subsets:
   `indices`, `broadcast_to` and `bincount` check output sizes before allocation.
   Arithmetic/comparison/logical ufuncs include `add/subtract/multiply/divide` and
   `reduce/accumulate/reduceat/outer/at`. Indexed `at` updates persist through array
-  aliases and restarts. Output arrays (`out=`) and masked calls that would expose
-  uninitialized output are intentionally unsupported.
+  aliases and restarts. Keyword `out=` accepts authenticated array targets,
+  including views and masked ufunc calls with initialized outputs. Numeric dtype
+  aliases such as `np.float32` are callable constructors and valid dtype arguments.
+  `empty`/`empty_like` allocate initialized zeros to avoid exposing host memory.
 - `PIL.ImageOps`: flipping, color/grayscale adjustments, fit/pad/contain/cover and
   bounded borders. `PIL.ImageEnhance` exposes Brightness/Contrast/Color/Sharpness
   with checkpointed source-image snapshots. `PIL.ImageFilter` includes bounded
@@ -352,12 +365,13 @@ Native extensions are initialized there before Monty callback threads use them,
 including when reopening a checkpoint in a fresh process.
 
 This is intentionally not full NumPy/pandas/Python emulation: wildcard imports,
-package introspection/type checks, custom callbacks (`apply`), NumPy `out=`, `query`/`eval`,
+package introspection/type checks, custom callbacks (`apply`), `query`/`eval`,
 pickle IO and compatibility-object context managers are not supported. Imports
-inside dynamic `exec`/`eval` strings or separate Python modules are not translated.
+inside dynamic `exec` strings are translated; imports inside `eval` strings or
+separate Python modules are not supported.
 Names beginning `_library_` are reserved. Unsupported functions fail explicitly;
 there is no fallback to arbitrary host attributes or host filesystem access.
-Use dtype names such as `'float64'` and explicit/vectorized methods. There are
+Use numeric dtype constructors or names such as `'float64'`, and vectorized methods. There are
 no fixed element-count or pixel-count caps: each session gets a byte budget,
 50 MiB by default. Set the default for **new** sessions with:
 
@@ -376,7 +390,7 @@ sessions or checkpoints. The old ARRAY/IMAGE/MONTY size settings are removed.
 Monty enforces the budget across its live heap, including globals and serialized
 library descriptors. Copies, wrapper overhead and checkpointing need headroom;
 the sum of array `nbytes` is not all the memory required. Free unused variables
-with `x=None`, reuse buffers and prefer smaller dtypes or chunks. Wrapper
+with `del`, reuse buffers and prefer smaller dtypes or chunks. Wrapper
 allocation preflights use this same session budget, based on dtype/sample bytes,
 not arbitrary array/image dimensions. Context-local checks isolate concurrent
 sessions. Object dtypes remain prohibited; native shape constraints and iteration
@@ -388,6 +402,13 @@ buffers are outside Monty's heap accounting. Native preflights cover known
 allocation shapes, not every temporary. Concurrent sessions can therefore use
 more host memory than their interpreter heaps; use OS isolation/resource limits
 when hard memory enforcement is required.
+
+Direct library method calls use one authenticated bridge operation rather than
+separate lookup/call operations. Read-only array receivers use buffer views over
+validated NPY data instead of writable copies; mutations restore a writable copy.
+The NPY restore path avoids the extra `np.load`/stream-read payload copy. These
+changes reduce transient copying, but do not remove checkpoint headroom or make
+the configured byte budget equal to usable array payload size.
 
 Each Python checkout still permits 1,000 suspensions (external calls, lookups and
 virtual OS operations). The short system prompt simply asks the model to avoid

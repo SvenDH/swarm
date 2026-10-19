@@ -38,7 +38,7 @@ class MemoryTests(unittest.IsolatedAsyncioTestCase):
             code = 'import numpy as np; data=np.zeros(300000); data.nbytes'
             results = await asyncio.gather(small.execute(code), large.execute(code), return_exceptions=True)
             self.assertIsInstance(results[0], ExecutionError)
-            self.assertIn('session memory budget', str(results[0]))
+            self.assertIn('Unable to allocate', str(results[0]))
             self.assertEqual(results[1], '2400000')
             # More than a million elements is allowed when it fits in memory.
             self.assertEqual(await large.execute('data=None; a=np.zeros(1200000,dtype=np.uint8); a.nbytes'), '1200000')
@@ -55,7 +55,7 @@ class MemoryTests(unittest.IsolatedAsyncioTestCase):
         async with Runtime(self.database, memory_budget=64*MiB) as runtime:
             agent = await runtime.agent()
             self.assertEqual(await agent.execute("from PIL import Image; image=Image.new('RGB',(2100,2000)); image.size"), '(2100, 2000)')
-            with self.assertRaisesRegex(ExecutionError, 'session memory budget'):
+            with self.assertRaisesRegex(ExecutionError, '^MemoryError$'):
                 await agent.execute("Image.new('RGBA',(10000,10000))")
 
     async def test_worker_accepts_a_new_session_budget(self):

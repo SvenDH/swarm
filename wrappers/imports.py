@@ -18,6 +18,8 @@ def _library_name(name, value):
     if value is _library_deleted:
         raise NameError("name '" + name + "' is not defined")
     return value
+def _library_method(_lib_receiver, _lib_method_name, /, *args, **kwargs):
+    return _library_request(_lib_receiver, 'method', _lib_method_name, *args, **kwargs)
 def _library_delitem(value, key):
     if isinstance(value, _LibraryValue):
         return _library_request(value, 'delitem', key)
@@ -174,8 +176,8 @@ class LibrarySyntax(ast.NodeTransformer):
             keywords = [self.visit(item) for item in node.keywords]
             target = ast.Name(name, ast.Load())
             body = ast.IfExp(call('is_value', target),
-                ast.Call(ast.Name('_library_invoke', ast.Load()),
-                         [call('get', target, ast.Constant(node.func.attr)), *args], keywords),
+                ast.Call(ast.Name('_library_method', ast.Load()),
+                         [target, ast.Constant(node.func.attr), *args], keywords),
                 ast.Call(ast.Attribute(target, node.func.attr, ast.Load()), args, keywords))
             arguments = ast.arguments(posonlyargs=[], args=[ast.arg(name)],
                 vararg=None, kwonlyargs=[], kw_defaults=[], kwarg=None, defaults=[])

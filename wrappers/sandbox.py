@@ -70,6 +70,8 @@ def _library_request(_lib_receiver, _lib_action, *args, **kwargs):
         spec = response['argument_result']
         original = _library_find((args, kwargs), spec)
         if original is not None:
+            if original.path == spec['path']:
+                return original
             return _LibraryValue(original.root, spec['path'], spec['auth'])
     return _library_unpack(response.get('result'), value.root)
 

@@ -11,7 +11,7 @@ from pathlib import PurePath
 
 from .bridge import dispatch, backend
 from .registry import require
-from .limits import memory_scope
+from .limits import memory_scope, memory_errors
 
 
 def plain(value, depth=0):
@@ -131,6 +131,7 @@ class Bridge:
             return type(value)(self.result(item, root) for item in value)
         return value
 
+    @memory_errors
     def __call__(self, action, spec, path=(), args=(), kwargs=None, auth=None):
         with memory_scope(self.memory_budget):
             return self._call(action, spec, path, args, kwargs, auth)
@@ -148,7 +149,12 @@ class Bridge:
         args, kwargs = self.arguments(args, roots), self.arguments(kwargs or {}, roots)
         for module, identity in roots:
             self.initialize(module)
-        response = dispatch(self.fs, action, spec, path, args, kwargs)
+        if action == 'method':
+            if not args or type(args[0]) is not str:
+                raise TypeError('Expected a method name')
+            response = dispatch(self.fs, 'call', spec, [*path, ['attr', args[0]]], args[1:], kwargs)
+        else:
+            response = dispatch(self.fs, action, spec, path, args, kwargs)
         if 'state' in response:
             response['state'] = self.seal(response['state'], spec['identity'])
         if response.get('call'):

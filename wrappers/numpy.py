@@ -3,6 +3,7 @@ import io
 import math
 import json
 import operator
+from numpy._core._exceptions import _ArrayMemoryError
 
 from .bridge import descriptor
 from .files import source, save
@@ -12,6 +13,9 @@ from .common import Record, freeze, thaw
 
 # Initialize native FFT code on the Python import worker, not a Monty callback.
 np.fft.fft([0.0])
+SCALARS = {name: np.dtype(name).type for name in (
+    'bool', 'uint8', 'uint16', 'uint32', 'uint64', 'int8', 'int16', 'int32', 'int64',
+    'float16', 'float32', 'float64', 'complex64', 'complex128')}
 
 UFUNCS = {'add': np.add, 'subtract': np.subtract, 'multiply': np.multiply,
           'divide': np.divide, 'true_divide': np.true_divide, 'floor_divide': np.floor_divide,
@@ -56,11 +60,11 @@ class Ufunc:
 
 
 def ufunc_call(function, *args, **kwargs):
-    if len(args) != function.nin or kwargs.get('out') is not None:
-        raise ValueError('supply input arguments only; out arrays are not supported')
+    if len(args) != function.nin:
+        raise ValueError('supply input arguments using positional arguments')
     shapes = [np.shape(arg) for arg in args]
     if 'where' in kwargs:
-        if not np.all(kwargs['where']):
+        if kwargs.get('out') is None and not np.all(kwargs['where']):
             raise ValueError('masked ufunc calls without initialized out arrays are not supported')
         shapes.append(np.shape(kwargs['where']))
     dtype = numeric_dtype(*args, dtype=kwargs.get('dtype'))
@@ -136,8 +140,6 @@ def pad(value, pad_width, mode='constant', **kwargs):
 
 def take(value, indices, axis=None, out=None, mode='raise'):
     value = np.asarray(value)
-    if out is not None:
-        raise ValueError('out arrays are not supported')
     if axis is None:
         shape = np.shape(indices)
     else:
@@ -147,7 +149,7 @@ def take(value, indices, axis=None, out=None, mode='raise'):
         axis %= value.ndim
         shape = (*value.shape[:axis], *np.shape(indices), *value.shape[axis+1:])
     checked_size(shape, value.dtype)
-    return np.take(value, indices, axis=axis, mode=mode)
+    return np.take(value, indices, axis=axis, out=out, mode=mode)
 
 
 def machine_info(dtype, integer=False):
@@ -167,7 +169,10 @@ def checked_size(shape, dtype='float64'):
     dtype = np.dtype(dtype)
     if dtype.hasobject:
         raise ValueError('object dtype is not supported')
-    check_memory(count * max(1, dtype.itemsize))
+    try:
+        check_memory(count * max(1, dtype.itemsize))
+    except MemoryError:
+        raise _ArrayMemoryError(shape, dtype) from None
 
 
 def preflight_binary(name, left, right):
@@ -222,6 +227,14 @@ def bounded(factory):
                            args[0] if factory is not np.full and args else 'float64')
         checked_size(shape, dtype)
         return factory(shape, *args, **kwargs)
+    return create
+
+
+def bounded_like(factory):
+    def create(a, dtype=None, order='K', subok=True, shape=None, **kwargs):
+        value = np.asarray(a)
+        checked_size(value.shape if shape is None else shape, value.dtype if dtype is None else dtype)
+        return factory(value, dtype=dtype, order=order, subok=subok, shape=shape, **kwargs)
     return create
 
 
@@ -349,7 +362,8 @@ def exports(fs):
             'indices': indices, 'broadcast_to': broadcast_to,
             'digitize': np.digitize, 'searchsorted': np.searchsorted, 'argwhere': np.argwhere,
             'zeros': bounded(np.zeros), 'ones': bounded(np.ones), 'full': bounded(np.full),
-            'zeros_like': np.zeros_like, 'ones_like': np.ones_like, 'sum': np.sum,
+            'empty': bounded(np.zeros), 'empty_like': bounded_like(np.zeros_like),
+            'zeros_like': bounded_like(np.zeros_like), 'ones_like': bounded_like(np.ones_like), 'sum': np.sum,
             'mean': np.mean, 'median': np.median, 'min': np.min, 'max': np.max,
             'std': np.std, 'var': np.var, 'dot': dot, 'matmul': matmul,
             'reshape': np.reshape, 'transpose': np.transpose, 'tile': tile, 'repeat': repeat,
@@ -379,10 +393,7 @@ def exports(fs):
             'split': np.split, 'array_split': np.array_split,
             'round': np.round, 'dtype': np.dtype, 'load': load, 'save': write,
             'pi': np.pi, 'e': np.e, 'nan': np.nan, 'inf': np.inf,
-            'int32': 'int32', 'int64': 'int64', 'float32': 'float32', 'float64': 'float64',
-            **{name: name for name in ('uint8', 'uint16', 'uint32', 'uint64', 'int8', 'int16',
-                                       'float16', 'complex64', 'complex128')},
-            'bool_': 'bool', 'linalg': {'norm': np.linalg.norm, 'solve': np.linalg.solve,
+            **SCALARS, 'bool_': SCALARS['bool'], 'linalg': {'norm': np.linalg.norm, 'solve': np.linalg.solve,
                                       'inv': np.linalg.inv, 'det': np.linalg.det,
                                       'svd': np.linalg.svd, 'eig': np.linalg.eig, 'eigh': np.linalg.eigh,
                                       'eigvals': np.linalg.eigvals, 'eigvalsh': np.linalg.eigvalsh,
@@ -405,10 +416,8 @@ def members(value, fs, name=None):
         function = UFUNCS[value.name]
         def aggregate(method):
             def invoke(a, axis=0, dtype=None, out=None, *args, **kwargs):
-                if out is not None:
-                    raise ValueError('out arrays are not supported')
                 checked_size(np.shape(a), numeric_dtype(a, dtype=dtype))
-                return method(a, axis, dtype, None, *args, **kwargs)
+                return method(a, axis, dtype, out, *args, **kwargs)
             return invoke
         def outer(a, b, **kwargs):
             dtype = numeric_dtype(a, b, dtype=kwargs.get('dtype'))
@@ -496,6 +505,8 @@ def members(value, fs, name=None):
 
 
 def pack(value):
+    if isinstance(value, type) and value in SCALARS.values():
+        return descriptor('numpy', 'scalar_type', np.dtype(value).name)
     if isinstance(value, Record):
         return descriptor('numpy', 'record', freeze(value.fields))
     if isinstance(value, Ufunc):
@@ -515,7 +526,9 @@ def pack(value):
         return descriptor('numpy', 'scalar', value.item())
 
 
-def restore(kind, data):
+def restore(kind, data, *, copy=True):
+    if kind == 'scalar_type' and data in SCALARS:
+        return SCALARS[data]
     if kind == 'record':
         return Record(thaw(data))
     if kind == 'ufunc' and data in UFUNCS:
@@ -544,14 +557,19 @@ def restore(kind, data):
     else:
         raise ValueError('Only NPY versions 1 and 2 are supported')
     checked_size(shape, dtype)
-    result = np.load(io.BytesIO(data), allow_pickle=False)
-    if not isinstance(result, np.ndarray):
-        raise ValueError('invalid array')
-    return result
+    offset = stream.tell()
+    size = math.prod(shape) * dtype.itemsize
+    if len(data) - offset != size:
+        raise ValueError('invalid array payload size')
+    # Decode directly from the validated buffer, then make one writable copy.
+    # np.load(BytesIO(...)) otherwise adds stream/read-buffer copies per RPC.
+    result = np.ndarray(shape, dtype=dtype, buffer=data, offset=offset,
+                        order='F' if fortran else 'C')
+    return result.copy(order='K') if copy else result
 
 
 def is_view(value):
-    return isinstance(value, (np.ndarray, Ufunc))
+    return isinstance(value, (np.ndarray, Ufunc)) or (isinstance(value, type) and value in SCALARS.values())
 
 
 def is_grid(value):

@@ -41,7 +41,7 @@ from wrappers import tools as library_tools
 from wrappers.protocol import Bridge
 from wrappers.bridge import backend as library_backend
 from wrappers.imports import BOOTSTRAP, CHECK, DELETE_BOOTSTRAP, prepare as prepare_libraries
-from wrappers.limits import memory_bytes, memory_scope, check_memory
+from wrappers.limits import memory_bytes, memory_scope, check_memory, memory_message, memory_errors
 
 load_dotenv(override=True)
 
@@ -301,7 +301,8 @@ class Runtime:
         self.db.execute('PRAGMA synchronous=FULL')
         columns = [r[1] for r in self.db.execute('PRAGMA table_info(sessions)')]
         if columns and columns not in (['id', 'name', 'cwd', 'monty', 'messages'],
-                                      ['id', 'name', 'cwd', 'monty', 'messages', 'memory_budget']):
+                                      ['id', 'name', 'cwd', 'monty', 'messages', 'memory_budget'],
+                                      ['id', 'name', 'cwd', 'monty', 'messages', 'memory_budget', 'paused']):
             raise RuntimeError('unsupported database schema; choose a new database and workspace root')
         self.db.executescript('''
             CREATE TABLE IF NOT EXISTS sessions (
@@ -325,6 +326,8 @@ class Runtime:
         ''')
         if 'memory_budget' not in {row[1] for row in self.db.execute('PRAGMA table_info(sessions)')}:
             self.db.execute('ALTER TABLE sessions ADD COLUMN memory_budget INTEGER')
+        if 'paused' not in {row[1] for row in self.db.execute('PRAGMA table_info(sessions)')}:
+            self.db.execute('ALTER TABLE sessions ADD COLUMN paused INTEGER NOT NULL DEFAULT 0')
         self.db.execute('UPDATE sessions SET memory_budget=? WHERE memory_budget IS NULL', (self.memory_budget,))
         self.db.execute('INSERT OR IGNORE INTO runtime_secrets VALUES (1, ?)', (os.urandom(32),))
         self._library_key = self.db.execute('SELECT library_key FROM runtime_secrets WHERE id=1').fetchone()[0]
@@ -666,9 +669,13 @@ class CodeAgent:
                 fs, snapshot, output, stdout, images = await self._evaluate(request['code'], state, files)
             except MontyCrashedError:
                 raise  # Infrastructure failures/cancellation leave the request pending.
-            except (MontyError, SyntaxError, ImportError) as exc:
+            except (MontyError, SyntaxError, ImportError, MemoryError) as exc:
                 error = exc.exception() if isinstance(exc, MontyError) else exc
-                output = f'{type(error).__name__}: {error}'[:24000]
+                if isinstance(error, MemoryError):
+                    text = memory_message(error)
+                    output = 'MemoryError' + (f': {text}' if text else '')
+                else:
+                    output = f'{type(error).__name__}: {error}'[:24000]
                 await self.runtime.database_call(self._commit, request, output, True)
                 raise ExecutionError(output) from exc
             files = await self.runtime.offload(lambda: self._publish(fs.entries()))
@@ -693,6 +700,7 @@ class CodeAgent:
                          lambda module: self.runtime._io_executor.submit(library_backend, module).result(),
                          memory_budget=self.memory_budget)
         images = []
+        @memory_errors
         def display(value):
             from wrappers.display import preview
             from wrappers.limits import check_memory, memory_scope
@@ -700,6 +708,7 @@ class CodeAgent:
             with memory_scope(self.memory_budget):
                 check_memory(sum(map(len, images)) + len(data))
             images.append(data)
+        @memory_errors
         def prepare_exec(source):
             # Transform source, never execute it on the host. The builtin exec
             # stays in the caller's interpreter scope with the same IO/limits.
@@ -1005,6 +1014,7 @@ class Worker:
         self.retry_delay = retry_delay
         self._running, self._listeners, self._connections = {}, {}, set()
         self._dirty, self._closing = set(), False
+        self._paused = set()
         self._server = None
         self._guards = []
 
@@ -1042,16 +1052,18 @@ class Worker:
         await self._server.serve_forever()
 
     def _recover(self):
+        self._paused = {row[0] for row in self.runtime.db.execute('SELECT id FROM sessions WHERE paused=1')}
         # Histories/executions predate the inbox too; recover those once, without
         # creating an extra turn when an inbox entry already owns the session.
         self.runtime.db.execute('''INSERT INTO prompts(session_id)
-            SELECT id FROM sessions WHERE
+            SELECT id FROM sessions WHERE paused=0 AND
               (EXISTS (SELECT 1 FROM executions WHERE session_id=sessions.id AND output IS NULL)
                OR json_extract(messages,'$[#-1].role') IN ('user','tool')
                OR json_array_length(json_extract(messages,'$[#-1].tool_calls')) > 0)
               AND NOT EXISTS (SELECT 1 FROM prompts WHERE session_id=sessions.id AND result IS NULL)''')
         return [row[0] for row in self.runtime.db.execute(
-            'SELECT DISTINCT session_id FROM prompts WHERE result IS NULL')]
+            'SELECT DISTINCT session_id FROM prompts WHERE result IS NULL '
+            'AND session_id IN (SELECT id FROM sessions WHERE paused=0)')]
 
     def _broadcast(self, session_id, event):
         for queue in tuple(self._listeners.get(session_id, ())):
@@ -1087,15 +1099,32 @@ class Worker:
         def enqueue():
             if not self.runtime.db.execute('SELECT 1 FROM sessions WHERE id=?', (session_id,)).fetchone():
                 raise ValueError('unknown session')
+            self.runtime.db.execute('UPDATE sessions SET paused=0 WHERE id=?', (session_id,))
             pending = self._next(session_id) if prompt is None else None
             if prompt is None and pending:
                 return pending[0]
             return self.runtime.db.execute('INSERT INTO prompts(session_id,prompt) VALUES (?,?)',
                                             (session_id, prompt)).lastrowid
         try:
-            return await self.runtime.database_call(enqueue)
+            job_id = await self.runtime.database_call(enqueue)
+            self._paused.discard(session_id)
+            return job_id
         finally:
             self._schedule(session_id)  # Cancelled submissions can still have committed.
+
+    async def stop(self, session_id):
+        self._paused.add(session_id)
+        row = await self.runtime.database_call(self.runtime.db.execute,
+            'UPDATE sessions SET paused=1 WHERE id=?', (session_id,))
+        if not row.rowcount:
+            self._paused.discard(session_id)
+            raise ValueError('unknown session')
+        task = self._running.get(session_id)
+        if task is not None:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+        self._dirty.discard(session_id)
+        self._broadcast(session_id, {'stopped': True})
 
     async def _drive(self, session_id):
         agent = None
@@ -1141,7 +1170,7 @@ class Worker:
                 await agent.close()
 
     def _schedule(self, session_id):
-        if self._closing:
+        if self._closing or session_id in self._paused:
             return
         self._dirty.add(session_id)
         if session_id not in self._running:
@@ -1180,11 +1209,16 @@ class Worker:
                     await agent.close()
                 else:
                     row = await self.runtime.database_call(lambda: self.runtime.db.execute(
-                        'SELECT id,name FROM sessions WHERE id=?', (session_id,)).fetchone())
+                        'SELECT id,name,paused FROM sessions WHERE id=?', (session_id,)).fetchone())
                     if row is None:
                         raise ValueError('unknown session')
-                    info = dict(zip(('id', 'name'), row))
+                    info = dict(zip(('id', 'name'), row[:2]))
+                    if row[2]:
+                        info['paused'] = True
                 await send({'result': info})
+            elif action == 'stop':
+                await self.stop(session_id)
+                await send({'result': True})
             elif action == 'run':
                 queue = OutputBuffer()
                 self._listeners.setdefault(session_id, set()).add(queue)
@@ -1200,7 +1234,7 @@ class Worker:
                         if 'job' in event and event['job'] != job_id:
                             continue
                         await send(event)
-                        if 'result' in event or 'error' in event:
+                        if 'result' in event or 'error' in event or 'stopped' in event:
                             break
             else:
                 raise ValueError('unknown worker action')
@@ -1264,6 +1298,8 @@ class WorkerClient:
                     raise RuntimeError(response['error'])
                 elif 'result' in response:
                     return response['result']
+                elif response.get('stopped'):
+                    return None
             raise ConnectionError('worker disconnected; the turn can be resumed after restart')
         finally:
             writer.close()

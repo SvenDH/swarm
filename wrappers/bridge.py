@@ -89,7 +89,8 @@ def decode(value, cache=None, fs=None):
             if identity not in cache:
                 cache[identity] = backend(root['module']).restore(root['kind'], root['data'])
             result = resolve(cache[identity], value['path'], root['module'], fs, cache)
-            if callable(result):
+            if callable(result) and not (root['module'] == 'numpy' and
+                                           root['kind'] == 'scalar_type' and not value['path']):
                 raise TypeError('Native library callbacks cannot be passed as data')
             return result
         if set(value) == {'__library_slice__'}:
@@ -172,6 +173,10 @@ def dispatch(fs, action, spec, path=(), args=(), kwargs=None):
     stateful = module == 'matplotlib'
     if spec['kind'] == 'module':
         root = api.restore('module', spec['data']) if stateful and spec['data'] is not None else api.exports(fs)
+    elif module == 'numpy' and spec['kind'] == 'array':
+        writable = action in ('setitem', 'inplace') or (action == 'call' and
+            (kwargs.get('out') is not None or (path and path[-1][1] in MUTATING['numpy'])))
+        root = api.restore('array', spec['data'], copy=bool(writable))
     else:
         root = api.restore(spec['kind'], spec['data'])
     cache = {} if spec['kind'] == 'module' else {(module, spec['identity']): root}
@@ -203,9 +208,24 @@ def dispatch(fs, action, spec, path=(), args=(), kwargs=None):
     elif action == 'call':
         if not callable(value):
             raise TypeError('Library value is not callable')
-        if module in ('numpy', 'scipy') and kwargs.get('out') is not None:
+        if module == 'scipy' and kwargs.get('out') is not None:
             raise ValueError('out= is not supported; assign the returned array instead')
+        out = wire_kwargs.get('out')
+        if module == 'numpy' and out is not None:
+            if isinstance(out, tuple) and len(out) == 1:
+                out = out[0]
+            if (type(out) is not dict or '__library_value__' not in out or
+                    out['__library_value__']['module'] != 'numpy' or
+                    out['__library_value__']['kind'] != 'array'):
+                raise TypeError('out must reference an existing NumPy array')
+        if module == 'numpy' and isinstance(value, type) and value in api.SCALARS.values() and args:
+            api.checked_size(api.np.shape(args[0]), api.np.dtype(value))
         result = value(*args, **kwargs)
+        if module == 'numpy' and out is not None:
+            target = out['__library_value__']
+            return {'updates': [{'module': 'numpy', 'identity': target['identity'],
+                                 'data': api.pack(cache[('numpy', target['identity'])])['data']}],
+                    'argument_result': {'module': 'numpy', 'identity': target['identity'], 'path': out['path']}}
         if module == 'PIL' and spec['kind'] == 'module':
             for (owner, identity), obj in cache.items():
                 view = api.view(obj, result) if owner == module else None

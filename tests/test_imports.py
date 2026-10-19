@@ -253,7 +253,6 @@ Path('standard.txt').write_text('ok')
             "from numpy import *",
             "import numpy as np; np.zeros((1000000000,))",
             "import numpy as np; np.array([1],dtype='V999999999')",
-            "import numpy as np; array=np.array([1,2]); np.clip(array,0,1,out=array)",
         ]
         for snippet in snippets:
             with self.subTest(snippet=snippet), self.assertRaises(ExecutionError):
