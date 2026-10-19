@@ -8,6 +8,30 @@ from .registry import MODULES, ALIASES, require
 BOOTSTRAP = Path(__file__).with_name('sandbox.py').read_text()
 CHECK = 'try:\n    _library_modules\nexcept NameError:\n    _library_ready=None\nelse:\n    _library_ready=list(_library_modules)\n_library_ready'
 BUILTINS = frozenset(vars(builtins))
+DELETE_BOOTSTRAP = '''try:
+    _library_deleted
+except NameError:
+    class _LibraryDeleted:
+        pass
+    _library_deleted = _LibraryDeleted()
+def _library_name(name, value):
+    if value is _library_deleted:
+        raise NameError("name '" + name + "' is not defined")
+    return value
+def _library_delitem(value, key):
+    if isinstance(value, _LibraryValue):
+        return _library_request(value, 'delitem', key)
+    if isinstance(value, dict):
+        value.pop(key)
+    elif isinstance(value, list):
+        if isinstance(key, slice):
+            for index in sorted(list(range(len(value)))[key], reverse=True):
+                value.pop(index)
+        else:
+            value.pop(key)
+    else:
+        raise TypeError("object does not support item deletion")
+'''
 
 
 def call(name, *args):
@@ -50,6 +74,26 @@ class LibrarySyntax(ast.NodeTransformer):
     def __init__(self, tree):
         self.names = {node.id for node in ast.walk(tree) if isinstance(node, ast.Name)}
         self.counter = 0
+
+    def visit_Name(self, node):
+        if (isinstance(node.ctx, ast.Load) and node.id not in BUILTINS and
+                node.id != 'display' and not node.id.startswith(('_library_', '_prepare_exec'))):
+            return call('name', ast.Constant(node.id), node)
+        return node
+
+    def visit_Delete(self, node):
+        result = []
+        for target in node.targets:
+            if isinstance(target, (ast.Tuple, ast.List)):
+                result.extend(self.visit_Delete(ast.Delete(target.elts)))
+            elif isinstance(target, ast.Name):
+                result.extend([ast.Expr(call('name', ast.Constant(target.id), ast.Name(target.id, ast.Load()))),
+                    ast.Assign([ast.Name(target.id, ast.Store())], ast.Name('_library_deleted', ast.Load()))])
+            elif isinstance(target, ast.Subscript):
+                result.append(ast.Expr(call('delitem', self.visit(target.value), key(self.visit(target.slice)))))
+            else:
+                raise SyntaxError('attribute deletion is not supported')
+        return result
 
     def visit_Import(self, node):
         result = []
@@ -137,6 +181,9 @@ class LibrarySyntax(ast.NodeTransformer):
                 vararg=None, kwonlyargs=[], kw_defaults=[], kwarg=None, defaults=[])
             return ast.Call(ast.Lambda(arguments, body), [receiver], [])
         self.generic_visit(node)
+        if isinstance(node.func, ast.Name) and node.func.id == 'exec' and node.args:
+            node.args[0] = ast.Call(ast.Name('_prepare_exec', ast.Load()), [node.args[0]], [])
+            return node
         if isinstance(node.func, ast.Name) and node.func.id == 'display':
             node.args = [call('pack', arg) for arg in node.args]
             return node
@@ -165,6 +212,8 @@ def prepare(source, active=False, loaded=()):
             backend(name)
     tree = ast.parse(source)
     active = active or any(
+        isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == 'exec' or
+        isinstance(node, ast.Delete) or
         isinstance(node, ast.Import) and any(alias.name.split('.')[0] in (*MODULES, *ALIASES) for alias in node.names) or
         isinstance(node, ast.ImportFrom) and node.module and node.module.split('.')[0] in (*MODULES, *ALIASES)
         for node in ast.walk(tree))

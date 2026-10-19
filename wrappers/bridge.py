@@ -2,6 +2,7 @@
 import operator
 from importlib import import_module
 from functools import lru_cache
+from importlib.metadata import version
 from itertools import islice
 from datetime import date, time, timedelta
 from .registry import MODULES, REQUIRES, require
@@ -102,11 +103,15 @@ def decode(value, cache=None, fs=None):
 
 
 def member(value, name, module, fs):
+    if name == '__version__' and type(value) is dict:
+        distribution = {'PIL': 'Pillow', 'docx': 'python-docx', 'pptx': 'python-pptx',
+                        'bs4': 'beautifulsoup4', 'sklearn': 'scikit-learn'}.get(module, module)
+        return version(distribution)
     if name.startswith('_'):
-        raise AttributeError('Private library attributes are not exposed')
+        raise AttributeError(f"module '{module}' has no attribute '{name}'")
     members = value if type(value) is dict else backend(module).members(value, fs, name)
     if name not in members:
-        raise AttributeError(f'{module}.{type(value).__name__}.{name} is not supported by the wrappers')
+        raise AttributeError(f"'{module}' object has no attribute '{name}'")
     return members[name]
 
 
@@ -234,6 +239,11 @@ def dispatch(fs, action, spec, path=(), args=(), kwargs=None):
             api.validate(args[1])
         value[args[0]] = args[1]
         result = None
+    elif action == 'delitem':
+        if module != 'pandas' or spec['kind'] == 'module':
+            raise TypeError('object does not support item deletion')
+        operator.delitem(value, args[0])
+        result = None
     elif action == 'setattr':
         api.assign(value, args[0], args[1])
         result = None
@@ -283,7 +293,7 @@ def dispatch(fs, action, spec, path=(), args=(), kwargs=None):
         if target is not None and target['module'] == 'numpy':
             obj = cache[('numpy', target['identity'])]
             response['updates'] = [{'module': 'numpy', 'identity': target['identity'], 'data': api.pack(obj)['data']}]
-    changed = action in ('setitem', 'setattr', 'inplace') or (
+    changed = action in ('setitem', 'delitem', 'setattr', 'inplace') or (
         action == 'call' and (kwargs.get('inplace', False) or (path and path[-1][1] in MUTATING.get(module, set())) or module not in MUTATING))
     if (spec['kind'] != 'module' and changed) or stateful:
         response['state'] = api.pack(root)

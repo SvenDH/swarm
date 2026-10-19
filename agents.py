@@ -40,7 +40,7 @@ from names import num_to_name
 from wrappers import tools as library_tools
 from wrappers.protocol import Bridge
 from wrappers.bridge import backend as library_backend
-from wrappers.imports import BOOTSTRAP, CHECK, prepare as prepare_libraries
+from wrappers.imports import BOOTSTRAP, CHECK, DELETE_BOOTSTRAP, prepare as prepare_libraries
 from wrappers.limits import memory_bytes, memory_scope, check_memory
 
 load_dotenv(override=True)
@@ -63,7 +63,7 @@ HELP = """Use the python tool to work with code and files. Variables and files p
 between successful calls; failed calls roll back. Your working directory is
 /home/<your-name>/. Avoid too many library calls per code block; prefer vectorized operations or
 split work across blocks. Stay within your memory budget and release unused
-large variables with x=None. Use print for observations; keep output concise.
+large variables with del. Use print for observations; keep output concise.
 Reuse code in Python files via exec(). Use display(image_or_path) to inspect images.
 Keep durable preferences and lessons in your home MEMORY.md using Python file IO;
 keep it brief, correct stale notes, and never store api secrets.
@@ -667,7 +667,8 @@ class CodeAgent:
             except MontyCrashedError:
                 raise  # Infrastructure failures/cancellation leave the request pending.
             except (MontyError, SyntaxError, ImportError) as exc:
-                output = f'{type(exc).__name__}: {exc}'[:24000]
+                error = exc.exception() if isinstance(exc, MontyError) else exc
+                output = f'{type(error).__name__}: {error}'[:24000]
                 await self.runtime.database_call(self._commit, request, output, True)
                 raise ExecutionError(output) from exc
             files = await self.runtime.offload(lambda: self._publish(fs.entries()))
@@ -699,7 +700,16 @@ class CodeAgent:
             with memory_scope(self.memory_budget):
                 check_memory(sum(map(len, images)) + len(data))
             images.append(data)
-        functions = {**library_tools(fs), '_library_rpc': bridge, 'display': display}
+        def prepare_exec(source):
+            # Transform source, never execute it on the host. The builtin exec
+            # stays in the caller's interpreter scope with the same IO/limits.
+            if not isinstance(source, (str, bytes)):
+                raise TypeError('exec() arg 1 must be a string or bytes')
+            if len(source) > self.memory_budget:
+                raise MemoryError('source exceeds the session memory budget')
+            return self.runtime._io_executor.submit(prepare_libraries, source, True).result()[0]
+        functions = {**library_tools(fs), '_library_rpc': bridge, 'display': display,
+                     '_prepare_exec': prepare_exec}
         # AsyncMonty runs synchronous OS/library callbacks on its worker threads.
         # Keep these synchronous so sandbox callers need not write `await numpy(...)`.
         async with self.runtime._pool.checkout(limits={'max_memory': self.memory_budget,
@@ -713,6 +723,8 @@ class CodeAgent:
             code, libraries = await self.runtime.offload(prepare_libraries, code, active, loaded or ())
             if libraries and not active:
                 await session.feed_run(BOOTSTRAP, external_lookup=functions, print_callback=lambda *args: None)
+            if libraries:
+                await session.feed_run(DELETE_BOOTSTRAP, external_lookup=functions, print_callback=lambda *args: None)
             printed, byte_count = [], 0
             def capture(stream, text):
                 nonlocal byte_count

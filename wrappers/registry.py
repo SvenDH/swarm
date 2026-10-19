@@ -23,4 +23,4 @@ def available():
 
 def require(name):
     if name not in available():
-        raise ImportError(f'{name} is not available: install its host package and dependencies first')
+        raise ImportError(f"No module named '{name}'")

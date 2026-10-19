@@ -1,5 +1,21 @@
 # Monty agents
 
+Reusable code can live in session files and run with `exec(open("script.py").read())`.
+Dynamic `exec()` source, including nested calls, receives the same import and
+library-operation translation as top-level code. Execution remains in the
+interpreter with the same caller scope, filesystem isolation, resource limits,
+and atomic rollback; source is never executed by host Python. NumPy/PIL version
+queries work, and agent-facing failures use normal Python exception names rather
+than interpreter-specific prefixes. This is still a supported Python subset,
+not a promise of full CPython compatibility.
+
+`del` supports variable names (including multiple/unpacked targets), list/dict
+entries, list slices and pandas columns, including inside `exec()`. Name deletion
+releases the value and subsequent translated reads raise `NameError`; deletion
+state survives restart and participates in atomic rollback. Internally names use
+a checkpoint-safe deleted marker rather than native symbol-table removal; this
+is not full CPython namespace introspection. Attribute deletion is not supported.
+
 Agents can inspect images with `display(...)` inside the Python tool:
 
 ```python

@@ -43,7 +43,7 @@ PURE = '''allclose array_equal array_equiv atleast_1d atleast_2d atleast_3d broa
 def numeric_dtype(*values, dtype=None):
     result = np.dtype(dtype) if dtype is not None else np.result_type(*[np.asarray(value).dtype for value in values])
     if result.kind not in 'buifcmM':
-        raise ValueError('ufunc wrappers support numeric and datetime dtypes only')
+        raise ValueError('ufuncs support numeric and datetime dtypes only')
     return result
 
 

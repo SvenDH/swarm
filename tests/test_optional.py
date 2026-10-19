@@ -22,7 +22,7 @@ class AvailabilityTests(unittest.TestCase):
                 self.assertEqual(tools(None), {})
                 for source in ('import numpy', 'import matplotlib.pyplot as plt',
                                'from bs4 import BeautifulSoup', 'import fitz'):
-                    with self.subTest(source=source), self.assertRaisesRegex(ImportError, 'host package'):
+                    with self.subTest(source=source), self.assertRaisesRegex(ImportError, 'No module named'):
                         prepare(source)
         finally:
             registry.available.cache_clear()
@@ -58,7 +58,7 @@ class OptionalTests(unittest.IsolatedAsyncioTestCase):
         try:
             with patch.object(registry, 'find_spec', return_value=None):
                 self.assertEqual(await self.agent.execute("open('plain.txt','w').write('works'); open('plain.txt').read()"), "'works'")
-                with self.assertRaisesRegex(ExecutionError, 'host package'):
+                with self.assertRaisesRegex(ExecutionError, 'No module named'):
                     await self.agent.execute('import numpy')
                 self.assertEqual(await self.agent.execute('2+3'), '5')
         finally:
