@@ -3,6 +3,7 @@ import numpy as np
 from sklearn import preprocessing, model_selection, metrics, linear_model, cluster, decomposition
 from .bridge import descriptor
 from .common import freeze, thaw, view, iterate, assign
+from .api import select
 
 FACTORIES = {
     'StandardScaler': preprocessing.StandardScaler, 'MinMaxScaler': preprocessing.MinMaxScaler,
@@ -74,9 +75,18 @@ def exports(fs):
         kwargs.setdefault('random_state', 0)
         return model_selection.train_test_split(*arrays, **kwargs)
     return {'preprocessing': {**{name: factory(name) for name in ('StandardScaler', 'MinMaxScaler', 'LabelEncoder', 'OneHotEncoder')},
+                              **select(vars(preprocessing), 'robust_scale minmax_scale maxabs_scale binarize label_binarize'),
                               'normalize': preprocessing.normalize, 'scale': preprocessing.scale},
             'model_selection': {'train_test_split': split},
-            'metrics': {'accuracy_score': metrics.accuracy_score, 'precision_score': metrics.precision_score,
+            'metrics': {**select(vars(metrics), '''balanced_accuracy_score roc_auc_score roc_curve auc
+                        precision_recall_curve average_precision_score log_loss brier_score_loss
+                        matthews_corrcoef cohen_kappa_score hamming_loss zero_one_loss jaccard_score
+                        fbeta_score precision_recall_fscore_support multilabel_confusion_matrix
+                        median_absolute_error mean_absolute_percentage_error explained_variance_score
+                        max_error mean_squared_log_error adjusted_rand_score adjusted_mutual_info_score
+                        normalized_mutual_info_score homogeneity_score completeness_score v_measure_score
+                        silhouette_score calinski_harabasz_score davies_bouldin_score'''),
+                        'accuracy_score': metrics.accuracy_score, 'precision_score': metrics.precision_score,
                         'recall_score': metrics.recall_score, 'f1_score': metrics.f1_score,
                         'mean_squared_error': metrics.mean_squared_error, 'mean_absolute_error': metrics.mean_absolute_error,
                         'r2_score': metrics.r2_score, 'confusion_matrix': metrics.confusion_matrix,

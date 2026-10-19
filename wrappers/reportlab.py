@@ -7,6 +7,7 @@ from PIL import Image
 from .bridge import descriptor
 from .common import record, thaw, view, iterate, assign
 from .files import source
+from .pil import checked_size
 
 FONTS = {'Courier', 'Courier-Bold', 'Courier-Oblique', 'Courier-BoldOblique',
          'Helvetica', 'Helvetica-Bold', 'Helvetica-Oblique', 'Helvetica-BoldOblique',
@@ -20,12 +21,17 @@ class Canvas:
 
 def exports(fs):
     return {'pdfgen': {'canvas': {'Canvas': lambda filename, pagesize=pagesizes.A4: Canvas(str(filename), pagesize)}},
-            'lib': {'pagesizes': {'A4': pagesizes.A4, 'letter': pagesizes.letter,
+            'lib': {'pagesizes': {**{name: value for name, value in vars(pagesizes).items()
+                                     if not name.startswith('_') and type(value) is tuple and len(value) == 2
+                                     and all(type(item) in (int, float) for item in value)},
+                                  'A4': pagesizes.A4, 'letter': pagesizes.letter,
                                   'A3': pagesizes.A3, 'landscape': pagesizes.landscape, 'portrait': pagesizes.portrait},
-                    'units': {'inch': 72, 'cm': 72 / 2.54, 'mm': 72 / 25.4},
-                    'colors': {name: rgba for name, rgba in (
+                    'units': {'inch': 72, 'cm': 72 / 2.54, 'mm': 72 / 25.4, 'pica': 12},
+                    'colors': {**{name: tuple(color.rgb()) for name, color in colors.getAllNamedColors().items()},
+                        'HexColor': lambda value: tuple(colors.HexColor(value).rgb()),
+                        **{name: rgba for name, rgba in (
                         ('black', (0, 0, 0)), ('white', (1, 1, 1)), ('red', (1, 0, 0)),
-                        ('green', (0, .5, 0)), ('blue', (0, 0, 1)), ('gray', (.5, .5, .5)))}}}
+                        ('green', (0, .5, 0)), ('blue', (0, 0, 1)), ('gray', (.5, .5, .5)))}}}}
 
 
 def functions(canvas):
@@ -37,6 +43,12 @@ def functions(canvas):
             'translate': canvas.translate, 'scale': canvas.scale, 'rotate': canvas.rotate,
             'saveState': canvas.saveState, 'restoreState': canvas.restoreState,
             'setTitle': canvas.setTitle, 'setAuthor': canvas.setAuthor,
+            'roundRect': canvas.roundRect, 'bezier': canvas.bezier, 'arc': canvas.arc, 'wedge': canvas.wedge,
+            'lines': canvas.lines, 'grid': canvas.grid, 'setDash': canvas.setDash,
+            'setLineCap': canvas.setLineCap, 'setLineJoin': canvas.setLineJoin,
+            'setMiterLimit': canvas.setMiterLimit, 'setFillAlpha': canvas.setFillAlpha,
+            'setStrokeAlpha': canvas.setStrokeAlpha, 'setCreator': canvas.setCreator,
+            'setSubject': canvas.setSubject, 'setKeywords': canvas.setKeywords,
             'setPageSize': canvas.setPageSize}
 
 
@@ -53,8 +65,7 @@ def write(value, fs):
         args, kwargs = thaw(args), thaw(kwargs)
         if name == 'drawImage':
             image = Image.open(io.BytesIO(args[0]), formats=['PNG', 'JPEG', 'GIF', 'WEBP', 'TIFF', 'BMP', 'ICO'])
-            if image.width * image.height > 4_000_000:
-                raise ValueError('Images are limited to 4,000,000 pixels')
+            checked_size(image.size, image.mode)
             image.load()
             canvas.drawImage(ImageReader(image), *args[1:], **kwargs)
         else:
@@ -75,6 +86,8 @@ def members(value, fs, name=None):
                'setFillColorRGB', 'setStrokeColorRGB', 'setLineWidth', 'line', 'rect',
                'circle', 'ellipse', 'showPage', 'translate', 'scale', 'rotate',
                'saveState', 'restoreState', 'setTitle', 'setAuthor', 'setPageSize')
+    methods += ('roundRect', 'bezier', 'arc', 'wedge', 'lines', 'grid', 'setDash', 'setLineCap',
+                'setLineJoin', 'setMiterLimit', 'setFillAlpha', 'setStrokeAlpha', 'setCreator', 'setSubject', 'setKeywords')
     return {**{method: (lambda *a, _method=method, **kw: draw(value, _method, a, kw)) for method in methods},
             'setFillColor': lambda color: draw(value, 'setFillColorRGB', tuple(color), {}),
             'setStrokeColor': lambda color: draw(value, 'setStrokeColorRGB', tuple(color), {}),

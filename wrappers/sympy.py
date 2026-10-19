@@ -4,6 +4,9 @@ from fractions import Fraction
 from keyword import iskeyword
 from .bridge import descriptor
 from .common import is_view, view, iterate, assign
+from .api import select
+from .limits import check_memory
+import operator
 
 CONSTRUCTORS = {name: value for name, value in (
     ('Symbol', sp.Symbol), ('Integer', sp.Integer), ('Float', sp.Float),
@@ -12,6 +15,14 @@ CONSTRUCTORS = {name: value for name, value in (
     ('Abs', sp.Abs), ('Equality', sp.Eq), ('Unequality', sp.Ne),
     ('StrictLessThan', sp.Lt), ('LessThan', sp.Le), ('StrictGreaterThan', sp.Gt),
     ('GreaterThan', sp.Ge), ('Tuple', sp.Tuple))}
+ELEMENTARY = select(vars(sp), '''asin acos atan atan2 sinh cosh tanh asinh acosh atanh
+    sign floor ceiling conjugate re im arg factorial binomial gamma loggamma erf erfc Min Max''')
+CONSTRUCTORS.update(ELEMENTARY)
+SETS = select(vars(sp), 'FiniteSet Interval Union Intersection Complement Contains And Or Not')
+CONSTRUCTORS.update(SETS)
+CONSTANTS = {'pi': sp.pi, 'E': sp.E, 'I': sp.I, 'oo': sp.oo, '-oo': -sp.oo,
+             'EulerGamma': sp.EulerGamma, 'Catalan': sp.Catalan, 'GoldenRatio': sp.GoldenRatio,
+             'zoo': sp.zoo, 'nan': sp.nan, 'EmptySet': sp.EmptySet, 'UniversalSet': sp.UniversalSet}
 
 
 def validate(value, depth=0):
@@ -70,8 +81,26 @@ def number(factory, *args, **kwargs):
     return factory(*args, **kwargs)
 
 
+def matrix_factory(function):
+    def invoke(rows, cols=None):
+        rows, cols = operator.index(rows), operator.index(rows if cols is None else cols)
+        if min(rows, cols) < 0:
+            raise ValueError('symbolic matrix dimensions must be nonnegative')
+        check_memory(rows * cols * 64)  # Conservative minimum per symbolic cell.
+        return function(rows, cols)
+    return invoke
+
+
 def exports(fs):
     return {'Symbol': lambda name, **kw: named(sp.Symbol, name, **kw),
+            **CONSTANTS, 'true': sp.true, 'false': sp.false,
+            **{name: checked(function) for name, function in SETS.items()},
+            **{name: checked(function) for name, function in ELEMENTARY.items()},
+            'zeros': matrix_factory(sp.zeros), 'ones': matrix_factory(sp.ones), 'eye': matrix_factory(sp.eye),
+            **{name: checked(function) for name, function in select(vars(sp), '''cancel together apart
+                collect trigsimp expand_trig powsimp powdenest radsimp rational_interpolate
+                resultant discriminant gcd lcm div rem quo invert det trace
+                linear_eq_to_matrix linsolve''').items()},
             'symbols': lambda names, **kw: named(sp.symbols, names, **kw),
             'Integer': lambda *a, **kw: number(sp.Integer, *a, **kw),
             'Float': lambda *a, **kw: number(sp.Float, *a, **kw),
@@ -87,6 +116,10 @@ def exports(fs):
 def members(value, fs, name=None):
     if isinstance(value, sp.MatrixBase):
         return {'shape': value.shape, 'T': value.T, 'det': value.det, 'inv': value.inv,
+                'rows': value.rows, 'cols': value.cols, 'rank': checked(value.rank), 'trace': value.trace,
+                'transpose': value.transpose, 'rref': checked(value.rref), 'nullspace': checked(value.nullspace),
+                'columnspace': checked(value.columnspace), 'LUsolve': checked(value.LUsolve),
+                'eigenvects': checked(value.eigenvects),
                 'tolist': value.tolist, 'eigenvals': checked(value.eigenvals)}
     if isinstance(value, sp.Basic):
         return {'free_symbols': list(value.free_symbols), 'args': value.args,
@@ -100,7 +133,7 @@ def members(value, fs, name=None):
 def tree(value):
     if value in (sp.true, sp.false):
         return ['bool', bool(value)]
-    constants = {sp.pi: 'pi', sp.E: 'E', sp.I: 'I', sp.oo: 'oo', -sp.oo: '-oo'}
+    constants = {value: name for name, value in CONSTANTS.items()}
     if value in constants:
         return ['constant', constants[value]]
     if isinstance(value, sp.Symbol):
@@ -128,7 +161,7 @@ def untree(data, depth=0):
     if name == 'constant':
         if len(data) != 2 or type(data[1]) is not str:
             raise ValueError('Invalid symbolic constant')
-        return {'pi': sp.pi, 'E': sp.E, 'I': sp.I, 'oo': sp.oo, '-oo': -sp.oo}[data[1]]
+        return CONSTANTS[data[1]]
     if len(data) != 3 or type(data[1]) not in (list, tuple):
         raise ValueError('Invalid symbolic tree arguments')
     args, options = data[1:]

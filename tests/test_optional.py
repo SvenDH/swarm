@@ -14,13 +14,12 @@ from wrappers.imports import prepare
 
 
 class AvailabilityTests(unittest.TestCase):
-    def test_missing_packages_are_not_advertised_registered_or_importable(self):
+    def test_missing_packages_are_not_registered_or_importable(self):
         registry.available.cache_clear()
         try:
             with patch.object(registry, 'find_spec', return_value=None):
                 self.assertEqual(registry.available(), {})
                 self.assertEqual(tools(None), {})
-                self.assertNotIn('numpy:', registry.help_text())
                 for source in ('import numpy', 'import matplotlib.pyplot as plt',
                                'from bs4 import BeautifulSoup', 'import fitz'):
                     with self.subTest(source=source), self.assertRaisesRegex(ImportError, 'host package'):

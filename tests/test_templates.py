@@ -67,9 +67,10 @@ class TemplateTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(agent.id, 0)
 
     async def test_oversized_file_is_rejected_before_creation(self):
+        self.runtime.memory_budget = 1024**2
         with (self.template / 'huge').open('wb') as file:
-            file.truncate(32 * 1024**2 + 1)
-        with self.assertRaisesRegex(ValueError, '32 MiB'):
+            file.truncate(1024**2 + 1)
+        with self.assertRaisesRegex(MemoryError, 'memory budget'):
             await self.runtime.agent()
         count = await self.runtime.database_call(lambda: self.runtime.db.execute('SELECT COUNT(*) FROM sessions').fetchone()[0])
         self.assertEqual(count, 0)

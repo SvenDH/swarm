@@ -1,11 +1,77 @@
 # Monty agents
 
-`uv run main.py` starts the async REPL. Configure `LLM_API_KEY`, `LLM_BASE_URL`
-and `LLM_MODEL` in the environment or `.env`. Reopen with `--session ID`;
-unfinished work continues automatically. `/new`, `/sessions`, `/use ID`,
-`/resume` and `/quit` are available in the REPL.
+Each agent can keep durable preferences, corrections and reusable lessons in
+`/home/<name>/MEMORY.md`, editing it with the existing Python file tools. No
+extra service or memory database is required. Notes use the same atomic commits,
+rollback, isolated storage and restart recovery as other files. Delete or edit
+the file to forget or correct a memory; new sessions do not share notes. Seed
+`template/MEMORY.md` if every new session should start with initial notes.
 
-Share one runtime across agents:
+Before each normal model request, committed notes are reloaded as reference data
+(not system instructions), outside conversation history. This keeps them fresh
+after tool calls, compaction and restart without accumulating duplicate messages.
+Automatic previews are limited to 8,000 characters; files over 32 KiB receive a
+read-file notice instead. Longer details can live in other files linked from
+MEMORY.md and be read on demand. Keep notes concise, verify stale facts, and do
+not save secrets. Memory writing is agent-directed, not a guaranteed automatic
+post-turn extraction step.
+
+This deliberately small design borrows bounded notes from
+[Hermes](https://hermes-agent.nousresearch.com/docs/user-guide/features/memory/)
+and file-based progressive disclosure from
+[SandboxAgent](https://openai.github.io/openai-agents-js/guides/sandbox-agents/memory/).
+[DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness/blob/master/docs/user/guide/mcp-memory.md)
+also documents optional external memory integrations; those services are not
+needed here.
+
+Run the worker and REPL in one process:
+
+```sh
+uv run main.py --with-worker
+```
+
+In this mode `/quit` also shuts down the worker; unfinished work resumes on
+the next start. Other REPL clients can connect while this process is running.
+
+Or start the session worker, then connect from another terminal:
+
+```sh
+uv run main.py --worker
+uv run main.py
+```
+
+Configure `LLM_API_KEY`, `LLM_BASE_URL` and `LLM_MODEL` on the worker, in the
+environment or `.env`. With a separate worker, `/quit` or disconnecting does
+not stop agents. Reconnect with `--session ID`. `/new`, `/sessions`, `/use ID`,
+`/resume` and `/quit` are available. Both commands accept `--database` and
+`--socket`; execution settings such as `--workers`, `--template` and
+`--context-chars` belong on the worker command.
+
+The worker resumes every unfinished session at startup, not just the session
+selected in a REPL. Prompts are durably queued per session and run in order;
+different sessions share the runtime's concurrency limits. Model/infrastructure
+failures retry with backoff (up to 30 seconds); step budgets automatically yield
+and continue. Recovered completed turns are not submitted again. Streaming output
+is live, not an event archive; reconnecting observes remaining output and the
+saved final answer.
+
+Provider-supplied `reasoning_content` or `reasoning` text deltas stream into a
+separate dimmed, magenta-bordered Reasoning panel. This is live display only,
+not conversation history or a replay log; providers that do not expose these
+fields produce no reasoning panel. Hidden reasoning is not requested or inferred.
+
+After the startup recovery scan, submissions wake only their own session; there
+is no inbox polling or global rescan per completed prompt. Idle sessions retain
+no runner task. The REPL renders streamed panels at its refresh rate, not once
+per token.
+
+Exactly one worker may own a database/socket. The local Unix socket is restricted
+to its owner (`0600`); it is a trusted local interface, not a network API. Restart
+the worker to recover after a crash. Run it under a service manager if it should
+restart automatically when the process dies. Multiple REPL clients are supported,
+but multiple execution-worker processes for one database are not.
+
+For embedded execution (without the worker service), share one runtime across agents:
 
 ```python
 import asyncio
@@ -24,7 +90,26 @@ continues an interrupted turn. `execute(code)` runs code without a model request
 `state()`, `files()`, `read_file(path)` and `sessions()` are also awaitable.
 `await CodeAgent.open(...)` is convenient for one agent; close it with
 `await agent.close()`. Use one shared `Runtime` per database for concurrent agents.
-Multi-process hosting is not supported.
+Do not open an embedded runtime against a database owned by a worker.
+
+Programmatic worker clients use `WorkerClient(database).request('agent')`,
+`request('sessions')` and `request('run', session_id=id, prompt='...')`.
+Pass `on_output(kind, text)` to receive streamed blocks. `Worker(...)` is an async
+context manager for embedding the service; `await worker.serve()` hosts it.
+
+Sessions automatically summarize older conversation history before model requests
+once its serialized text reaches 120,000 characters. Recent messages and complete
+tool-call/result batches are retained; earlier summaries are folded into the next
+one. Configure `Runtime(..., context_chars=120_000)` or `--context-chars` on the worker;
+use `context_chars=None` to disable it. This is a soft character threshold, not an
+exact model token limit; unusually large individual messages can still exceed a
+provider's context window.
+
+Summaries stream in a **Context memory** panel and replace old messages atomically
+in SQLite. A failed/interrupted summary leaves the original history available for
+retry; a committed summary survives restart. Python globals, files and pending
+executions are unchanged. Summarization is lossy: the original conversation prefix
+is replaced, not archived.
 
 Use Python's `open()` and `pathlib.Path` for virtual filesystem operations.
 There are no direct `pwd`, `cd`, `ls`, `mkdir`, `read`, `write`, `edit`, `glob`,
@@ -37,6 +122,7 @@ There is no event log or replay layer. SQLite stores only:
 - `sessions`: the latest interpreter checkpoint, working directory and conversation.
 - `files`: current paths and immutable storage keys, not file contents.
 - `executions`: pending commands and their results, allowing safe retries.
+- `prompts`: the worker's durable inbox, started state, final answers and retry errors.
 - `runtime_secrets`: one host-only key used to authenticate library state across restarts.
 
 A command is saved before execution. Its interpreter checkpoint, file links and
@@ -45,6 +131,12 @@ files/globals; interrupted infrastructure leaves a pending command to retry.
 Use `execution_id` with `execute()` when retrying an explicit command; model tool
 IDs are deduplicated automatically. Incomplete model streams are never executed.
 Model requests can repeat after a crash.
+
+The inbox entry is marked started in the same transaction that appends its user
+message. After restart, a started entry resumes existing history instead of
+appending the prompt again, including a crash between saving the final assistant
+message and saving the inbox result. The inbox table is created automatically
+for existing checkpoint databases.
 
 File objects are durably published before the database commit. Visible directories
 under `workspaces/<name>/` are disposable copies, repaired when a session reopens.
@@ -65,7 +157,8 @@ Files in `session_template/` are copied into `/home/<name>/` for each new sessio
 Nested/empty directories, hidden files and binary files are supported. Existing
 sessions never consult the source again. Change the source with `--template PATH`
 or `Runtime(..., template=PATH)`; use an empty directory for no starter files.
-Symlinks/special files are rejected and individual files are limited to 32 MiB.
+Symlinks/special files are rejected. Starter files must fit the session's
+configured memory budget.
 
 The runtime shares one SQLite connection, HTTP client, bounded Monty pool and IO
 workers. Histories/checkpoints load only when admitted, not for every waiting
@@ -114,21 +207,74 @@ filtering, groupby/aggregation, file conversion and document editing are exposed
 through explicit allowlists in the corresponding files under `wrappers/`.
 `np.random.default_rng(seed)` creates an independently checkpointed generator.
 
+Coverage is expanded explicitly, never by forwarding arbitrary public native
+attributes. `wrappers/api.py` selects reviewed names and converts document enum
+constants to plain integers; unavailable names are omitted for older host versions.
+This is not an assertion that every unexposed API is unsafe: some require a new
+virtual-IO, aliasing or durable-state adapter before they can be supported.
+
+Expanded data-only APIs include:
+
+- NumPy numeric trigonometric/hyperbolic/bitwise ufuncs, sets, bounded `pad` and
+  `take`, machine limits (`finfo/iinfo`) and additional checkpointed RNG distributions.
+- pandas pivots/melting/crosstabs, categoricals, date/timedelta indexes, `str`/`dt`
+  accessors, cumulative statistics and deterministic sampling. Pivot reducers use
+  an allowlist, not arbitrary method names such as `to_pickle` or `eval`.
+- Pillow image enums, `ImageColor`, `ImageChops`, compositing, histogram/pixel
+  helpers and checkpointed `ImageFont.load_default(size=...)`. Fonts remain
+  embedded-only: no `truetype` host font lookup or arbitrary font objects.
+- SciPy numeric `special` ufuncs, physical constants, more distributions,
+  `ndimage` filters/morphology/zoom, linear algebra, signal functions/windows.
+  Ufunc `out` arguments and uninitialized masked output remain blocked.
+- Matplotlib named colors, `cm.<name>(values)`, additional axes styling and
+  figure legends; Seaborn categorical/regression/ECDF plots, despine and palettes.
+- openpyxl styles/number formats, docx/pptx integer enum namespaces and length
+  units, PDF transformations/constants/search, ReportLab named colors/page sizes
+  and drawing helpers, HTML traversal and XlsxWriter cell/range utilities.
+- More sklearn numeric metrics and preprocessing, and SymPy typed elementary
+  functions, constants, sets, linear solving and matrix methods. Symbolic string
+  evaluation, code generation and arbitrary native constructors remain blocked.
+
+The explicit export/member maps in each adapter are the source of truth, not
+the complete API documentation of the host library. Optional packages are still
+loaded only when installed. Restart the worker after changing wrappers.
+
 Additional optional adapters expose these common subsets:
 
 - `numpy`: bounded `tile/repeat/eye/diag/meshgrid`, reshaping and live array views,
   cumulative and NaN-aware reductions, quantiles, histograms, interpolation,
   comparisons and linear algebra (SVD, QR, eigenvalues, Cholesky, least squares).
+  `numpy.fft` includes bounded `fft/ifft/rfft/irfft`, frequencies and shifts.
+  `mgrid/ogrid` accept integer, floating-point and complex-step slice syntax;
+  `indices`, `broadcast_to` and `bincount` check output sizes before allocation.
+  Arithmetic/comparison/logical ufuncs include `add/subtract/multiply/divide` and
+  `reduce/accumulate/reduceat/outer/at`. Indexed `at` updates persist through array
+  aliases and restarts. Output arrays (`out=`) and masked calls that would expose
+  uninitialized output are intentionally unsupported.
+- `PIL.ImageOps`: flipping, color/grayscale adjustments, fit/pad/contain/cover and
+  bounded borders. `PIL.ImageEnhance` exposes Brightness/Contrast/Color/Sharpness
+  with checkpointed source-image snapshots. `PIL.ImageFilter` includes bounded
+  Gaussian/box blur, median/min/max/mode filters and common fixed filters.
+  `PIL.ImageDraw.Draw(image)` supports shapes, lines, text and text measurements.
+  Drawing contexts remain linked to their original image across restarts and
+  failed executions roll back drawings. Text uses the embedded default font;
+  host font files are unavailable, and font/stroke sizes and text masks are bounded.
 - `matplotlib.pyplot`: `figure/subplots`, line/scatter/bar/histogram/image plots,
   step/stairs/stack/contour plots, spans, text/annotations, axes styling,
   figure labels/layout and PNG/SVG/PDF `savefig`. Plot calls record commands;
   native artist handles and global styles are not exposed.
+  `matplotlib.colors` supports RGB/RGBA/hex and RGB/HSV conversions.
+  `matplotlib.use('Agg')` is accepted without changing host-global settings;
+  `get_backend()` returns `Agg`. GUI/custom backends are not exposed.
 - `seaborn`: `scatterplot`, `lineplot`, `histplot`, `boxplot`, `barplot`,
   `heatmap`, `violinplot`, `kdeplot`. Pass `ax=` to draw into an existing figure;
   otherwise save through the returned axes' `.figure.savefig(...)`.
 - `scipy`: distributions and statistical tests, linear algebra, signal/FFT,
   interpolation, linear programming, assignment and distances; ranks, spread,
   normality tests and `special` functions (softmax, sigmoid, gamma, erf).
+  `scipy.integrate` supports sampled-data trapezoid/Simpson integration and their
+  cumulative variants (not callback-based quadrature). `scipy.spatial.transform`
+  exposes checkpointed `Rotation` constructors, conversions, apply and inverse.
   No Python callbacks.
 - `pptx`: presentations, layouts/slides, text boxes, paragraphs/runs/fonts,
   tables and pictures; `pptx.util.Inches/Cm/Pt` and virtual `save`.
@@ -171,10 +317,49 @@ pickle IO and compatibility-object context managers are not supported. Imports
 inside dynamic `exec`/`eval` strings or separate Python modules are not translated.
 Names beginning `_library_` are reserved. Unsupported functions fail explicitly;
 there is no fallback to arbitrary host attributes or host filesystem access.
-Use dtype names such as `'float64'` and explicit/vectorized methods. Arrays are
-limited to 1,000,000 elements/32 MiB, images to 4,000,000 pixels and library
-iteration to 10,000 items. Native-library work remains outside Monty's resource
-accounting; these wrappers are not a separate OS-level resource sandbox.
+Use dtype names such as `'float64'` and explicit/vectorized methods. There are
+no fixed element-count or pixel-count caps: each session gets a byte budget,
+50 MiB by default. Set the default for **new** sessions with:
+
+```sh
+uv run main.py --with-worker --memory-mb 512
+```
+
+Or set `SWARM_MEMORY_BYTES=536870912` in the worker environment/`.env`.
+Embedded callers can use `Runtime(..., memory_budget=512 * 1024**2)` and override
+individual new sessions with `await runtime.agent(memory_budget=128 * 1024**2)`.
+`WorkerClient.request('agent', memory_budget=...)` also accepts bytes for a new
+session. Budgets are saved in SQLite and survive restarts; reopening an existing
+session retains its budget. Existing databases gain this field without losing
+sessions or checkpoints. The old ARRAY/IMAGE/MONTY size settings are removed.
+
+Monty enforces the budget across its live heap, including globals and serialized
+library descriptors. Copies, wrapper overhead and checkpointing need headroom;
+the sum of array `nbytes` is not all the memory required. Free unused variables
+with `x=None`, reuse buffers and prefer smaller dtypes or chunks. Wrapper
+allocation preflights use this same session budget, based on dtype/sample bytes,
+not arbitrary array/image dimensions. Context-local checks isolate concurrent
+sessions. Object dtypes remain prohibited; native shape constraints and iteration
+limits remain in place.
+
+This is **not a hard process RSS quota**. Native extension scratch allocations,
+Python-side decoding/serialization, shared package caches and virtual-filesystem
+buffers are outside Monty's heap accounting. Native preflights cover known
+allocation shapes, not every temporary. Concurrent sessions can therefore use
+more host memory than their interpreter heaps; use OS isolation/resource limits
+when hard memory enforcement is required.
+
+Each Python checkout still permits 1,000 suspensions (external calls, lookups and
+virtual OS operations). The short system prompt simply asks the model to avoid
+too many library calls per code block, prefer vectorized operations, or split
+work across blocks; it does not describe the suspension mechanism or counts.
+
+NumPy supports `uint8` and other numeric dtype aliases, ellipsis indexing,
+`nbytes` and `tobytes()`. PIL exposes resampling constants, `merge`, `split`,
+`getchannel` and `putalpha`. Matplotlib exposes bounded `fig.add_axes` and
+compression/quality-only `savefig(pil_kwargs=...)`. Monty does not support `del`
+or `import gc`; use `value = None` to release references, and
+`sorted(paths, key=str)` to order virtual paths.
 
 ## Native-library boundary
 

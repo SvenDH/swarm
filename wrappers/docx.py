@@ -4,7 +4,9 @@ from docx.text.paragraph import Paragraph
 from docx.text.run import Run
 from docx.text.font import Font
 from docx.table import Table, _Cell, _Row
-from docx.shared import Inches, Cm, Pt
+from docx.shared import Inches, Cm, Mm, Pt, Emu, Twips, RGBColor
+from docx.enum import text, table, section, style, shape
+from .api import enums
 from docx.shape import InlineShape
 import io
 
@@ -25,8 +27,10 @@ def run(fs, op, path, paragraphs=None):
 
 def exports(fs):
     return {'Document': lambda docx=None: Document() if docx is None else Document(source(fs, docx)),
-            'shared': {'Inches': Inches, 'Cm': Cm, 'Pt': Pt},
-            'enum': {'text': {'WD_ALIGN_PARAGRAPH': {'LEFT': 0, 'CENTER': 1, 'RIGHT': 2, 'JUSTIFY': 3}}}}
+            'shared': {'Inches': Inches, 'Cm': Cm, 'Mm': Mm, 'Pt': Pt, 'Emu': Emu, 'Twips': Twips,
+                       'RGBColor': lambda r, g, b: tuple(RGBColor(r, g, b))},
+            'enum': {name: enums(module) for name, module in (
+                ('text', text), ('table', table), ('section', section), ('style', style), ('shape', shape))}}
 
 
 def members(value, fs, name=None):

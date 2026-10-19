@@ -1,7 +1,7 @@
-"""Example: LLM_API_KEY=... uv run main.py (or configure LLM_BASE_URL)."""
+"""Connect a REPL to a worker, or host both with --with-worker."""
 import argparse
 import asyncio
-from agents import Runtime
+from agents import Worker, WorkerClient
 from rich.console import Console
 from rich.live import Live
 from rich.markdown import Markdown
@@ -20,27 +20,28 @@ class ReplOutput:
     def panel(self):
         dark = self.kind in ('python', 'stdout', 'result')
         background = '#11161d'
-        title = {'assistant': 'Assistant', 'python': 'Python', 'stdout': 'Output · pending commit',
-                 'result': 'Result', 'error': 'Error'}[self.kind]
+        title = {'assistant': 'Assistant', 'reasoning': 'Reasoning', 'python': 'Python', 'stdout': 'Output · pending commit',
+                 'result': 'Result', 'error': 'Error', 'compaction': 'Context memory'}[self.kind]
         if self.kind == 'python':
             body = Syntax(self.text, 'python', theme='monokai', background_color=background, word_wrap=True)
-        elif self.kind == 'assistant':
-            body = Markdown(self.text)
+        elif self.kind in ('assistant', 'compaction', 'reasoning'):
+            body = Markdown(self.text, style='dim' if self.kind == 'reasoning' else 'none')
         else:
             content = self.text or ('Completed' if self.kind == 'result' else '')
             body = Text(content, style='#b8c0cc' if dark else 'red')
         return Panel(body, title=title, title_align='left', padding=(0, 1),
                      style=f'on {background}' if dark else '',
-                     border_style='#30363d' if dark else 'red' if self.kind == 'error' else 'cyan')
+                     border_style=('#30363d' if dark else 'red' if self.kind == 'error'
+                                   else 'magenta' if self.kind == 'reasoning' else 'cyan'))
 
     def __call__(self, kind, text):
         if kind != self.kind or self.live is None:
             self.finish()
             self.kind, self.text = kind, ''
-            self.live = Live(console=self.console, refresh_per_second=15, vertical_overflow='visible')
+            self.live = Live(get_renderable=self.panel, console=self.console,
+                             refresh_per_second=15, vertical_overflow='visible')
             self.live.start(refresh=False)
         self.text += text
-        self.live.update(self.panel())
 
     def finish(self):
         if self.live is not None:
@@ -54,17 +55,38 @@ class ReplOutput:
 
 async def main():
     parser = argparse.ArgumentParser()
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument('--worker', action='store_true', help='run the session worker instead of the REPL')
+    mode.add_argument('--with-worker', action='store_true', help='run the worker and REPL in this process')
+    parser.add_argument('--socket', help='local worker socket (defaults to DATABASE.sock)')
     parser.add_argument('--session', type=int, help='reopen a saved session ID')
     parser.add_argument('--database', default='agent.db')
     parser.add_argument('--workspaces')
     parser.add_argument('--template', help='starter files copied into each new agent home')
     parser.add_argument('--workers', type=int, default=4, help='shared Monty workers in this host process')
     parser.add_argument('--model-concurrency', type=int, default=128)
+    parser.add_argument('--context-chars', type=int, default=120_000, help='conversation compaction threshold')
+    parser.add_argument('--memory-mb', type=int, help='memory budget per new session in MiB (default: 50)')
     args = parser.parse_args()
+    if args.worker or args.with_worker:
+        async with Worker(args.database, socket=args.socket, workspaces=args.workspaces,
+                          workers=args.workers, model_concurrency=args.model_concurrency,
+                          template=args.template, context_chars=args.context_chars,
+                          memory_budget=None if args.memory_mb is None else args.memory_mb * 1024**2) as worker:
+            print(f'Monty worker listening on {worker.socket}', flush=True)
+            if args.with_worker:
+                await repl(args)
+            else:
+                await worker.serve()
+        return
+    await repl(args)
+
+
+async def repl(args):
     output = ReplOutput()
-    async with Runtime(args.database, workspaces=args.workspaces, workers=args.workers,
-                       model_concurrency=args.model_concurrency, template=args.template) as runtime:
-        agent = await runtime.agent(session_id=args.session, on_output=output)
+    client = WorkerClient(args.database, socket=args.socket, on_output=output)
+    try:
+        agent = await client.request('agent', session_id=args.session)
         print('Monty agent — /new, /sessions, /use ID, /resume, /quit')
         resume = args.session is not None
         try:
@@ -72,26 +94,24 @@ async def main():
                 try:
                     if resume:
                         resume = False
-                        output.reset()
-                        await agent.run()
-                        output.finish()
-                    prompt = (await asyncio.to_thread(input, f'{agent.id}:{agent.name}> ')).strip()
+                        prompt = '/resume'
+                    else:
+                        prompt = (await asyncio.to_thread(input, f"{agent['id']}:{agent['name']}> ")).strip()
                     if prompt == '/quit':
                         break
                     if prompt == '/sessions':
-                        for session in await agent.sessions():
-                            print(f"{session['id']}: {session['name']} — {session['workspace']}")
+                        for session in await client.request('sessions'):
+                            print(f"{session['id']}: {session['name']}")
                         continue
                     if prompt == '/new' or prompt.startswith('/use '):
-                        replacement = await runtime.agent(on_output=output,
+                        agent = await client.request('agent',
                             session_id=None if prompt == '/new' else int(prompt.split()[1]))
-                        await agent.close()
-                        agent = replacement
                         resume = True
                         continue
                     if prompt:
                         output.reset()
-                        answer = await agent.run(None if prompt == '/resume' else prompt)
+                        answer = await client.request('run', session_id=agent['id'],
+                                                      prompt=None if prompt == '/resume' else prompt)
                         if output.kind is None:
                             output('assistant', answer)
                         output.finish()
@@ -102,7 +122,8 @@ async def main():
                     output.finish()
         finally:
             output.finish()
-            await agent.close()
+    except (FileNotFoundError, ConnectionRefusedError):
+        output.console.print(f'Worker is not running. Start: uv run main.py --worker --database {args.database}')
 
 
 if __name__ == '__main__':

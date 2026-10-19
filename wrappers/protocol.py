@@ -11,6 +11,7 @@ from pathlib import PurePath
 
 from .bridge import dispatch, backend
 from .registry import require
+from .limits import memory_scope
 
 
 def plain(value, depth=0):
@@ -25,7 +26,7 @@ def plain(value, depth=0):
         return type(value)(plain(item, depth + 1) for item in value)
     if type(value) is dict:
         return {plain(key, depth + 1): plain(item, depth + 1) for key, item in value.items()}
-    raise TypeError('Native arguments must be plain data or authenticated library references')
+    raise TypeError(f'Native arguments must be plain data or authenticated library references; received {type(value).__name__}')
 
 
 def fingerprint(value, depth=0):
@@ -68,8 +69,9 @@ def fingerprint(value, depth=0):
 
 
 class Bridge:
-    def __init__(self, fs, key, load=backend):
+    def __init__(self, fs, key, load=backend, memory_budget=None):
         self.fs, self.key, self.load = fs, key, load
+        self.memory_budget = memory_budget
         self.loaded = set()
 
     def initialize(self, module):
@@ -130,6 +132,10 @@ class Bridge:
         return value
 
     def __call__(self, action, spec, path=(), args=(), kwargs=None, auth=None):
+        with memory_scope(self.memory_budget):
+            return self._call(action, spec, path, args, kwargs, auth)
+
+    def _call(self, action, spec, path, args, kwargs, auth):
         if action == 'import':
             if type(spec) is not str:
                 raise ValueError('Expected a library name')

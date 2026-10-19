@@ -1,6 +1,8 @@
 """XlsxWriter recipes use in-memory ZIPs; never native temp/host file paths."""
 import io
 import xlsxwriter as xlsx
+from xlsxwriter import utility
+from .api import select
 from .bridge import descriptor
 from .common import record, thaw, view, iterate, assign
 from .files import source
@@ -32,7 +34,9 @@ def exports(fs):
         if options:
             raise ValueError('Workbook options are fixed: in_memory, no automatic formulas/URLs')
         return Workbook(str(filename))
-    return {'Workbook': create}
+    return {'Workbook': create, 'utility': select(vars(utility), '''xl_rowcol_to_cell xl_col_to_name
+        xl_range xl_range_abs xl_cell_to_rowcol xl_cell_to_rowcol_abs xl_range_formula
+        xl_rowcol_to_cell_fast cell_autofit_width xl_pixel_width''')}
 
 
 def ref(value):

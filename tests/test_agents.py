@@ -17,7 +17,7 @@ from openai import AsyncOpenAI
 import main as repl
 from wrappers.registry import available
 
-from agents import CodeAgent, DirectoryStorage, ExecutionError, Unix, code_prefix
+from agents import CodeAgent, DirectoryStorage, ExecutionError, Unix, Worker, code_prefix
 from main import ReplOutput
 from rich.console import Console
 from names import num_to_name
@@ -169,7 +169,12 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
         self.agent.on_output = record
 
         def first_response():
-            packet = sse({'role': 'assistant', 'content': 'Let me calculate.'})
+            yield sse({'role': 'assistant', 'reasoning_content': 'Check the '})
+            self.assertIn(('reasoning', 'Check the '), observed)
+            yield sse({'reasoning': 'calculation.'})
+            yield sse({'reasoning': ' Ready.', 'reasoning_content': ' Ready.'})
+            self.assertEqual(''.join(t for k, t in observed if k == 'reasoning'), 'Check the calculation. Ready.')
+            packet = sse({'content': 'Let me calculate.'})
             yield b': heartbeat\n\n' + packet[:9]
             yield packet[9:]
             self.assertIn(('assistant', 'Let me calculate.'), observed)
@@ -189,6 +194,16 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
         def respond(request):
             body = json.loads(request.content)
             self.assertTrue(body['stream'])
+            system = body['messages'][0]['content']
+            self.assertNotIn('Available optional libraries', system)
+            self.assertNotIn('numpy', system.lower())
+            self.assertNotIn('pandas', system.lower())
+            for implementation_detail in ('monty', 'virtual', 'sandbox', 'wrapper', 'fake'):
+                self.assertNotIn(implementation_detail, system.lower())
+                self.assertNotIn(implementation_detail, json.dumps(body['tools']).lower())
+            self.assertNotIn('suspension', system.lower())
+            self.assertIn('too many library calls per code block', system)
+            self.assertIn('session memory budget', system)
             requests.append(body)
             if len(requests) == 2:
                 self.assertEqual(body['messages'][-1]['content'], 'hé😀\n42')
@@ -205,6 +220,8 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(''.join(t for k, t in observed if k == 'result'), '42')
         self.assertEqual(''.join(t for k, t in observed if k == 'assistant'),
                          'Let me calculate.Done.')
+        self.assertFalse(any('reasoning' in m or 'reasoning_content' in m
+                             for m in self.agent._state.messages))
 
     async def test_incomplete_model_stream_never_records_or_executes_partial_code(self):
         observed = []
@@ -274,8 +291,10 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
         with patch('sys.argv', ['main.py', '--database', self.tmp.name + '/repl.db',
                                 '--workspaces', self.tmp.name + '/repl-workspaces']), \
              patch('builtins.input', side_effect=['calculate', '/quit']), \
-             patch('agents.AsyncOpenAI', return_value=model_client(client)), redirect_stdout(output):
-            await repl.main()
+             redirect_stdout(output):
+            async with Worker(self.tmp.name + '/repl.db', client=model_client(client),
+                              workspaces=self.tmp.name + '/repl-workspaces'):
+                await repl.main()
         transcript = output.getvalue()
         self.assertIn('Assistant', transcript)
         self.assertIn('Calculating.', transcript)
@@ -306,6 +325,23 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
         output('error', 'second error')
         output.finish()
         self.assertIn('second error', buffer.getvalue())
+        output('compaction', 'Saved continuation memory')
+        self.assertEqual(output.panel().title, 'Context memory')
+        output.finish()
+        output('reasoning', 'Checking the calculation')
+        self.assertEqual(output.panel().title, 'Reasoning')
+        self.assertEqual(output.panel().border_style, 'magenta')
+        output.finish()
+        self.assertIn('Checking the calculation', buffer.getvalue())
+
+    async def test_rich_does_not_build_a_panel_for_every_token(self):
+        output = ReplOutput(Console(file=io.StringIO()))
+        with patch.object(output, 'panel', wraps=output.panel) as panel, patch('main.Live') as live:
+            for _ in range(1000):
+                output('assistant', 'token ')
+            panel.assert_not_called()
+            self.assertIs(live.call_args.kwargs['get_renderable'], panel)
+            output.finish()
 
     async def test_isolated_sessions_and_disk_files(self):
         await self.agent.execute("open('/a','w').write('first'); x=1")
@@ -451,7 +487,7 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((workspace / self.agent.home.lstrip('/') / 'version.txt').read_text(), 'new')
         self.assertEqual(await self.agent.execute('n'), '2')
         tables = {r[0] for r in self.agent.db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
-        self.assertEqual(tables, {'sessions', 'files', 'executions', 'runtime_secrets'})
+        self.assertEqual(tables, {'sessions', 'files', 'executions', 'runtime_secrets', 'prompts'})
 
     async def test_execution_ids_are_idempotent(self):
         await self.agent.execute('n=0')
@@ -486,8 +522,9 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
         output = io.StringIO()
         with patch('sys.argv', ['main.py', '--database', self.path, '--session', str(self.session_id)]), \
              patch('builtins.input', side_effect=['/quit']), \
-             patch('agents.AsyncOpenAI', return_value=model_client(client)), redirect_stdout(output):
-            await repl.main()
+             redirect_stdout(output):
+            async with Worker(self.path, client=model_client(client)):
+                await repl.main()
         self.assertIn('Continued automatically.', output.getvalue())
         self.agent = await CodeAgent.open(self.path, session_id=self.session_id)
         self.assertIsNone((await self.agent.state()).pending)

@@ -8,7 +8,9 @@ from pptx.shapes.placeholder import SlidePlaceholder
 from pptx.shapes.graphfrm import GraphicFrame
 from pptx.text.text import TextFrame, _Paragraph, _Run, Font
 from pptx.table import Table, _Cell
-from pptx.util import Inches, Cm, Pt
+from pptx.util import Inches, Cm, Mm, Pt, Emu, Centipoints
+from pptx.enum import text, shapes, chart, dml, action, lang
+from .api import enums
 from pptx.dml.color import RGBColor, ColorFormat
 from .bridge import descriptor
 from .files import source, save
@@ -17,10 +19,11 @@ from .common import iterate
 
 def exports(fs):
     return {'Presentation': lambda path=None: Presentation(None if path is None else source(fs, path)),
-            'util': {'Inches': Inches, 'Cm': Cm, 'Pt': Pt},
+            'util': {'Inches': Inches, 'Cm': Cm, 'Mm': Mm, 'Pt': Pt, 'Emu': Emu, 'Centipoints': Centipoints},
             'dml': {'color': {'RGBColor': lambda r, g, b: tuple(RGBColor(r, g, b))}},
-            'enum': {'text': {'PP_ALIGN': {'LEFT': 1, 'CENTER': 2, 'RIGHT': 3}},
-                     'shapes': {'MSO_SHAPE': {'RECTANGLE': 1, 'OVAL': 9}}}}
+            'enum': {name: enums(module) for name, module in (
+                ('text', text), ('shapes', shapes), ('chart', chart), ('dml', dml),
+                ('action', action), ('lang', lang))}}
 
 
 def members(value, fs, name=None):

@@ -14,6 +14,9 @@ wheels/
 *.db-shm
 *.db-wal
 
+agent.sock*
+agent.worker*
+
 .env*
 
 workspaces/

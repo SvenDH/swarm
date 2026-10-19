@@ -15,10 +15,18 @@ def call(name, *args):
 
 
 def key(node):
+    if isinstance(node, ast.Constant) and node.value is Ellipsis:
+        return ast.Dict([ast.Constant('__library_ellipsis__')], [ast.Constant(True)])
     if isinstance(node, ast.Slice):
-        return ast.Call(ast.Name('slice', ast.Load()),
-                        [node.lower or ast.Constant(None), node.upper or ast.Constant(None),
-                         node.step or ast.Constant(None)], [])
+        # Monty's slice constructor rejects floats/complex steps used by NumPy
+        # grids. Keep ordinary slices native; send extended ones as wire data.
+        # The lambda evaluates each bound once and works with old checkpoints.
+        factory = ast.parse(
+            "lambda a,b,c: slice(a,b,c) if "
+            "(a is None or isinstance(a,int)) and (b is None or isinstance(b,int)) and "
+            "(c is None or isinstance(c,int)) else {'__library_slice__':[a,b,c]}", mode='eval').body
+        return ast.Call(factory, [node.lower or ast.Constant(None), node.upper or ast.Constant(None),
+                                  node.step or ast.Constant(None)], [])
     if isinstance(node, ast.Tuple):
         return ast.Tuple([key(item) for item in node.elts], ast.Load())
     return node
@@ -74,6 +82,8 @@ class LibrarySyntax(ast.NodeTransformer):
         self.generic_visit(node)
         if len(node.targets) == 1:
             target = node.targets[0]
+            if isinstance(target, (ast.Tuple, ast.List)):
+                node.value = call('iter', node.value)
             if isinstance(target, ast.Subscript):
                 return ast.Expr(call('setitem', target.value, key(target.slice), node.value))
             if isinstance(target, ast.Attribute):

@@ -76,11 +76,11 @@ df.groupby('g')['y'].sum().to_dict()
         self.assertEqual(await self.agent.execute('(tiled.tolist(),tiled.dtype.name)'), "([[1, 2], [1, 2]], 'int32')")
         from wrappers.numpy import tile
         with patch('wrappers.numpy.np.tile', side_effect=AssertionError('allocation reached')):
-            for reps in (1_000_001, (1_000_001,0), -1, 1.5):
-                with self.subTest(reps=reps), self.assertRaises((ValueError, TypeError)):
+            for reps in (1_000_000_001, (1_000_000_001,0), -1, 1.5):
+                with self.subTest(reps=reps), self.assertRaises((ValueError, TypeError, MemoryError)):
                     tile([1,2], reps)
         with self.assertRaises(ExecutionError):
-            await self.agent.execute('np.tile([1,2],1000001)')
+            await self.agent.execute('np.tile([1,2],1000000001)')
 
     async def test_pillow_images_mutate_persist_and_save(self):
         self.assertEqual(await self.agent.execute('''
@@ -119,14 +119,15 @@ gx, gy = np.meshgrid([1,2],[3,4])
 
     async def test_extended_numpy_preflights_allocations(self):
         from wrappers.numpy import repeat, eye, diag, meshgrid, histogram
+        from wrappers.limits import memory_scope
         cases = [('repeat', repeat, ([1,2], 1_000_000)),
                  ('eye', eye, (2000,)), ('diag', diag, ([1], 1_000_000)),
                  ('meshgrid', meshgrid, (list(range(1001)), list(range(1001)))),
                  ('histogram', histogram, ([1,2], 10_000_000))]
         for name, function, args in cases:
-            with self.subTest(name=name), patch('wrappers.numpy.np.' + name,
+            with memory_scope(8 * 1024**2), self.subTest(name=name), patch('wrappers.numpy.np.' + name,
                     side_effect=AssertionError('native allocation reached')):
-                with self.assertRaises(ValueError):
+                with self.assertRaises(MemoryError):
                     function(*args)
 
     async def test_workbook_sheet_cell_views_and_iteration(self):

@@ -1,4 +1,4 @@
-from pypdf import PdfReader, PdfWriter
+from pypdf import PdfReader, PdfWriter, Transformation
 from pypdf._page import PageObject
 import io
 
@@ -24,7 +24,8 @@ def exports(fs):
         if clone_from is None:
             return PdfWriter()
         return PdfWriter(clone_from=clone_from if isinstance(clone_from, PdfReader) else source(fs, clone_from))
-    return {'PdfReader': lambda stream, **kwargs: PdfReader(source(fs, stream), **kwargs),
+    return {'Transformation': Transformation,
+            'PdfReader': lambda stream, **kwargs: PdfReader(source(fs, stream), **kwargs),
             'PdfWriter': writer}
 
 
@@ -40,11 +41,18 @@ def members(value, fs, name=None):
                 'is_encrypted': value.is_encrypted, 'decrypt': value.decrypt}
     if isinstance(value, PageObject):
         return {'extract_text': value.extract_text, 'rotate': value.rotate,
+                'rotation': value.rotation, 'mediabox': tuple(value.mediabox), 'cropbox': tuple(value.cropbox),
+                'scale': value.scale, 'scale_by': value.scale_by, 'add_transformation': value.add_transformation,
                 'scale_to': value.scale_to, 'merge_page': value.merge_page}
+    if isinstance(value, Transformation):
+        return {'ctm': value.ctm, 'matrix': value.matrix, 'translate': value.translate,
+                'scale': value.scale, 'rotate': value.rotate, 'apply_on': value.apply_on}
     return {}
 
 
 def pack(value):
+    if isinstance(value, Transformation):
+        return descriptor('pypdf', 'transformation', value.ctm)
     if isinstance(value, (PdfReader, PdfWriter)):
         output = io.BytesIO()
         writer = value if isinstance(value, PdfWriter) else PdfWriter(clone_from=value)
@@ -57,6 +65,8 @@ def pack(value):
 
 
 def restore(kind, data):
+    if kind == 'transformation':
+        return Transformation(tuple(data))
     if kind == 'reader':
         return PdfReader(io.BytesIO(data))
     if kind == 'writer':

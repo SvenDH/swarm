@@ -6,16 +6,196 @@ import operator
 
 from .bridge import descriptor
 from .files import source, save
+from .limits import check_memory
+from .api import select
+from .common import Record, freeze, thaw
+
+# Initialize native FFT code on the Python import worker, not a Monty callback.
+np.fft.fft([0.0])
+
+UFUNCS = {'add': np.add, 'subtract': np.subtract, 'multiply': np.multiply,
+          'divide': np.divide, 'true_divide': np.true_divide, 'floor_divide': np.floor_divide,
+          'power': np.power, 'remainder': np.remainder, 'mod': np.mod,
+          'negative': np.negative, 'positive': np.positive, 'square': np.square,
+          'absolute': np.absolute, 'equal': np.equal, 'not_equal': np.not_equal,
+          'less': np.less, 'less_equal': np.less_equal, 'greater': np.greater,
+          'greater_equal': np.greater_equal, 'bitwise_and': np.bitwise_and,
+          'bitwise_or': np.bitwise_or, 'bitwise_xor': np.bitwise_xor,
+          'bitwise_not': np.bitwise_not, 'hypot': np.hypot,
+          'maximum': np.maximum, 'minimum': np.minimum,
+          'logical_and': np.logical_and, 'logical_or': np.logical_or, 'logical_not': np.logical_not,
+          'sqrt': np.sqrt, 'exp': np.exp, 'log': np.log, 'sin': np.sin, 'cos': np.cos}
+UFUNCS.update(select(vars(np), '''arccos arcsin arctan arccosh arcsinh arctanh cosh sinh tanh
+    tan arctan2 degrees radians deg2rad rad2deg exp2 expm1 log2 log10 log1p logaddexp
+    logaddexp2 cbrt reciprocal float_power fmod divmod conjugate conj fabs fmax fmin
+    rint floor ceil trunc spacing nextafter copysign sign signbit heaviside ldexp
+    gcd lcm invert left_shift right_shift logical_xor isfinite isinf isnan'''))
+
+PURE = '''allclose array_equal array_equiv atleast_1d atleast_2d atleast_3d broadcast_arrays
+    broadcast_shapes hsplit vsplit dsplit compress extract
+    trim_zeros flatnonzero unravel_index lexsort partition argpartition
+    union1d intersect1d setdiff1d setxor1d isin unique_counts unique_inverse unique_values
+    nanprod nanvar nanpercentile nanquantile nancumsum nancumprod nanargmin nanargmax ptp
+    average trapezoid ediff1d real imag angle real_if_close unwrap sinc i0 convolve correlate
+    vdot einsum_path'''
+
+
+def numeric_dtype(*values, dtype=None):
+    result = np.dtype(dtype) if dtype is not None else np.result_type(*[np.asarray(value).dtype for value in values])
+    if result.kind not in 'buifcmM':
+        raise ValueError('ufunc wrappers support numeric and datetime dtypes only')
+    return result
+
+
+class Ufunc:
+    def __init__(self, name):
+        self.name = name
+
+    def __call__(self, *args, **kwargs):
+        return ufunc_call(UFUNCS[self.name], *args, **kwargs)
+
+
+def ufunc_call(function, *args, **kwargs):
+    if len(args) != function.nin or kwargs.get('out') is not None:
+        raise ValueError('supply input arguments only; out arrays are not supported')
+    shapes = [np.shape(arg) for arg in args]
+    if 'where' in kwargs:
+        if not np.all(kwargs['where']):
+            raise ValueError('masked ufunc calls without initialized out arrays are not supported')
+        shapes.append(np.shape(kwargs['where']))
+    dtype = numeric_dtype(*args, dtype=kwargs.get('dtype'))
+    checked_size(np.broadcast_shapes(*shapes), dtype)
+    return function(*args, **kwargs)
+
+
+class Grid:
+    def __init__(self, sparse=False):
+        self.sparse = sparse
+
+    def __getitem__(self, key):
+        axes = key if isinstance(key, tuple) else (key,)
+        if not 1 <= len(axes) <= 64:
+            raise ValueError('grids support 1..64 axes')
+        counts = []
+        for axis in axes:
+            if not isinstance(axis, slice) or axis.stop is None:
+                raise TypeError('grids require slices with a stop value')
+            start, stop, step = 0 if axis.start is None else axis.start, axis.stop, 1 if axis.step is None else axis.step
+            if not all(isinstance(x, (int, float)) and math.isfinite(x) for x in (start, stop)):
+                raise ValueError('grid endpoints must be finite real numbers')
+            if isinstance(step, complex):
+                if not math.isfinite(abs(step)):
+                    raise ValueError('grid step must be finite')
+                count = int(abs(step))
+            else:
+                if not isinstance(step, (int, float)) or not math.isfinite(step) or step == 0:
+                    raise ValueError('grid step must be finite and nonzero')
+                count = max(0, math.ceil((stop - start) / step))
+            checked_size((count,))
+            counts.append(count)
+        checked_size((sum(counts),) if self.sparse else (len(axes), *counts))
+        return (np.ogrid if self.sparse else np.mgrid)[key]
+
+
+def bincount(x, weights=None, minlength=0):
+    values = np.asarray(x)
+    if values.ndim != 1 or (values.size and (values.dtype.kind not in 'iu' or np.any(values < 0))):
+        raise ValueError('bincount requires a one-dimensional array of nonnegative integers')
+    minlength = operator.index(minlength)
+    if minlength < 0:
+        raise ValueError('minlength must be nonnegative')
+    checked_size((max(minlength, int(values.max()) + 1 if values.size else 0),))
+    return np.bincount(values.astype(np.intp, copy=False), weights=weights, minlength=minlength)
+
+
+def indices(dimensions, dtype='int64', sparse=False):
+    shape = tuple(operator.index(size) for size in dimensions)
+    if len(shape) > 64 or any(size < 0 for size in shape):
+        raise ValueError('indices requires nonnegative dimensions and at most 64 axes')
+    checked_size((sum(shape),) if sparse else (len(shape), *shape), dtype)
+    return np.indices(shape, dtype=dtype, sparse=sparse)
+
+
+def broadcast_to(value, shape):
+    value = np.asarray(value)
+    checked_size(shape, value.dtype)
+    return np.broadcast_to(value, shape)
+
+
+def pad(value, pad_width, mode='constant', **kwargs):
+    value = np.asarray(value)
+    widths = np.broadcast_to(np.asarray(pad_width), (value.ndim, 2))
+    if widths.dtype.kind not in 'iu' or np.any(widths < 0):
+        raise ValueError('pad widths must be nonnegative integers')
+    if mode not in ('constant', 'edge', 'linear_ramp', 'maximum', 'mean', 'median', 'minimum',
+                    'reflect', 'symmetric', 'wrap'):
+        raise ValueError('Unsupported pad mode; callbacks and uninitialized padding are not exposed')
+    checked_size(tuple(size + int(width[0]) + int(width[1]) for size, width in zip(value.shape, widths)), value.dtype)
+    return np.pad(value, pad_width, mode=mode, **kwargs)
+
+
+def take(value, indices, axis=None, out=None, mode='raise'):
+    value = np.asarray(value)
+    if out is not None:
+        raise ValueError('out arrays are not supported')
+    if axis is None:
+        shape = np.shape(indices)
+    else:
+        axis = operator.index(axis)
+        if not -value.ndim <= axis < value.ndim:
+            raise ValueError('invalid take axis')
+        axis %= value.ndim
+        shape = (*value.shape[:axis], *np.shape(indices), *value.shape[axis+1:])
+    checked_size(shape, value.dtype)
+    return np.take(value, indices, axis=axis, mode=mode)
+
+
+def machine_info(dtype, integer=False):
+    info = np.iinfo(dtype) if integer else np.finfo(dtype)
+    return Record({'bits': info.bits, 'min': info.min, 'max': info.max,
+                   **({} if integer else {'eps': info.eps, 'epsneg': info.epsneg, 'tiny': info.tiny,
+                                         'smallest_normal': info.smallest_normal,
+                                         'smallest_subnormal': info.smallest_subnormal,
+                                         'precision': info.precision, 'resolution': info.resolution})})
 
 
 def checked_size(shape, dtype='float64'):
     shape = (shape,) if isinstance(shape, int) else tuple(shape)
-    if len(shape) > 64 or any(operator.index(size) < 0 or size > 1_000_000 for size in shape):
-        raise ValueError('array dimensions must be 0..1,000,000 with at most 64 axes')
+    if len(shape) > 64 or any(operator.index(size) < 0 for size in shape):
+        raise ValueError('array dimensions must be nonnegative with at most 64 axes')
     count = math.prod(shape)
     dtype = np.dtype(dtype)
-    if count > 1_000_000 or count * dtype.itemsize > 32 * 1024**2 or dtype.hasobject:
-        raise ValueError('array exceeds size limits or uses object dtype')
+    if dtype.hasobject:
+        raise ValueError('object dtype is not supported')
+    check_memory(count * max(1, dtype.itemsize))
+
+
+def preflight_binary(name, left, right):
+    if not isinstance(left, np.ndarray) and not isinstance(right, np.ndarray):
+        return
+    a, b = np.shape(left), np.shape(right)
+    if name == 'MatMult':
+        if not a or not b:
+            raise ValueError('matmul inputs need at least one dimension')
+        shape = (*np.broadcast_shapes(a[:-2] if len(a)>1 else (), b[:-2] if len(b)>1 else ()),
+                 *((a[-2],) if len(a)>1 else ()), *((b[-1],) if len(b)>1 else ()))
+    else:
+        shape = np.broadcast_shapes(a, b)
+    checked_size(shape, numeric_dtype(left, right))
+
+
+def matmul(a, b):
+    a, b = np.asarray(a), np.asarray(b)
+    preflight_binary('MatMult', a, b)
+    return np.matmul(a, b)
+
+
+def dot(a, b):
+    a, b = np.asarray(a), np.asarray(b)
+    shape = (np.broadcast_shapes(a.shape, b.shape) if not a.ndim or not b.ndim else
+             a.shape[:-1] if b.ndim == 1 else (*a.shape[:-1], *b.shape[:-2], b.shape[-1]))
+    checked_size(shape, numeric_dtype(a, b))
+    return np.dot(a, b)
 
 
 def array(data, dtype=None, **kwargs):
@@ -47,14 +227,14 @@ def bounded(factory):
 
 def arange(start, stop=None, step=1, **kwargs):
     first, last = (0, start) if stop is None else (start, stop)
-    if step == 0 or max(0, math.ceil((last - first) / step)) > 1_000_000:
-        raise ValueError('arange exceeds 1,000,000 elements or has zero step')
+    if step == 0:
+        raise ValueError('arange step must not be zero')
+    checked_size((max(0, math.ceil((last - first) / step)),), kwargs.get('dtype', 'float64'))
     return np.arange(first, last, step, **kwargs)
 
 
 def linspace(start, stop, num=50, **kwargs):
-    if not 0 <= num <= 1_000_000:
-        raise ValueError('linspace num must be 0..1,000,000')
+    checked_size((num, *np.broadcast_shapes(np.shape(start), np.shape(stop))), kwargs.get('dtype', 'float64'))
     return np.linspace(start, stop, num=num, **kwargs)
 
 
@@ -130,6 +310,25 @@ def histogram(a, bins=10, range=None, density=None, weights=None):
     return np.histogram(a, bins=bins, range=range, density=density, weights=weights)
 
 
+def fft_transform(function, inverse_real=False):
+    def transform(a, n=None, axis=-1, norm=None):
+        value = np.asarray(a)
+        axis = operator.index(axis)
+        shape = list(value.shape)
+        shape[axis] = operator.index(n) if n is not None else (
+            2 * (shape[axis] - 1) if inverse_real else shape[axis])
+        checked_size(shape, 'complex128')
+        return function(value, n=n, axis=axis, norm=norm)
+    return transform
+
+
+def fft_frequencies(function):
+    def frequencies(n, d=1.0):
+        checked_size((operator.index(n),))
+        return function(n, d=d)
+    return frequencies
+
+
 def exports(fs):
     def load(path, *, allow_pickle=False):
         if allow_pickle:
@@ -141,11 +340,18 @@ def exports(fs):
         path = str(path)
         return save(fs, path if path.endswith('.npy') else path + '.npy',
                     lambda stream: np.save(stream, array, allow_pickle=False))
-    return {'array': array, 'asarray': array, 'arange': arange, 'linspace': linspace,
+    return {**select(vars(np), PURE),
+            'pad': pad, 'take': take, 'finfo': machine_info, 'iinfo': lambda dtype: machine_info(dtype, True),
+            'result_type': np.result_type, 'promote_types': np.promote_types, 'can_cast': np.can_cast,
+            'iscomplex': np.iscomplex, 'isreal': np.isreal, 'iscomplexobj': np.iscomplexobj, 'isrealobj': np.isrealobj,
+            'array': array, 'asarray': array, 'arange': arange, 'linspace': linspace,
+            'mgrid': Grid(), 'ogrid': Grid(True), 'bincount': bincount,
+            'indices': indices, 'broadcast_to': broadcast_to,
+            'digitize': np.digitize, 'searchsorted': np.searchsorted, 'argwhere': np.argwhere,
             'zeros': bounded(np.zeros), 'ones': bounded(np.ones), 'full': bounded(np.full),
             'zeros_like': np.zeros_like, 'ones_like': np.ones_like, 'sum': np.sum,
             'mean': np.mean, 'median': np.median, 'min': np.min, 'max': np.max,
-            'std': np.std, 'var': np.var, 'dot': np.dot, 'matmul': np.matmul,
+            'std': np.std, 'var': np.var, 'dot': dot, 'matmul': matmul,
             'reshape': np.reshape, 'transpose': np.transpose, 'tile': tile, 'repeat': repeat,
             'eye': eye, 'identity': lambda n, dtype='float64': eye(n, dtype=dtype),
             'diag': diag, 'diagonal': np.diagonal, 'trace': np.trace, 'meshgrid': meshgrid,
@@ -174,6 +380,8 @@ def exports(fs):
             'round': np.round, 'dtype': np.dtype, 'load': load, 'save': write,
             'pi': np.pi, 'e': np.e, 'nan': np.nan, 'inf': np.inf,
             'int32': 'int32', 'int64': 'int64', 'float32': 'float32', 'float64': 'float64',
+            **{name: name for name in ('uint8', 'uint16', 'uint32', 'uint64', 'int8', 'int16',
+                                       'float16', 'complex64', 'complex128')},
             'bool_': 'bool', 'linalg': {'norm': np.linalg.norm, 'solve': np.linalg.solve,
                                       'inv': np.linalg.inv, 'det': np.linalg.det,
                                       'svd': np.linalg.svd, 'eig': np.linalg.eig, 'eigh': np.linalg.eigh,
@@ -181,22 +389,89 @@ def exports(fs):
                                       'qr': np.linalg.qr, 'cholesky': np.linalg.cholesky,
                                       'pinv': np.linalg.pinv, 'lstsq': np.linalg.lstsq,
                                       'matrix_rank': np.linalg.matrix_rank, 'cond': np.linalg.cond},
-            'random': {'default_rng': np.random.default_rng}}
+            'random': {'default_rng': np.random.default_rng},
+            'fft': {'fft': fft_transform(np.fft.fft), 'ifft': fft_transform(np.fft.ifft),
+                    'rfft': fft_transform(np.fft.rfft), 'irfft': fft_transform(np.fft.irfft, True),
+                    'fftfreq': fft_frequencies(np.fft.fftfreq),
+                    'rfftfreq': fft_frequencies(np.fft.rfftfreq),
+                    'fftshift': np.fft.fftshift, 'ifftshift': np.fft.ifftshift},
+            **{name: Ufunc(name) for name in UFUNCS}}
 
 
 def members(value, fs, name=None):
+    if isinstance(value, Record):
+        return value.fields
+    if isinstance(value, Ufunc):
+        function = UFUNCS[value.name]
+        def aggregate(method):
+            def invoke(a, axis=0, dtype=None, out=None, *args, **kwargs):
+                if out is not None:
+                    raise ValueError('out arrays are not supported')
+                checked_size(np.shape(a), numeric_dtype(a, dtype=dtype))
+                return method(a, axis, dtype, None, *args, **kwargs)
+            return invoke
+        def outer(a, b, **kwargs):
+            dtype = numeric_dtype(a, b, dtype=kwargs.get('dtype'))
+            shape = (*np.shape(a), *np.shape(b))
+            if 'where' in kwargs:
+                shape = np.broadcast_shapes(shape, np.shape(kwargs['where']))
+            checked_size(shape, dtype)
+            if kwargs.get('out') is not None:
+                raise ValueError('out arrays are not supported')
+            if 'where' in kwargs and not np.all(kwargs['where']):
+                raise ValueError('masked ufunc calls without initialized out arrays are not supported')
+            return function.outer(a, b, **kwargs)
+        def at(a, indices, b=None, /):
+            if not isinstance(a, np.ndarray):
+                raise TypeError('at requires a NumPy array')
+            # Validate the indexed selection without allocating a[indices].
+            advanced, basic, axis = [], [], 0
+            for key in indices if isinstance(indices, tuple) else (indices,):
+                if isinstance(key, slice):
+                    basic.append(len(range(*key.indices(a.shape[axis]))))
+                    axis += 1
+                else:
+                    index = np.asarray(key)
+                    if index.size and index.dtype.kind not in 'iub':
+                        raise ValueError('at indices must be integers, booleans or slices')
+                    advanced.append((int(np.count_nonzero(index)),) if index.dtype.kind == 'b' else index.shape)
+                    axis += index.ndim if index.dtype.kind == 'b' else 1
+            checked_size((*np.broadcast_shapes(*advanced), *basic, *a.shape[axis:]), a.dtype)
+            return function.at(a, indices) if b is None else function.at(a, indices, b)
+        def reduceat(a, indices, axis=0, dtype=None):
+            shape = list(np.shape(a))
+            shape[operator.index(axis)] = len(indices)
+            checked_size(shape, numeric_dtype(a, dtype=dtype))
+            return function.reduceat(a, indices, axis=axis, dtype=dtype)
+        return {'reduce': aggregate(function.reduce), 'accumulate': aggregate(function.accumulate),
+                'reduceat': reduceat, 'outer': outer, 'at': at, 'nin': function.nin, 'nout': function.nout}
     if isinstance(value, np.random.Generator):
         def distribution(function, size_position):
             def generate(*args, **kwargs):
                 size = kwargs.get('size', args[size_position] if len(args) > size_position else None)
-                checked_size(() if size is None else size, kwargs.get('dtype', 'float64'))
+                if kwargs.get('out') is not None:
+                    raise ValueError('out arrays are not supported')
+                if size is None:
+                    params = [*args[:size_position],
+                              *(v for k, v in kwargs.items() if k not in ('size', 'dtype', 'out', 'method'))]
+                    size = np.broadcast_shapes(*(np.shape(v) for v in params))
+                checked_size(size, kwargs.get('dtype', 'float64'))
                 return function(*args, **kwargs)
             return generate
         return {'random': distribution(value.random, 0), 'normal': distribution(value.normal, 2),
                 'uniform': distribution(value.uniform, 2), 'integers': distribution(value.integers, 2),
-                'standard_normal': distribution(value.standard_normal, 0)}
+                'standard_normal': distribution(value.standard_normal, 0),
+                'exponential': distribution(value.exponential, 1),
+                'standard_exponential': distribution(value.standard_exponential, 0),
+                'gamma': distribution(value.gamma, 2), 'beta': distribution(value.beta, 2),
+                'poisson': distribution(value.poisson, 1), 'binomial': distribution(value.binomial, 2),
+                'lognormal': distribution(value.lognormal, 2), 'logistic': distribution(value.logistic, 2),
+                'laplace': distribution(value.laplace, 2), 'chisquare': distribution(value.chisquare, 1),
+                'standard_t': distribution(value.standard_t, 1), 'weibull': distribution(value.weibull, 1),
+                'geometric': distribution(value.geometric, 1), 'triangular': distribution(value.triangular, 3)}
     if isinstance(value, np.ndarray):
-        return {'shape': value.shape, 'size': value.size, 'ndim': value.ndim,
+        return {'shape': value.shape, 'size': value.size, 'ndim': value.ndim, 'nbytes': value.nbytes,
+                'tobytes': value.tobytes,
                 'real': value.real, 'imag': value.imag,
                 'dtype': value.dtype, 'T': value.T, 'tolist': value.tolist, 'item': value.item,
                 'reshape': value.reshape, 'flatten': value.flatten, 'ravel': value.ravel,
@@ -206,9 +481,13 @@ def members(value, fs, name=None):
                 'squeeze': value.squeeze, 'swapaxes': value.swapaxes,
                 'diagonal': value.diagonal, 'trace': value.trace,
                 'prod': value.prod, 'cumsum': value.cumsum, 'cumprod': value.cumprod,
+                'itemsize': value.itemsize, 'strides': value.strides, 'real': value.real,
+                'take': lambda *a, **kw: take(value, *a, **kw),
+                'compress': value.compress, 'searchsorted': value.searchsorted,
+                'conj': value.conj, 'conjugate': value.conjugate,
                 'nonzero': value.nonzero,
                 'min': value.min, 'max': value.max, 'std': value.std, 'var': value.var,
-                'dot': value.dot, 'transpose': value.transpose, 'all': value.all, 'any': value.any,
+                'dot': lambda other: dot(value, other), 'transpose': value.transpose, 'all': value.all, 'any': value.any,
                 'round': value.round, 'clip': value.clip, 'sort': value.sort,
                 'argsort': value.argsort, 'argmin': value.argmin, 'argmax': value.argmax}
     if isinstance(value, np.dtype):
@@ -217,6 +496,12 @@ def members(value, fs, name=None):
 
 
 def pack(value):
+    if isinstance(value, Record):
+        return descriptor('numpy', 'record', freeze(value.fields))
+    if isinstance(value, Ufunc):
+        return descriptor('numpy', 'ufunc', value.name)
+    if isinstance(value, Grid):
+        return descriptor('numpy', 'grid', value.sparse)
     if isinstance(value, np.random.Generator):
         return descriptor('numpy', 'rng', json.dumps(value.bit_generator.state))
     if isinstance(value, np.ndarray):
@@ -231,6 +516,12 @@ def pack(value):
 
 
 def restore(kind, data):
+    if kind == 'record':
+        return Record(thaw(data))
+    if kind == 'ufunc' and data in UFUNCS:
+        return Ufunc(data)
+    if kind == 'grid' and type(data) is bool:
+        return Grid(data)
     if kind == 'rng':
         value = np.random.default_rng(0)
         state = json.loads(data)
@@ -254,13 +545,17 @@ def restore(kind, data):
         raise ValueError('Only NPY versions 1 and 2 are supported')
     checked_size(shape, dtype)
     result = np.load(io.BytesIO(data), allow_pickle=False)
-    if not isinstance(result, np.ndarray) or result.size > 1_000_000:
+    if not isinstance(result, np.ndarray):
         raise ValueError('invalid array')
     return result
 
 
 def is_view(value):
-    return isinstance(value, np.ndarray)
+    return isinstance(value, (np.ndarray, Ufunc))
+
+
+def is_grid(value):
+    return isinstance(value, Grid)
 
 
 def iterate(value):

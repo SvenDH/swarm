@@ -3,6 +3,8 @@ import pymupdf as pdf
 from .bridge import descriptor
 from .files import source
 from .common import assign
+from .limits import check_memory
+import math
 
 
 def exports(fs):
@@ -12,7 +14,9 @@ def exports(fs):
         if filename is not None:
             stream = source(fs, filename).getvalue()
         return pdf.open() if stream is None else pdf.open(stream=stream, filetype='pdf')
-    return {'open': open_pdf, 'Document': open_pdf, 'Rect': pdf.Rect, 'Point': pdf.Point,
+    return {**{name: value for name, value in vars(pdf).items()
+               if name.startswith(('PDF_', 'TEXT_', 'LINK_', 'ANNOT_', 'CS_')) and type(value) in (int, float)},
+            'open': open_pdf, 'Document': open_pdf, 'Rect': pdf.Rect, 'Point': pdf.Point,
             'Matrix': pdf.Matrix}
 
 
@@ -33,8 +37,7 @@ def members(value, fs, name=None):
             if dpi is not None:
                 transform = pdf.Matrix(dpi / 72, dpi / 72)
             bounds = rect * transform
-            if abs(bounds.width * bounds.height) > 4_000_000:
-                raise ValueError('Rendered images are limited to 4,000,000 pixels')
+            check_memory(math.ceil(abs(bounds.width)) * math.ceil(abs(bounds.height)) * 4)
             if colorspace is not None:
                 raise ValueError('Custom colorspaces are not exposed')
             return value.get_pixmap(matrix=transform, clip=clip, alpha=alpha, annots=annots)
@@ -43,6 +46,7 @@ def members(value, fs, name=None):
                 raise ValueError('Unsupported text options (host fonts are not exposed)')
             return value.insert_text(point, text, **kwargs)
         return {'number': value.number, 'rect': value.rect, 'get_text': value.get_text,
+                'search_for': value.search_for, 'get_links': value.get_links,
                 'get_pixmap': pixmap, 'insert_text': insert_text, 'set_rotation': value.set_rotation}
     if isinstance(value, pdf.Pixmap):
         def write(filename):
@@ -52,6 +56,11 @@ def members(value, fs, name=None):
     if isinstance(value, pdf.Rect):
         return {'width': value.width, 'height': value.height, 'x0': value.x0, 'y0': value.y0,
                 'x1': value.x1, 'y1': value.y1}
+    if isinstance(value, pdf.Point):
+        return {'x': value.x, 'y': value.y, 'distance_to': value.distance_to}
+    if isinstance(value, pdf.Matrix):
+        return {'a': value.a, 'b': value.b, 'c': value.c, 'd': value.d, 'e': value.e, 'f': value.f,
+                'is_rectilinear': value.is_rectilinear}
     return {}
 
 
@@ -59,8 +68,7 @@ def pack(value):
     if isinstance(value, pdf.Document):
         return descriptor('pymupdf', 'document', value.tobytes() if value.page_count else None)
     if isinstance(value, pdf.Pixmap):
-        if value.width * value.height > 4_000_000:
-            raise ValueError('Rendered images are limited to 4,000,000 pixels')
+        check_memory(value.width * value.height * value.n)
         return descriptor('pymupdf', 'pixmap', value.tobytes('png'))
     if isinstance(value, (pdf.Rect, pdf.Point, pdf.Matrix)):
         return descriptor('pymupdf', type(value).__name__, list(value))

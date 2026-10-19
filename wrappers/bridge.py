@@ -1,9 +1,10 @@
 """Allowlisted native operations over checkpoint-safe values, never host handles."""
 import operator
 from importlib import import_module
+from functools import lru_cache
 from itertools import islice
 from datetime import date, time, timedelta
-from .registry import MODULES, require
+from .registry import MODULES, REQUIRES, require
 
 PRIMITIVES = (str, bytes, bool, int, float, complex, date, time, timedelta, type(None))
 
@@ -20,11 +21,16 @@ INPLACE = {'Add': operator.iadd, 'Sub': operator.isub, 'Mult': operator.imul,
            'Pow': operator.ipow, 'MatMult': operator.imatmul, 'BitAnd': operator.iand,
            'BitOr': operator.ior, 'BitXor': operator.ixor, 'LShift': operator.ilshift,
            'RShift': operator.irshift}
-MUTATING = {'numpy': {'sort', 'random', 'normal', 'uniform', 'integers', 'standard_normal'},
-            'pandas': set(), 'PIL': {'putpixel', 'paste', 'thumbnail'},
+MUTATING = {'numpy': {'sort', 'random', 'normal', 'uniform', 'integers', 'standard_normal',
+                'exponential', 'standard_exponential', 'gamma', 'beta', 'poisson', 'binomial',
+                'lognormal', 'logistic', 'laplace', 'chisquare', 'standard_t', 'weibull', 'geometric', 'triangular'},
+            'pandas': set(), 'PIL': {'putpixel', 'putalpha', 'paste', 'thumbnail', 'line', 'rectangle',
+                'rounded_rectangle', 'ellipse', 'polygon', 'regular_polygon', 'arc',
+                'pieslice', 'chord', 'point', 'text', 'multiline_text'},
             'openpyxl': {'create_sheet', 'remove', 'append', 'cell', 'iter_rows', 'merge_cells',
                          'unmerge_cells', 'delete_rows', 'delete_cols'},
-            'pypdf': {'add_page', 'add_blank_page', 'append', 'add_metadata', 'rotate', 'scale_to', 'merge_page'},
+            'pypdf': {'add_page', 'add_blank_page', 'append', 'add_metadata', 'rotate', 'scale_to',
+                      'scale_by', 'scale', 'add_transformation', 'merge_page'},
             'docx': {'add_paragraph', 'add_heading', 'add_table', 'add_page_break', 'add_picture',
                      'add_run', 'add_row', 'add_column'},
             'scipy': set(), 'sklearn': {'fit', 'fit_transform'}, 'seaborn': set(),
@@ -37,7 +43,9 @@ MUTATING = {'numpy': {'sort', 'random', 'normal', 'uniform', 'integers', 'standa
                           'setFillColorRGB', 'setStrokeColorRGB', 'setFillColor', 'setStrokeColor',
                           'setLineWidth', 'line', 'rect', 'circle', 'ellipse', 'showPage',
                           'translate', 'scale', 'rotate', 'saveState', 'restoreState',
-                          'setTitle', 'setAuthor', 'setPageSize', 'drawImage'},
+                          'setTitle', 'setAuthor', 'setPageSize', 'drawImage', 'roundRect', 'bezier',
+                          'arc', 'wedge', 'lines', 'grid', 'setDash', 'setLineCap', 'setLineJoin',
+                          'setMiterLimit', 'setFillAlpha', 'setStrokeAlpha', 'setCreator', 'setSubject', 'setKeywords'},
             'xlsxwriter': {'add_worksheet', 'add_format', 'add_chart', 'write', 'write_row',
                            'write_column', 'write_string', 'write_number', 'write_formula',
                            'write_blank', 'set_column', 'set_row', 'merge_range', 'freeze_panes',
@@ -45,13 +53,22 @@ MUTATING = {'numpy': {'sort', 'random', 'normal', 'uniform', 'integers', 'standa
                            'add_series', 'set_title', 'set_x_axis', 'set_y_axis', 'set_legend',
                            'set_style', 'set_bold', 'set_italic', 'set_num_format', 'set_bg_color',
                            'set_font_color', 'set_align'}}
-CROSS = {'scipy': ('numpy',), 'sklearn': ('numpy',), 'seaborn': ('matplotlib',)}
+CROSS = {'scipy': ('numpy',), 'sklearn': ('numpy',), 'seaborn': ('matplotlib',), 'matplotlib': ('numpy',)}
 
 
 def backend(module):
     if module not in MODULES:
         raise ImportError(f'Unsupported library: {module}')
     require(module)
+    return _backend(module)
+
+
+@lru_cache(maxsize=None)
+def _backend(module):
+    # Native initialization (including cross-library result adapters) happens
+    # with the requested backend on the Python IO worker, never during replay.
+    for dependency in REQUIRES.get(module, ()):
+        backend(dependency)
     return import_module('.' + MODULES[module], 'wrappers')
 
 
@@ -76,6 +93,8 @@ def decode(value, cache=None, fs=None):
             return result
         if set(value) == {'__library_slice__'}:
             return slice(*value['__library_slice__'])
+        if set(value) == {'__library_ellipsis__'} and value['__library_ellipsis__'] is True:
+            return Ellipsis
         return {key: decode(item, cache, fs) for key, item in value.items()}
     if isinstance(value, (list, tuple)):
         return type(value)(decode(item, cache, fs) for item in value)
@@ -179,9 +198,14 @@ def dispatch(fs, action, spec, path=(), args=(), kwargs=None):
     elif action == 'call':
         if not callable(value):
             raise TypeError('Library value is not callable')
-        if module == 'numpy' and kwargs.get('out') is not None:
+        if module in ('numpy', 'scipy') and kwargs.get('out') is not None:
             raise ValueError('out= is not supported; assign the returned array instead')
         result = value(*args, **kwargs)
+        if module == 'PIL' and spec['kind'] == 'module':
+            for (owner, identity), obj in cache.items():
+                view = api.view(obj, result) if owner == module else None
+                if view is not None:
+                    return {'argument_result': {'module': owner, 'identity': identity, 'path': view}}
         if result is root and spec['kind'] != 'module':
             result_path = []
         if module == 'numpy' and api.shares(root, result):
@@ -198,10 +222,14 @@ def dispatch(fs, action, spec, path=(), args=(), kwargs=None):
                 'path': [*original['path'], ['numpy_function', path[0][1], wire_args[1:], wire_kwargs]]}}
     elif action == 'item':
         result = value[args[0]]
+        if module == 'numpy' and api.is_grid(value):
+            return {'result': encode(result, module)}  # Generated arrays are values, not views of the grid factory.
         result_path = [*path, ['item', wire_args[0]]]
         if api.is_view(result):
             return {'result': {'__library_view__': api.view(root, result) or result_path}}
     elif action == 'setitem':
+        if spec['kind'] == 'module' and type(value) is dict:
+            raise TypeError('Library namespaces and constant mappings are read-only')
         if module == 'sympy':
             api.validate(args[1])
         value[args[0]] = args[1]
@@ -228,12 +256,16 @@ def dispatch(fs, action, spec, path=(), args=(), kwargs=None):
         result = {'float': float, 'int': int, 'bool': bool}[args[0]](value)
     elif action == 'binary':
         name, other, reverse = args
+        if module == 'numpy':
+            api.preflight_binary(name, other if reverse else value, value if reverse else other)
         if module == 'sympy':
             api.validate(other)
         result = OPERATORS[name](other, value) if reverse else OPERATORS[name](value, other)
     elif action == 'unary':
         result = OPERATORS[args[0]](value)
     elif action == 'inplace':
+        if module == 'numpy':
+            api.preflight_binary(args[0], value, args[1])
         if module == 'sympy':
             api.validate(args[1])
         result = INPLACE[args[0]](value, args[1])
@@ -246,6 +278,11 @@ def dispatch(fs, action, spec, path=(), args=(), kwargs=None):
     else:
         encoded = encode(result, module, root, result_path)
     response = {'result': encoded}
+    if module == 'numpy' and action == 'call' and path and path[-1][1] == 'at' and wire_args:
+        target = wire_args[0].get('__library_value__') if isinstance(wire_args[0], dict) else None
+        if target is not None and target['module'] == 'numpy':
+            obj = cache[('numpy', target['identity'])]
+            response['updates'] = [{'module': 'numpy', 'identity': target['identity'], 'data': api.pack(obj)['data']}]
     changed = action in ('setitem', 'setattr', 'inplace') or (
         action == 'call' and (kwargs.get('inplace', False) or (path and path[-1][1] in MUTATING.get(module, set())) or module not in MUTATING))
     if (spec['kind'] != 'module' and changed) or stateful:
