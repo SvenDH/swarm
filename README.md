@@ -1,5 +1,25 @@
 # Monty agents
 
+Agents can inspect images with `display(...)` inside the Python tool:
+
+```python
+from PIL import Image
+
+image = Image.open("scene.png")
+display(image)          # a PIL image
+display("scene.png")   # or a session file path (pathlib.Path also works)
+```
+
+This requires Pillow on the host and a vision-capable model/provider. Explicit
+`display()` calls send JPEG previews (at most 1024 pixels per side) using the
+[image input format](https://developers.openai.com/api/docs/guides/images-vision).
+Original files and image objects remain unchanged. Previews are stored outside
+SQLite; only object references commit with successful code execution. They
+survive restart and expand into image messages when calling the provider, after
+all tool results in a batch. Context compaction summarizes older history rather
+than retaining all old images. The REPL shows a display confirmation, not the
+image pixels; last-expression image objects are not automatically displayed.
+
 Each agent can keep durable preferences, corrections and reusable lessons in
 `/home/<name>/MEMORY.md`, editing it with the existing Python file tools. No
 extra service or memory database is required. Notes use the same atomic commits,
@@ -56,9 +76,13 @@ is live, not an event archive; reconnecting observes remaining output and the
 saved final answer.
 
 Provider-supplied `reasoning_content` or `reasoning` text deltas stream into a
-separate dimmed, magenta-bordered Reasoning panel. This is live display only,
-not conversation history or a replay log; providers that do not expose these
-fields produce no reasoning panel. Hidden reasoning is not requested or inferred.
+separate dimmed, magenta-bordered Reasoning panel. The exact supplied fields
+are saved with assistant messages and sent back on continuation requests, as
+required by thinking-mode providers. No reasoning is fabricated or requested
+from providers that do not expose it. Summarization excludes these fields from
+its input history. If old history is rejected for missing reasoning, the agent
+rebases it through a fresh continuation summary, preserving files/globals and
+completed tool effects. Other HTTP 400 errors stop rather than retry forever.
 
 After the startup recovery scan, submissions wake only their own session; there
 is no inbox polling or global rescan per completed prompt. Idle sessions retain

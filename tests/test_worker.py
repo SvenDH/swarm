@@ -8,7 +8,7 @@ from unittest.mock import patch
 
 import httpx
 
-from agents import CodeAgent, Runtime, Worker, WorkerClient
+from agents import CodeAgent, Runtime, Worker, WorkerClient, OutputBuffer
 from test_agents import model_client, stream_response
 
 
@@ -56,6 +56,44 @@ class WorkerTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual([m['content'] for m in (await agent.state()).messages if m['role'] == 'user'],
                              ['first', 'second', 'third'])
             await agent.close()
+
+    async def test_fast_output_burst_is_coalesced_without_disconnecting(self):
+        async def response(agent, client, messages, **options):
+            for kind in ('reasoning', 'assistant', 'python', 'stdout'):
+                for i in range(5000):
+                    agent._emit(kind, str(i % 10))
+            return {'role': 'assistant', 'content': 'done'}
+
+        observed = []
+        async with Worker(self.path, client=self.client()) as worker:
+            client = WorkerClient(self.path, on_output=lambda *event: observed.append(event))
+            info = await client.request('agent')
+            with patch.object(CodeAgent, '_response', response):
+                result = await client.request('run', session_id=info['id'], prompt='draw')
+            self.assertEqual(result, 'done')
+        for kind in ('reasoning', 'assistant', 'python', 'stdout'):
+            self.assertEqual(''.join(text for event, text in observed if event == kind), '0123456789' * 500)
+        self.assertEqual([event for event, text in observed], ['reasoning', 'assistant', 'python', 'stdout'])
+
+    async def test_output_buffer_bounds_frames_and_preserves_control_events(self):
+        buffer = OutputBuffer()
+        for _ in range(10000):
+            buffer.put_nowait({'event': 'python', 'text': 'abcd'})
+        buffer.put_nowait({'job': 1, 'result': 'done'})
+        self.assertFalse(buffer.full())
+        frames = []
+        while not buffer.empty():
+            frames.append(await buffer.get())
+        self.assertEqual(''.join(e.get('text', '') for e in frames), 'abcd' * 10000)
+        self.assertEqual(frames[-1], {'job': 1, 'result': 'done'})
+        self.assertTrue(all(len(e.get('text', '')) <= 16384 for e in frames))
+        self.assertEqual(buffer.characters, 0)
+        worker = Worker(self.path)
+        worker._listeners[1] = {buffer}
+        buffer.put_nowait({'event': 'python', 'text': 'x' * (2 * 1024**2)})
+        worker._broadcast(1, {'event': 'python', 'text': 'more'})
+        self.assertIn('fell behind', (await buffer.get())['error'])
+        self.assertNotIn(buffer, worker._listeners[1])
 
     async def test_disconnecting_client_does_not_cancel_agent(self):
         entered, release = asyncio.Event(), asyncio.Event()

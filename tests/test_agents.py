@@ -220,8 +220,10 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(''.join(t for k, t in observed if k == 'result'), '42')
         self.assertEqual(''.join(t for k, t in observed if k == 'assistant'),
                          'Let me calculate.Done.')
-        self.assertFalse(any('reasoning' in m or 'reasoning_content' in m
-                             for m in self.agent._state.messages))
+        reasoning = self.agent._state.messages[1]
+        self.assertEqual(reasoning['reasoning_content'], 'Check the  Ready.')
+        self.assertEqual(reasoning['reasoning'], 'calculation. Ready.')
+        self.assertEqual(requests[1]['messages'][-2]['reasoning_content'], reasoning['reasoning_content'])
 
     async def test_incomplete_model_stream_never_records_or_executes_partial_code(self):
         observed = []

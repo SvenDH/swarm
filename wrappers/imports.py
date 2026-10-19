@@ -137,6 +137,9 @@ class LibrarySyntax(ast.NodeTransformer):
                 vararg=None, kwonlyargs=[], kw_defaults=[], kwarg=None, defaults=[])
             return ast.Call(ast.Lambda(arguments, body), [receiver], [])
         self.generic_visit(node)
+        if isinstance(node.func, ast.Name) and node.func.id == 'display':
+            node.args = [call('pack', arg) for arg in node.args]
+            return node
         if isinstance(node.func, ast.Name) and node.func.id in ('len', 'list', 'tuple', 'print', 'str', 'float', 'int', 'bool'):
             node.func = ast.Name('_library_' + node.func.id, ast.Load())
         if isinstance(node.func, ast.Name) and node.func.id in BUILTINS:
