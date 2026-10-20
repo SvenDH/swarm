@@ -1,7 +1,8 @@
 """Async Monty agents with durable SQLite checkpoints and resumable pending work.
 
 Files are immutable storage objects referenced by SQLite; workspaces are disposable
-copies. Only completed model messages and successful interpreter changes commit.
+copies. Completed model messages and checkpointable interpreter changes commit,
+including partial state after ordinary Python exceptions.
 The database and interpreter snapshots must be trusted. Native-library wrappers
 operate on virtual bytes/plain data outside Monty's resource accounting.
 """
@@ -39,8 +40,8 @@ from pydantic_monty import CallbackFile, AsyncMonty, MontyError, MontyCrashedErr
 from dotenv import load_dotenv
 from names import num_to_name
 from wrappers.protocol import NativeMemory
-from wrappers.runtime import ExecutionBudget, evaluate, settled
-from wrappers.limits import memory_bytes, memory_scope, check_memory, memory_message
+from wrappers.runtime import ExecutionBudget, evaluate, settled, error_text
+from wrappers.limits import memory_bytes, memory_scope, check_memory
 
 load_dotenv(override=True)
 
@@ -64,18 +65,17 @@ def unfinished(messages):
 
 
 class PythonCode(BaseModel):
-    """Execute Python. Files and ordinary variables persist; native library objects are RAM-only."""
+    """Run Python in the Unix REPL environment."""
     model_config = ConfigDict(extra='forbid')
     code: str
 
-HELP = """Use python for code and files. Files and ordinary variables persist; failed calls roll back.
-Native library objects are RAM-only: after restart, errors, or eviction, reload files or recompute.
-Your working directory is /home/<your-name>/.
-Avoid too many library calls per code block; prefer vectorized operations or split work.
-Release unused large variables with del. Use print for concise observations, exec() for Python files,
-and display(image_or_path) for images.
-Keep brief durable preferences and lessons in ~/MEMORY.md using Python file IO; correct stale notes
-and never store API secrets. Some Python features may be unavailable.
+HELP = """You are a code-mode assistant. Execute Python with the python REPL tool to
+inspect and modify your persistent filesystem. No host shell/network.
+Use print for observations. Batch related work; avoid dumping large files.
+No wildcard imports, pickle, arbitrary callbacks/apply/query/eval, or unsupported APIs.
+Use explicit methods and assignments; context managers/custom special methods are
+not supported. Arrays are capped at 1,000,000 elements; images at 4,000,000 pixels.
+Finish with a concise answer based on actual execution results.
 """
 
 
@@ -638,7 +638,7 @@ class CodeAgent:
 
     def _commit(self, request, output, error, files=None, cwd=None, snapshot=None, images=()):
         with self._transaction():
-            if not error:
+            if files is not None:
                 self.db.execute('UPDATE sessions SET cwd=?,monty=? WHERE id=?', (cwd, snapshot, self.id))
                 self._replace_files(files)
             self.db.execute('UPDATE executions SET output=?,error=? WHERE session_id=? AND id=?',
@@ -675,7 +675,7 @@ class CodeAgent:
                     async with ExecutionBudget(self.runtime.execution_timeout, self._emit) as budget:
                         evaluation = asyncio.create_task(self._evaluate(request['code'], state, files, printed, budget))
                         try:
-                            fs, snapshot, output, stdout, images = await asyncio.wait_for(asyncio.shield(evaluation), budget.seconds)
+                            fs, snapshot, output, stdout, images, error = await asyncio.wait_for(asyncio.shield(evaluation), budget.seconds)
                             if time.monotonic() - budget.started >= budget.seconds:
                                 raise TimeoutError('Python execution timed out; split work into smaller blocks')
                         except MontyCrashedError as exc:
@@ -688,25 +688,23 @@ class CodeAgent:
                 except MontyCrashedError:
                     raise  # Infrastructure failures/cancellation leave the request pending.
                 except (MontyError, SyntaxError, ImportError, MemoryError, TimeoutError, asyncio.TimeoutError) as exc:
-                    error = exc.exception() if isinstance(exc, MontyError) else exc
-                    if isinstance(error, (TimeoutError, asyncio.TimeoutError)) and not str(error):
-                        error = TimeoutError('Python execution timed out; split work into smaller blocks')
-                    if isinstance(error, MemoryError):
-                        text = memory_message(error)
-                        output = 'MemoryError' + (f': {text}' if text else '')
-                    else:
-                        output = f'{type(error).__name__}: {error}'[:24000]
-                    output = (''.join(printed) + output)[:24000]
+                    if not isinstance(exc, (SyntaxError, ImportError)):
+                        self.runtime._native.clear(self._native_key())
+                    output = (''.join(printed) + error_text(exc))[:24000]
                     await self.runtime.database_call(self._commit, request, output, True)
                     raise ExecutionError(output) from exc
                 files = await self.runtime.offload(lambda: self._publish(fs.entries()))
                 images = await self.runtime.offload(lambda: [self.storage.put(self.name, image) for image in images])
-                await self.runtime.database_call(self._commit, request, output, False, files, fs.cwd, snapshot, images)
+                await self.runtime.database_call(self._commit, request, output, error, files, fs.cwd, snapshot, images)
                 await self._checkout(files)
+                if error:
+                    raise ExecutionError(output)
                 self._emit('result', output[len(stdout):])
                 if images:
                     self._emit('result', f'\nDisplayed {len(images)} image(s) for visual inspection.')
                 return output
+        except ExecutionError:
+            raise  # Ordinary exceptions have already committed their partial state.
         except BaseException:
             self.runtime._native.clear(self._native_key())
             raise

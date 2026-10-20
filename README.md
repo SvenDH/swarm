@@ -91,10 +91,12 @@ Fitted estimators stay native in RAM. Plot/document commands retain RAM-only
 copies of their input data so later edits do not change previously recorded commands;
 there is no native checkpoint encoding or recipe decoding.
 
-An execution is recorded before it starts. Only a successful checkpoint and
-its associated files commit. A failed block rolls back ordinary variables and files,
-and invalidates that session's native objects rather than preserving partial mutations;
-printed output remains visible but does not prove a write committed.
+An execution is recorded before it starts. Ordinary Python exceptions commit the
+partial interpreter and file state, and keep native mutations made before the error.
+The error is recorded as the tool result, so recovery does not replay that block.
+Crashes, timeouts, cancellations and failed checkpoint writes preserve the previous
+durable checkpoint and invalidate native objects. Printed output alone does not
+prove a write committed.
 After a restart, pending work resumes from the last committed state. Native
 objects are deliberately not restored: their old references raise an error
 instructing the agent to recompute or reload them. Python code, ordinary values,

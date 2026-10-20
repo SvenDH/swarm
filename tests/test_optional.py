@@ -328,7 +328,7 @@ loaded=load_workbook('generated.xlsx')
                 await self.agent.execute(snippet)
         self.assertEqual(host.read_text(), 'secret')
 
-    async def test_plotting_isolation_and_rollback(self):
+    async def test_plotting_isolation_and_partial_failure(self):
         self.need('matplotlib')
         other = await self.runtime.agent()
         await asyncio.gather(self.agent.execute("import matplotlib.pyplot as plt; plt.plot([1,2],[3,4])"),
@@ -340,7 +340,8 @@ loaded=load_workbook('generated.xlsx')
             await self.agent.execute("plt.plot([1,2],[99,99]); plt.savefig('bad.png'); raise ValueError('rollback')")
         await self.agent.execute("plt.plot([1,2],[3,4])")
         await self.agent.execute("plt.savefig('after.png')")
-        self.assertEqual(before, await self.agent.read_file(self.agent.home + '/after.png'))
+        self.assertNotEqual(before, await self.agent.read_file(self.agent.home + '/after.png'))
+        self.assertTrue((await self.agent.read_file(self.agent.home + '/bad.png')).startswith(b'\x89PNG'))
 
 
 if __name__ == '__main__':

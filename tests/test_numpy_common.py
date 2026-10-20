@@ -89,8 +89,7 @@ add.at(a,[0,0,2],1)
             await self.agent.execute('from numpy import add; a=np.array([3,7,4])')
             with self.subTest(code=code), self.assertRaises(ExecutionError):
                 await self.agent.execute(code)
-        with self.assertRaisesRegex(ExecutionError,'recompute'):
-            await self.agent.execute('a.tolist()')
+        self.assertEqual(await self.agent.execute('a.tolist()'), '[3, 7, 4]')
 
     async def test_grids_preflight_before_native_allocations(self):
         from wrappers.numpy import Grid

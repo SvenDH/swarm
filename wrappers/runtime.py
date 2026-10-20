@@ -3,11 +3,21 @@ import asyncio
 import threading
 import time
 import textwrap
-from pydantic_monty import MontyClassProxy
+from pydantic_monty import MontyClassProxy, MontyError, MontyCrashedError
 from .protocol import Bridge
 from .bridge import backend as library_backend
 from .imports import BOOTSTRAP, CHECK, DELETE_BOOTSTRAP, prepare as prepare_libraries, cleanup as cleanup_libraries
-from .limits import memory_scope, check_memory, memory_errors
+from .limits import memory_scope, check_memory, memory_errors, memory_message
+
+
+def error_text(error):
+    error = error.exception() if isinstance(error, MontyError) else error
+    if isinstance(error, MemoryError):
+        text = memory_message(error)
+        return 'MemoryError' + (f': {text}' if text else '')
+    if isinstance(error, (TimeoutError, asyncio.TimeoutError)) and not str(error):
+        error = TimeoutError('Python execution timed out; split work into smaller blocks')
+    return f'{type(error).__name__}: {error}'[:24000]
 
 
 async def settled(future):
@@ -159,14 +169,22 @@ async def evaluate(runtime, fs, owner, code, checkpoint, printed, emit, budget, 
                 raise MemoryError('printed output exceeds 16000 bytes')
             printed.append(text)
             emit('stdout', text)
-        value = await session.feed_run(code, external_lookup=functions, os=budget.wrap(fs),
-                                 cwd=fs.cwd, print_callback=budget.wrap(capture))
+        error, value = None, None
+        try:
+            value = await session.feed_run(code, external_lookup=functions, os=budget.wrap(fs),
+                                          cwd=fs.cwd, print_callback=budget.wrap(capture))
+        except MontyCrashedError:
+            raise  # A dead interpreter has no partial state to checkpoint.
+        except MontyError as exc:
+            error = exc.exception()
+            if isinstance(error, (TimeoutError, asyncio.TimeoutError)) and time.monotonic() - budget.started >= budget.seconds:
+                raise
         stdout = ''.join(printed)
         if isinstance(value, MontyClassProxy) and value.name == '_LibraryRender':
             rendered = value.attributes['text']
         else:
             rendered = repr(value) if value is not None else ''
-        output = (stdout + rendered)[:24000]
+        output = (stdout + (error_text(error) if error is not None else rendered))[:24000]
         snapshot = await session.dump()
         with runtime._native.lock:
             runtime._native.enforce(extra=len(snapshot) * 2, owner=owner)
@@ -174,4 +192,4 @@ async def evaluate(runtime, fs, owner, code, checkpoint, printed, emit, budget, 
         # copy plus 25% of the budget for the next feed and cleanup.
         if len(snapshot) * 2 > memory_budget * 3 // 4:
             raise MemoryError()
-        return snapshot, output, stdout, images
+        return snapshot, output, stdout, images, error is not None

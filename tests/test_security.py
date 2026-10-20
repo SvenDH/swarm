@@ -42,8 +42,7 @@ class SecurityTests(unittest.IsolatedAsyncioTestCase):
                          "state['module']='sympy'", "state['seal']='0'*64", "state['extra']=1"):
             with self.subTest(mutation=mutation):
                 await self.reject(f"state=dict(original); {mutation}; _library_rpc('repr',state)")
-        with self.assertRaisesRegex(ExecutionError, 'recompute'):
-            await self.agent.execute('a.tolist()')
+        self.assertEqual(await self.agent.execute('a.tolist()'), '[1, 2]')
 
     async def test_forged_paths_and_embedded_arguments_are_rejected(self):
         self.need('numpy')
@@ -118,8 +117,7 @@ isinstance(payload,dict)
             with self.subTest(code=code):
                 await self.agent.execute('matrix=sp.Matrix([[1]])')
                 await self.reject(code)
-        with self.assertRaisesRegex(ExecutionError, 'recompute'):
-            await self.agent.execute('int(matrix[0,0])')
+        self.assertEqual(await self.agent.execute('int(matrix[0,0])'), '1')
 
     async def test_replayed_callbacks_cannot_be_passed_to_native_apis(self):
         self.need('numpy')

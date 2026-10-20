@@ -55,8 +55,8 @@ numbers.extend([5,6])
 '''), "(True, True, 'world', [1, 9, 3, 4, 5, 6], 33)")
         with self.assertRaises(ExecutionError):
             await self.agent.execute("h.update(b'bad'); buffer.write(b'bad'); numbers.append(7); raise ValueError('abort')")
-        with self.assertRaisesRegex(ExecutionError,'recompute'):
-            await self.agent.execute('h.hexdigest()')
+        self.assertEqual(await self.agent.execute('(h.hexdigest()!=copy.hexdigest(),numbers[-1],buffer.getvalue()[-3:])'),
+                         "(True, 7, b'bad')")
         await self.agent.execute('buffer=io.BytesIO(); text=io.StringIO()')
         await self.agent.execute('buffer.close(); text.close()')
         self.assertEqual(await self.agent.execute('(buffer.closed,text.closed)'), '(True, True)')

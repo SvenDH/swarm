@@ -41,7 +41,7 @@ reopened=Image.open('pixels.png')
 (pixels[0,1],pixels[2,1],reopened.load()[0,1])
 '''), '((70, 80, 90), (1, 2, 3), (70, 80, 90))')
 
-    async def test_scalar_modes_errors_and_rollback(self):
+    async def test_scalar_modes_and_errors_preserve_image(self):
         self.assertEqual(await self.agent.execute('''
 from PIL import Image
 gray=Image.new('L',(2,2),7)
@@ -55,5 +55,4 @@ pixels[0,0]=123
             await self.agent.execute("gray=Image.new('L',(2,2),7); pixels=gray.load(); pixels[0,0]=123")
             with self.subTest(code=code), self.assertRaises(ExecutionError):
                 await self.agent.execute(code)
-        with self.assertRaisesRegex(ExecutionError,'recompute'):
-            await self.agent.execute('gray.getpixel((0,0))')
+        self.assertEqual(await self.agent.execute('gray.getpixel((0,0))'), '123')

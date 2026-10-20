@@ -11,11 +11,11 @@ class ExecTests(unittest.IsolatedAsyncioTestCase):
     asyncSetUp = test_agents.AgentTests.asyncSetUp
     asyncTearDown = test_agents.AgentTests.asyncTearDown
 
-    async def test_failed_block_preserves_stdout_and_rolls_back(self):
+    async def test_failed_block_preserves_stdout_and_changes(self):
         await self.agent.execute('x=1')
         with self.assertRaisesRegex(ExecutionError, 'before error\nValueError: abort'):
             await self.agent.execute('print("before error"); x=2; raise ValueError("abort")')
-        self.assertEqual(await self.agent.execute('x'), '1')
+        self.assertEqual(await self.agent.execute('x'), '2')
 
     async def test_repeated_calls_do_not_redefine_helpers(self):
         await self.agent.execute('import numpy as np; a=np.zeros(1000)')
@@ -45,12 +45,12 @@ class ExecTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(await self.agent.execute(f"exec({nested!r}); x.tolist()"), '[0, 1, 2]')
         self.assertEqual(await self.agent.execute("value=7; exec('value += 1'); value"), '8')
 
-    async def test_exec_rolls_back_files_and_globals(self):
+    async def test_exec_preserves_partial_files_and_globals(self):
         await self.agent.execute("x=1; open('saved','w').write('original')")
         source = "import numpy as np; x=99; open('saved','w').write('bad'); raise ValueError('abort')"
         with self.assertRaisesRegex(ExecutionError, '^ValueError: abort$'):
             await self.agent.execute(f'exec({source!r})')
-        self.assertEqual(await self.agent.execute("(x,open('saved').read())"), "(1, 'original')")
+        self.assertEqual(await self.agent.execute("(x,open('saved').read())"), "(99, 'bad')")
 
     async def test_dynamic_source_cannot_import_host_modules_or_read_host_paths(self):
         for source in ("import os; os.system('true')", "import subprocess", "import numpy as np; np.load('/etc/passwd')",

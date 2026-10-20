@@ -59,14 +59,16 @@ class DisplayTests(unittest.IsolatedAsyncioTestCase):
             with patch.object(self.agent.runtime, 'client', model_client(client)):
                 self.assertEqual(await self.agent.run('draw'), 'Blue.')
 
-    async def test_invalid_inputs_and_failed_execution_do_not_attach_images(self):
+    async def test_invalid_inputs_do_not_attach_images_but_partial_display_does(self):
         await self.agent.execute("from PIL import Image; im=Image.new('RGB',(8,8))")
         for code in ("display('/etc/passwd')", "display('https://example.com/a.png')", "display(123)",
                      "display({'__library_value__': {}, 'path': [], 'auth': None})",
                      "display(im); raise ValueError('abort')"):
             with self.subTest(code=code), self.assertRaises(ExecutionError):
                 await self.agent.execute(code)
-        self.assertEqual((await self.agent.state()).messages, [])
+        messages = (await self.agent.state()).messages
+        self.assertEqual(len(messages), 1)
+        self.assertEqual(len(messages[0]['_images']), 1)
 
     async def test_batch_images_follow_all_tool_results(self):
         await self.agent.execute("from PIL import Image; display(Image.new('RGB',(8,8)))")

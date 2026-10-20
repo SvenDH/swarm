@@ -135,8 +135,7 @@ image.save('drawing.png')
         self.assertEqual(await self.agent.execute("other=ImageDraw.Draw(image); image.putpixel((2,2),(1,2,3)); other.point((3,3),fill='black'); (image.getpixel((2,2)),image.getpixel((3,3)))"), '((1, 2, 3), (0, 0, 0))')
         with self.assertRaises(ExecutionError):
             await self.agent.execute("draw.point((1,1),fill='red'); raise ValueError('rollback')")
-        with self.assertRaisesRegex(ExecutionError,'recompute'):
-            await self.agent.execute('image.getpixel((1,1))')
+        self.assertEqual(await self.agent.execute('image.getpixel((1,1))'), '(255, 0, 0)')
         for code in ("draw.text((0,0),'bad',font='/etc/passwd')",
                      "draw.text((0,0),'bad','black','/etc/passwd')",
                      "draw.text((0,0),'bad',font_size=1000000)",

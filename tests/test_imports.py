@@ -206,8 +206,8 @@ writer.add_blank_page(width=10,height=10)
                          "(3, 7, 'before', 'before', (2, 2), 1)")
         with self.assertRaises(ExecutionError):
             await self.agent.execute("array[0]=99; cell.value='bad'; paragraph.text='bad'; raise ValueError('rollback')")
-        with self.assertRaisesRegex(ExecutionError,'recompute'):
-            await self.agent.execute('(array.tolist(),cell.value,paragraph.text)')
+        self.assertEqual(await self.agent.execute('(array.tolist(),cell.value,paragraph.text)'),
+                         "([99, 2], 'bad', 'bad')")
         await self.agent.execute("book=Workbook(); cell=book.active['A1']; doc=Document(); paragraph=doc.add_paragraph('before')")
         await self.agent.execute("cell.value='after'; book.save('after.xlsx'); paragraph.text='after'; doc.save('after.docx')")
 
@@ -270,7 +270,7 @@ Path('standard.txt').write_text('ok')
         self.assertEqual(await a.execute('x.tolist()'), '[9, 2]')
         self.assertEqual(await b.execute('x.tolist()'), '[3, 4]')
 
-    async def test_random_generator_live_state_and_recompute_after_error(self):
+    async def test_random_generator_live_state_survives_error(self):
         import numpy as np
         expected = np.random.default_rng(123)
         first = expected.integers(0, 100, size=4).tolist()
@@ -281,6 +281,6 @@ Path('standard.txt').write_text('ok')
         self.agent = await self.runtime.agent(session_id=session_id)
         with self.assertRaises(ExecutionError):
             await self.agent.execute("rng.integers(0,100,size=4); raise ValueError('rollback')")
-        with self.assertRaisesRegex(ExecutionError,'recompute'):
-            await self.agent.execute('rng.integers(0,100,size=4)')
+        third = expected.integers(0, 100, size=4).tolist()
+        self.assertEqual(await self.agent.execute('rng.integers(0,100,size=4).tolist()'), repr(third))
         self.assertEqual(await self.agent.execute('rng=np.random.default_rng(123); rng.integers(0,100,size=4); rng.integers(0,100,size=4).tolist()'), repr(second))

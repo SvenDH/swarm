@@ -87,11 +87,11 @@ math=importlib.import_module('math')
             await self.agent.execute(f"import shutil; shutil.copyfile({str(secret)!r}, 'leak')")
         self.assertEqual(await self.agent.execute("os.path.exists('leak')"), 'False')
 
-    async def test_file_mutations_rollback(self):
+    async def test_file_mutations_survive_exception(self):
         await self.agent.execute("import shutil; open('a','w').write('original')")
         with self.assertRaises(ExecutionError):
             await self.agent.execute("shutil.copyfile('a','b'); raise ValueError('abort')")
-        self.assertEqual(await self.agent.execute("from pathlib import Path; Path('b').exists()"), 'False')
+        self.assertEqual(await self.agent.execute("from pathlib import Path; Path('b').exists()"), 'True')
 
     async def test_common_builtin_helpers(self):
         self.assertEqual(await self.agent.execute('''

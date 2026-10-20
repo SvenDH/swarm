@@ -78,7 +78,7 @@ except Exception as error:
 formatted
 '''), repr(['ValueError: bad input\n']))
 
-    async def test_broadcasting_and_file_commit_rollback(self):
+    async def test_broadcasting_and_partial_file_commit(self):
         self.assertEqual(await self.agent.execute('''
 import numpy as np
 H,W=40,60
@@ -90,7 +90,7 @@ c=np.array([1,2,3],dtype=np.float32)
         self.assertEqual(await self.agent.execute("open('saved','w').write('hello'); open('saved').read()"), "'hello'")
         with self.assertRaises(ExecutionError):
             await self.agent.execute("open('saved','w').write('bad'); print('wrote'); raise ValueError('abort')")
-        self.assertEqual(await self.agent.execute("open('saved').read()"), "'hello'")
+        self.assertEqual(await self.agent.execute("open('saved').read()"), "'bad'")
 
     async def test_shared_budget_serializes_execution_not_agents(self):
         async with Runtime(self.tmp.name + '/shared.db', workspaces=self.tmp.name + '/shared-files', workers=4, memory_budget=8*1024**2) as runtime:

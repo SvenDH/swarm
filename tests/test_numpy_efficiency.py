@@ -40,9 +40,9 @@ a=np.array([1,2],dtype=dtype)
         with self.assertRaises(ExecutionError):
             await self.agent.execute('np.empty(1000000000)')
         with self.assertRaises(ExecutionError):
-            await self.agent.execute('np.empty_like(a,shape=(1000000000,))')
+            await self.agent.execute('np.empty_like(a,shape=(2000000000,))')
 
-    async def test_out_aliases_views_masking_and_rollback(self):
+    async def test_out_aliases_views_masking_and_partial_failure(self):
         self.assertEqual(await self.agent.execute('''
 import numpy as np
 a=np.array([-2,1,9]); alias=a
@@ -54,8 +54,7 @@ np.add(a[1:],2,out=b)
         self.assertEqual(await self.agent.execute('v=a[1:]; np.add(v,1,out=v,where=[True,False]); a.tolist()'), '[0, 2, 4]')
         with self.assertRaises(ExecutionError):
             await self.agent.execute("np.clip(a,0,1,out=a); raise ValueError('abort')")
-        with self.assertRaisesRegex(ExecutionError, 'recompute'):
-            await self.agent.execute('a.tolist()')
+        self.assertEqual(await self.agent.execute('a.tolist()'), '[0, 1, 1]')
         await self.agent.execute('a=np.array([0,2,4])')
         self.assertEqual(await self.agent.execute('s=np.zeros((),dtype=np.int64); np.add.reduce(a,out=s); s.item()'), '6')
         for code in ('np.add(a,1,out=[0,0,0])', "np.add(a,1,out={'__library_value__':{}})"):

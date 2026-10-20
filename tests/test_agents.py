@@ -72,14 +72,14 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
         await self.agent.close()
         self.tmp.cleanup()
 
-    async def test_restart_and_atomic_rollback(self):
+    async def test_restart_preserves_partial_changes_after_exception(self):
         await self.agent.execute("from pathlib import Path; Path('/w').mkdir(); open('a','w').write('original'); x=42")
         with self.assertRaises(Exception):
             await self.agent.execute("open('a','w').write('broken'); x=0; raise ValueError('abort')")
         await self.agent.close()
         self.agent = await CodeAgent.open(self.path, session_id=self.session_id)
-        self.assertEqual(await self.agent.execute("(x, open('a').read(), str(Path.cwd()))"), repr((42, 'original', self.agent.home)))
-        self.assertEqual(await self.agent.execute("from pathlib import Path; Path('a').read_text()"), "'original'")
+        self.assertEqual(await self.agent.execute("(x, open('a').read(), str(Path.cwd()))"), repr((0, 'broken', self.agent.home)))
+        self.assertEqual(await self.agent.execute("from pathlib import Path; Path('a').read_text()"), "'broken'")
 
     async def test_native_filesystem_operations(self):
         await self.agent.execute("from pathlib import Path; Path('/w').mkdir(); Path('/w/a.py').write_text('a\\nb\\na'); Path('/empty').mkdir()")
@@ -275,7 +275,7 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
             await self.agent.execute("print('preview'); open('/a','w').write('after'); raise ValueError('rollback')")
         self.assertEqual(observed[-1], ('stdout', 'preview\n'))
         self.assertFalse(any(kind == 'result' for kind, _ in observed))
-        self.assertEqual(await self.agent.read_file('/a'), b'before')
+        self.assertEqual(await self.agent.read_file('/a'), b'after')
         observed.clear()
         with self.assertRaises(ExecutionError):
             await self.agent.execute("print('x' * 16001)")
@@ -476,7 +476,7 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(await agent.read_file(agent.home + '/a'), b'uncommitted')
             with self.assertRaises(Exception):
                 await agent.execute("open('a','w').write('bad'); raise ValueError('rollback')")
-            self.assertEqual(await agent.read_file(agent.home + '/a'), b'uncommitted')
+            self.assertEqual(await agent.read_file(agent.home + '/a'), b'bad')
         finally:
             await agent.close()
 
@@ -555,8 +555,8 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
             with self.assertRaises(ExecutionError):
                 await self.agent.execute(command, execution_id='failed-command')
         self.assertIsNone((await self.agent.state()).pending)
-        self.assertEqual(await self.agent.read_file(self.agent.home + '/a'), b'before')
-        self.assertEqual(await self.agent.execute('n'), '0')
+        self.assertEqual(await self.agent.read_file(self.agent.home + '/a'), b'bad')
+        self.assertEqual(await self.agent.execute('n'), '1')
         self.assertEqual(self.agent.db.execute(
             "SELECT error FROM executions WHERE id='failed-command'").fetchone()[0], 1)
 

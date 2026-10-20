@@ -46,11 +46,11 @@ def f():
 f()
 '''), "'deleted'")
 
-    async def test_failed_delete_rolls_back(self):
+    async def test_deletions_before_exception_persist(self):
         await self.agent.execute("x=42; a=[1,2,3]")
         with self.assertRaisesRegex(ExecutionError, 'ValueError'):
             await self.agent.execute("del x, a[0]; raise ValueError('abort')")
-        self.assertEqual(await self.agent.execute('(x,a)'), '(42, [1, 2, 3])')
+        self.assertEqual(await self.agent.execute("('x' in globals(),a)"), '(False, [2, 3])')
 
     @unittest.skipUnless('pandas' in available(), 'pandas missing')
     async def test_dataframe_column_deletion_and_readonly_namespaces(self):

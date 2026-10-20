@@ -57,7 +57,7 @@ array.shape
                     await a.execute('x.tolist()')
                 self.assertEqual(await a.execute("x=np.load('saved.npy'); x.tolist()"),'[0, 1, 2, 3]')
 
-    async def test_native_failure_invalidates_only_its_session(self):
+    async def test_exception_preserves_partial_native_and_durable_changes(self):
         with tempfile.TemporaryDirectory() as folder:
             async with Runtime(folder+'/agents.db') as runtime:
                 a,b=await runtime.agent(),await runtime.agent()
@@ -65,9 +65,8 @@ array.shape
                 await b.execute('import numpy as np; x=np.arange(3)+10')
                 with self.assertRaisesRegex(ExecutionError,'abort'):
                     await a.execute("count=99; x[0]=99; open('saved','w').write('bad'); raise ValueError('abort')")
-                self.assertEqual(await a.execute("(count,open('saved').read())"),"(1, 'old')")
-                with self.assertRaisesRegex(ExecutionError,'recompute'):
-                    await a.execute('x.tolist()')
+                self.assertEqual(await a.execute("(count,open('saved').read())"),"(99, 'bad')")
+                self.assertEqual(await a.execute('x.tolist()'), '[99, 1, 2]')
                 self.assertEqual(await b.execute('x.tolist()'),'[10, 11, 12]')
 
     async def test_shared_lru_budget_evicts_old_objects_instead_of_serializing(self):
