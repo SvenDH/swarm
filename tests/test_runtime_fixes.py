@@ -110,7 +110,7 @@ c=np.array([1,2,3],dtype=np.float32)
                 results = await asyncio.gather(*(agent.execute("data=b'x'*1500000; len(data)") for agent in agents))
             self.assertEqual(results, ['1500000', '1500000'])
             self.assertEqual(peak, 1)
-            with self.assertRaises(ValueError):
+            with self.assertRaises(TypeError):
                 await runtime.agent(memory_budget=16*1024**2)
 
     async def test_checkpoint_headroom_keeps_cleanup_possible(self):

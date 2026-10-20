@@ -6,7 +6,7 @@ import math
 from inspect import signature
 
 from .files import source, save
-from .bridge import descriptor
+from .bridge import descriptor, TypeRef
 
 FORMATS = {'PNG', 'JPEG', 'GIF', 'WEBP', 'TIFF', 'BMP', 'ICO'}
 ENHANCERS = {'Brightness': ImageEnhance.Brightness, 'Contrast': ImageEnhance.Contrast,
@@ -22,6 +22,19 @@ FILTERS = {'GaussianBlur': ImageFilter.GaussianBlur, 'BoxBlur': ImageFilter.BoxB
            'EMBOSS': ImageFilter.EMBOSS, 'SMOOTH_MORE': ImageFilter.SMOOTH_MORE}
 FILTER_PARAMETERS = {'GaussianBlur': 'radius', 'BoxBlur': 'radius', 'MedianFilter': 'size',
                      'MinFilter': 'size', 'MaxFilter': 'size', 'ModeFilter': 'size'}
+
+
+class PixelAccess:
+    """Recreate native pixel access per operation; persist only the image root."""
+
+    def __init__(self, image):
+        self.image = image
+
+    def __getitem__(self, key):
+        return self.image.load()[key]
+
+    def __setitem__(self, key, value):
+        self.image.load()[key] = value
 
 
 class Drawing:
@@ -167,23 +180,6 @@ def scale(image, factor, **kwargs):
     return ImageOps.scale(image, factor, **kwargs)
 
 
-def run(fs, op, path=None, output=None, size=None, mode='RGB', color='white'):
-    if op not in ('info', 'new', 'resize', 'convert'):
-        raise ValueError('unknown image operation')
-    api = exports(fs)['Image']
-    image = api['new'](mode, tuple(size), color) if op == 'new' else api['open'](path)
-    try:
-        if op == 'info':
-            return {'size': list(image.size), 'mode': image.mode, 'format': image.format}
-        if op == 'resize':
-            image = members(image, fs)['resize'](tuple(size))
-        elif op == 'convert':
-            image = image.convert(mode)
-        return members(image, fs)['save'](output)
-    finally:
-        image.close()
-
-
 def exports(fs):
     def open_image(fp, **kwargs):
         if set(kwargs) - {'mode', 'formats'}:
@@ -214,7 +210,7 @@ def exports(fs):
             checked_size(size)
             return factory(tuple(size), *args, **kwargs)
         return create
-    return {'Image': {'open': open_image, 'new': new,
+    return {'Image': {'Image': types()['Image'], 'open': open_image, 'new': new,
                       'fromarray': fromarray, 'frombytes': frombytes, 'merge': merge,
                       **{name: int(value) for name, value in Image.Resampling.__members__.items()},
                       'Transpose': enum_values(Image.Transpose), 'Transform': enum_values(Image.Transform),
@@ -259,6 +255,10 @@ def cover(image, size, method=Image.Resampling.BICUBIC):
     return ImageOps.cover(image, size, method=method)
 
 
+def types():
+    return {'Image': TypeRef('Image', Image.Image)}
+
+
 def members(image, fs, name=None):
     if isinstance(image, DefaultFont):
         native = image.native()
@@ -286,6 +286,7 @@ def members(image, fs, name=None):
             raise ValueError('getdata is limited to 10,000 pixels; prefer np.asarray(image)')
         return list(image.getdata())
     return {'size': image.size, 'width': image.width, 'height': image.height,
+            'load': lambda: PixelAccess(image),
             'drawing': lambda mode=None: Drawing(image, mode),
             'mode': image.mode, 'format': image.format, 'save': write, 'resize': resize,
             'crop': crop, 'rotate': image.rotate, 'convert': image.convert,
@@ -345,7 +346,7 @@ def restore(kind, data):
 
 
 def is_view(value):
-    return isinstance(value, Drawing)
+    return isinstance(value, (Drawing, PixelAccess))
 
 
 def iterate(value):
@@ -353,6 +354,8 @@ def iterate(value):
 
 
 def view(root, value):
+    if isinstance(root, Image.Image) and isinstance(value, PixelAccess) and value.image is root:
+        return [['call', 'load', [], {}]]
     if isinstance(root, Image.Image) and isinstance(value, Drawing) and value.image is root:
         return [['call', 'drawing', [value.mode], {}]]
     return None

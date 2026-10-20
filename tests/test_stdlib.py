@@ -10,6 +10,16 @@ class StdlibTests(unittest.IsolatedAsyncioTestCase):
     asyncSetUp = test_agents.AgentTests.asyncSetUp
     asyncTearDown = test_agents.AgentTests.asyncTearDown
 
+    async def test_native_modules_and_seeded_randomness(self):
+        self.assertEqual(await self.agent.execute('''
+import sys, pathlib, json, time, random
+random.seed(42)
+first=random.random()
+random.seed(42)
+(type(sys).__name__,type(pathlib).__name__,json.loads(json.dumps({'a':1})),
+ time.time()>0,first==random.random())
+'''), "('module', 'module', {'a': 1}, True, True)")
+
     async def test_readonly_globals_snapshot_and_restart(self):
         self.assertEqual(await self.agent.execute('''
 x=7

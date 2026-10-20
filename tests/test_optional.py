@@ -8,7 +8,6 @@ from pathlib import Path
 from unittest.mock import patch
 
 from agents import Runtime, ExecutionError
-from wrappers import tools
 from wrappers import registry
 from wrappers.imports import prepare
 
@@ -19,7 +18,6 @@ class AvailabilityTests(unittest.TestCase):
         try:
             with patch.object(registry, 'find_spec', return_value=None):
                 self.assertEqual(registry.available(), {})
-                self.assertEqual(tools(None), {})
                 for source in ('import numpy', 'import matplotlib.pyplot as plt',
                                'from bs4 import BeautifulSoup', 'import fitz'):
                     with self.subTest(source=source), self.assertRaisesRegex(ImportError, 'No module named'):

@@ -57,6 +57,17 @@ MUTATING = {'numpy': {'sort', 'random', 'rand', 'randn', 'randint', 'random_samp
 CROSS = {'scipy': ('numpy',), 'sklearn': ('numpy',), 'seaborn': ('matplotlib',), 'matplotlib': ('numpy',)}
 
 
+class TypeRef:
+    """An identification token, not a callable host class."""
+    def __init__(self, name, cls):
+        self.name, self.cls = name, cls
+
+
+def restore_value(module, kind, data):
+    api = backend(module)
+    return api.types()[data] if kind == 'type' else api.restore(kind, data)
+
+
 def backend(module):
     if module not in MODULES:
         raise ImportError(f'Unsupported library: {module}')
@@ -88,7 +99,7 @@ def decode(value, cache=None, fs=None):
                 raise TypeError('Library namespaces cannot be passed as data')
             identity = (root['module'], root['identity'])
             if identity not in cache:
-                cache[identity] = backend(root['module']).restore(root['kind'], root['data'])
+                cache[identity] = restore_value(root['module'], root['kind'], root['data'])
             result = resolve(cache[identity], value['path'], root['module'], fs, cache)
             if callable(result) and not (root['module'] == 'numpy' and
                                            root['kind'] == 'scalar_type' and not value['path']):
@@ -105,6 +116,8 @@ def decode(value, cache=None, fs=None):
 
 
 def member(value, name, module, fs):
+    if isinstance(value, TypeRef) and name in ('__name__', '__module__'):
+        return value.name if name == '__name__' else value.cls.__module__
     if name == '__version__' and module not in STDLIB and (type(value) is dict or
             (module == 'numpy' and isinstance(value, backend(module).Session))):
         distribution = {'PIL': 'Pillow', 'docx': 'python-docx', 'pptx': 'python-pptx',
@@ -114,7 +127,9 @@ def member(value, name, module, fs):
         raise AttributeError(f"module '{module}' has no attribute '{name}'")
     members = value if type(value) is dict else backend(module).members(value, fs, name)
     if name not in members:
-        raise AttributeError(f"'{module}' object has no attribute '{name}'")
+        if type(value) is dict:
+            raise AttributeError(f"module '{module}' has no attribute '{name}'")
+        raise AttributeError(f"'{type(value).__name__}' object has no attribute '{name}'")
     return members[name]
 
 
@@ -136,6 +151,8 @@ def resolve(root, path, module, fs, cache=None):
 
 
 def encode(value, module, root=None, path=None):
+    if isinstance(value, TypeRef):
+        return {'__library_object__': descriptor(module, 'type', value.name)}
     if isinstance(value, PRIMITIVES):
         return value
     # Children of document/workbook roots keep paths into the same persisted root.
@@ -180,7 +197,7 @@ def dispatch(fs, action, spec, path=(), args=(), kwargs=None):
             (kwargs.get('out') is not None or (path and path[-1][1] in MUTATING['numpy'])))
         root = api.restore('array', spec['data'], copy=bool(writable))
     else:
-        root = api.restore(spec['kind'], spec['data'])
+        root = restore_value(module, spec['kind'], spec['data'])
     cache = {} if spec['kind'] == 'module' else {(module, spec['identity']): root}
     value = resolve(root, path, module, fs, cache)
     wire_args, wire_kwargs = args, kwargs or {}
@@ -193,7 +210,7 @@ def dispatch(fs, action, spec, path=(), args=(), kwargs=None):
             return {'call': True}
         result_path = [*path, ['attr', name]]
         # Constants/distributions are independent values, not views of namespaces.
-        if spec['kind'] == 'module' and (not stateful or module == 'numpy') and api.pack(result) is not None:
+        if isinstance(result, TypeRef) or (spec['kind'] == 'module' and (not stateful or module == 'numpy') and api.pack(result) is not None):
             return {'result': encode(result, module)}
         # Learned/statistical arrays belong to NumPy, not to the estimator backend.
         if module in ('scipy', 'sklearn'):
@@ -276,6 +293,11 @@ def dispatch(fs, action, spec, path=(), args=(), kwargs=None):
         result = len(value)
     elif action == 'callable':
         result = callable(value)
+    elif action == 'is_type':
+        result = isinstance(value, (TypeRef, type))
+    elif action == 'isinstance':
+        expected = args[0]
+        result = isinstance(value, expected.cls if isinstance(expected, TypeRef) else expected)
     elif action == 'dir':
         result = sorted(key for key in (value if type(value) is dict else api.members(value, fs))
                         if not key.startswith('_'))
@@ -336,4 +358,9 @@ def dispatch(fs, action, spec, path=(), args=(), kwargs=None):
                 if result_view is not None:
                     response['argument_result'] = {'module': owner, 'identity': identity, 'path': result_view}
                     break
+    # File-like arguments can change their contents/cursor in another adapter.
+    for (owner, identity), obj in cache.items():
+        if owner == 'io' and (owner, identity) != (module, spec['identity']):
+            response.setdefault('updates', []).append(
+                {'module': owner, 'identity': identity, 'data': backend(owner).pack(obj)['data']})
     return response

@@ -6,19 +6,6 @@ from .files import source, save
 from .bridge import descriptor
 
 
-def run(fs, op, path, output=None, pages=None):
-    reader = PdfReader(source(fs, path))
-    indices = range(len(reader.pages)) if pages is None else pages
-    if op == 'read':
-        return [reader.pages[i].extract_text() for i in indices]
-    if op != 'select':
-        raise ValueError('unknown PDF operation')
-    writer = PdfWriter()
-    for i in indices:
-        writer.add_page(reader.pages[i])
-    return save(fs, output, writer.write)
-
-
 def exports(fs):
     def writer(*, clone_from=None):
         if clone_from is None:

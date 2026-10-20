@@ -5,7 +5,7 @@ import json
 import operator
 from numpy._core._exceptions import _ArrayMemoryError
 
-from .bridge import descriptor
+from .bridge import descriptor, TypeRef
 from .files import source, save
 from .limits import check_memory
 from .api import select
@@ -215,18 +215,6 @@ def array(data, dtype=None, **kwargs):
     return np.array(initial, dtype=dtype, **kwargs)
 
 
-def run(fs, op, data, other=None, axis=None):
-    a = np.asarray(data)
-    operations = {'array': lambda: a, 'sum': lambda: a.sum(axis=axis),
-                  'mean': lambda: a.mean(axis=axis), 'min': lambda: a.min(axis=axis),
-                  'max': lambda: a.max(axis=axis), 'std': lambda: a.std(axis=axis),
-                  'median': lambda: np.median(a, axis=axis),
-                  'transpose': lambda: a.T, 'reshape': lambda: a.reshape(other),
-                  'dot': lambda: a.dot(other), 'unique': lambda: np.unique(a)}
-    value = operations[op]()
-    return value.tolist()
-
-
 def bounded(factory):
     def create(shape, *args, **kwargs):
         dtype = kwargs.get('dtype', args[1] if factory is np.full and len(args) > 1 else
@@ -348,6 +336,10 @@ def fft_frequencies(function):
     return frequencies
 
 
+def types():
+    return {'ndarray': TypeRef('ndarray', np.ndarray)}
+
+
 def exports(fs, rng=None):
     def load(path, *, allow_pickle=False):
         if allow_pickle:
@@ -359,7 +351,7 @@ def exports(fs, rng=None):
         path = str(path)
         return save(fs, path if path.endswith('.npy') else path + '.npy',
                     lambda stream: np.save(stream, array, allow_pickle=False))
-    return {**select(vars(np), PURE),
+    return {**select(vars(np), PURE), 'ndarray': types()['ndarray'],
             'pad': pad, 'take': take, 'finfo': machine_info, 'iinfo': lambda dtype: machine_info(dtype, True),
             'result_type': np.result_type, 'promote_types': np.promote_types, 'can_cast': np.can_cast,
             'iscomplex': np.iscomplex, 'isreal': np.isreal, 'iscomplexobj': np.iscomplexobj, 'isrealobj': np.isrealobj,

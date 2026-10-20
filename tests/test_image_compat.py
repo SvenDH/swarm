@@ -19,6 +19,31 @@ class ImageCompatibilityTests(unittest.IsolatedAsyncioTestCase):
         await self.runtime.close()
         self.tmp.cleanup()
 
+    async def test_reviewed_type_checks_and_accurate_errors(self):
+        self.assertEqual(await self.agent.execute('''
+from PIL import Image
+import numpy as np
+image=Image.new('RGB',(2,2))
+values=np.arange(3)
+image_type=Image.Image
+array_type=np.ndarray
+(isinstance(image,image_type),isinstance(values,array_type),
+ isinstance(image,array_type),isinstance(values,image_type),
+ isinstance(1,array_type),isinstance(values,(image_type,array_type)),
+ image_type.__name__,array_type.__name__)
+'''), "(True, True, False, False, False, True, 'Image', 'ndarray')")
+        session_id = self.agent.id
+        await self.runtime.close()
+        self.runtime = await Runtime(self.database, workers=2).__aenter__()
+        self.agent = await self.runtime.agent(session_id=session_id)
+        self.assertEqual(await self.agent.execute('(isinstance(image,image_type),isinstance(values,array_type))'), '(True, True)')
+        with self.assertRaisesRegex(ExecutionError, "'Image' object has no attribute 'missing_method'"):
+            await self.agent.execute('image.missing_method()')
+        for code in ('image_type.cls', 'image_type.__mro__', 'array_type.__subclasses__()',
+                     'isinstance(image,Image)', 'np.ndarray((10,))'):
+            with self.subTest(code=code), self.assertRaises(ExecutionError):
+                await self.agent.execute(code)
+
     async def test_image_array_operations_and_checkpoint(self):
         result = await self.agent.execute('''
 import numpy as np

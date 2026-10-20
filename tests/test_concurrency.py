@@ -9,6 +9,8 @@ import httpx
 from openai import AsyncOpenAI
 
 from agents import Runtime
+from wrappers.protocol import Bridge
+from wrappers.registry import available
 from test_agents import stream_response
 
 
@@ -21,6 +23,7 @@ class ConcurrencyTests(unittest.IsolatedAsyncioTestCase):
         await self.runtime.close()
         self.tmp.cleanup()
 
+    @unittest.skipUnless('numpy' in available(), 'numpy missing')
     async def test_slow_library_keeps_loop_responsive_and_other_code_waits_for_budget(self):
         a, b = await asyncio.gather(self.runtime.agent(), self.runtime.agent())
         started, release = threading.Event(), threading.Event()
@@ -28,15 +31,16 @@ class ConcurrencyTests(unittest.IsolatedAsyncioTestCase):
         observed = []
         a.on_output = lambda kind, text: observed.append(threading.get_ident())
 
-        def slow_numpy(fs, *args, **kwargs):
+        original = Bridge.__call__
+        def slow_numpy(bridge, *args, **kwargs):
             self.assertNotEqual(threading.get_ident(), loop_thread)
             started.set()
             if not release.wait(5):
                 raise TimeoutError('test did not release callback')
-            return 7
+            return original(bridge, *args, **kwargs)
 
-        with patch('agents.library_tools', lambda fs: {'numpy': lambda *args: slow_numpy(fs, *args)}):
-            running = asyncio.create_task(a.execute("print('start'); numpy('sum', [1])"))
+        with patch.object(Bridge, '__call__', slow_numpy):
+            running = asyncio.create_task(a.execute("print('start'); import numpy as np; np.sum([1])"))
             queued = None
             try:
                 self.assertTrue(await asyncio.to_thread(started.wait, 5))
@@ -46,7 +50,7 @@ class ConcurrencyTests(unittest.IsolatedAsyncioTestCase):
                 self.assertFalse(running.done())
             finally:
                 release.set()
-            self.assertEqual(await running, 'start\n7')
+            self.assertEqual(await running, 'start\n1')
             self.assertEqual(await queued, '42')
         self.assertTrue(observed)
         self.assertEqual(set(observed), {loop_thread})
@@ -92,19 +96,21 @@ class ConcurrencyTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(await a.execute(execution_id='cancelled'), '1')
         self.assertEqual(await a.execute('n'), '1')
 
+    @unittest.skipUnless('numpy' in available(), 'numpy missing')
     async def test_cancel_during_sandbox_execution_is_recoverable(self):
         a = await self.runtime.agent()
         await a.execute('n=0')
         started, release = threading.Event(), threading.Event()
 
-        def slow_call(*args):
+        original = Bridge.__call__
+        def slow_call(bridge, *args, **kwargs):
             started.set()
             if not release.wait(5):
                 raise TimeoutError('test did not release callback')
-            return 1
+            return original(bridge, *args, **kwargs)
 
-        with patch('agents.library_tools', lambda fs: {'numpy': slow_call}):
-            running = asyncio.create_task(a.execute("n += 1; numpy('sum', [1]); n", execution_id='cancel-sandbox'))
+        with patch.object(Bridge, '__call__', slow_call):
+            running = asyncio.create_task(a.execute("n += 1; import numpy as np; np.sum([1]); n", execution_id='cancel-sandbox'))
             try:
                 self.assertTrue(await asyncio.to_thread(started.wait, 5))
                 running.cancel()

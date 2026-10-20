@@ -3,9 +3,10 @@ import ast
 import builtins
 import hashlib
 import textwrap
+from importlib import import_module
 from pathlib import Path
 
-from .registry import MODULES, ALIASES, require
+from .registry import MODULES, ALIASES, NATIVE, require
 
 BOOTSTRAP = Path(__file__).with_name('sandbox.py').read_text()
 CHECK = 'try:\n    _library_modules\nexcept NameError:\n    _library_ready=None\nelse:\n    _library_ready=list(_library_modules)\n_library_ready'
@@ -103,20 +104,11 @@ def _library_import_module(name, package=None):
     if name.startswith('.'):
         raise ImportError('Relative imports are not supported')
     parts = name.split('.')
-    if parts[0] == 'math':
-        import math
-        result = math
-    elif parts[0] == 'pathlib':
-        import pathlib
-        result = pathlib
-    elif parts[0] == 'datetime':
-        import datetime
-        result = datetime
-    else:
-        result = _library_import(parts[0])
+    result = _library_native_import(parts[0]) if parts[0] in _library_native_modules else _library_import(parts[0])
     for part in parts[1:]:
         result = _library_get(result, part)
-        if not isinstance(result, _LibraryValue) or result.root['kind'] != 'module':
+        if not ((isinstance(result, _LibraryValue) and result.root['kind'] == 'module') or
+                type(result).__name__ == 'module'):
             raise ModuleNotFoundError("No module named '" + name + "'")
     return result
 def _library_getattr(value, name, *default):
@@ -148,11 +140,23 @@ def _library_callable(value):
 def _library_vars(value):
     if isinstance(value, _LibraryValue):
         return {name: _library_get(value, name) for name in _library_request(value, 'dir')}
+    if type(value).__name__ == 'module':
+        return {name: getattr(value, name) for name in _library_dir(value)}
     return {name: getattr(value, name) for name in _object_fields(value, True)}
 def _library_dir(value):
     if isinstance(value, _LibraryValue):
         return _library_request(value, 'dir')
+    if type(value).__name__ == 'module':
+        return [name for name in _library_native_modules.get(str(value), ()) if hasattr(value, name)]
     return sorted(_object_fields(value, False))
+def _library_isinstance(value, classes):
+    if isinstance(classes, tuple):
+        return any(_library_isinstance(value, item) for item in classes)
+    if isinstance(classes, _LibraryValue):
+        if not _library_request(classes, 'is_type'):
+            raise TypeError('isinstance() arg 2 must be a type or tuple of types')
+        return _library_request(value, 'isinstance', classes) if isinstance(value, _LibraryValue) else False
+    return isinstance(value, classes)
 def _library_delitem(value, key):
     if isinstance(value, _LibraryValue):
         return _library_request(value, 'delitem', key)
@@ -167,12 +171,17 @@ def _library_delitem(value, key):
     else:
         raise TypeError("object does not support item deletion")
 '''
-# Refresh helper definitions on restored sessions without resetting objects.
-DELETE_BOOTSTRAP += '\n' + '\n'.join(ast.unparse(node) for node in ast.parse(BOOTSTRAP).body
-    if isinstance(node, ast.FunctionDef) and node.name in ('_library_get', '_library_request', '_library_item', '_library_len', '_library_iter'))
+# Only names cross this boundary. Attribute lookup stays inside Monty, so native
+# modules never become their string wire representation during introspection.
+_native_names = {f"<module '{name}'>": sorted(key for key in vars(import_module(name)) if not key.startswith('_'))
+                 for name in NATIVE}
+DELETE_BOOTSTRAP += '\n_library_native_modules = ' + repr({**_native_names, **{name: () for name in NATIVE}}) + '\n'
+DELETE_BOOTSTRAP += 'def _library_native_import(name):\n' + ''.join(
+    f'    if name == {name!r}:\n        import {name}\n        return {name}\n' for name in NATIVE)
+DELETE_BOOTSTRAP += "    raise ModuleNotFoundError(\"No module named '\" + name + \"'\")\n"
 # Defining functions on every call retains old interpreter code in checkpoints.
 # Refresh once per helper revision, including sessions restored after an update.
-_revision = hashlib.sha256(DELETE_BOOTSTRAP.encode()).hexdigest()
+_revision = hashlib.sha256((BOOTSTRAP + DELETE_BOOTSTRAP).encode()).hexdigest()
 CHECK += ("\ntry:\n    _library_revision\nexcept NameError:\n    _library_revision=None\n"
           f"(_library_ready, _library_revision == {_revision!r})")
 DELETE_BOOTSTRAP = ("try:\n    _library_revision\nexcept NameError:\n    _library_revision=None\n"
@@ -373,7 +382,7 @@ class LibrarySyntax(ast.NodeTransformer):
             node = ast.Call(ast.Name('locals', ast.Load()), [], [])
             return ast.Call(ast.Name('sorted', ast.Load()), [node], []) if listing else node
         if isinstance(node.func, ast.Name) and node.func.id in ('len', 'list', 'tuple', 'print', 'str', 'float', 'int', 'bool',
-                                                              'getattr', 'hasattr', 'callable', 'vars', 'dir'):
+                                                              'getattr', 'hasattr', 'callable', 'vars', 'dir', 'isinstance'):
             node.func = ast.Name('_library_' + node.func.id, ast.Load())
         if isinstance(node.func, ast.Name) and node.func.id in BUILTINS:
             return node
@@ -398,7 +407,7 @@ def prepare(source, active=False, loaded=()):
             backend(name)
     tree = ast.parse(source)
     active = active or any(
-        isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id in ('exec','getattr','hasattr','callable','vars','dir','globals','__import__') or
+        isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id in ('exec','getattr','hasattr','callable','vars','dir','globals','__import__','isinstance') or
         isinstance(node, ast.Delete) or
         isinstance(node, ast.Import) and any(alias.name.split('.')[0] in (*MODULES, *ALIASES) for alias in node.names) or
         isinstance(node, ast.ImportFrom) and node.module and node.module.split('.')[0] in (*MODULES, *ALIASES)

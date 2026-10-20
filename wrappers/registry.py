@@ -3,6 +3,10 @@ from importlib.util import find_spec
 from functools import lru_cache
 
 STDLIB = {'os', 'stat', 'shutil', 'tempfile', 'importlib', 'platform', 'resource', 'gc', 'traceback'}
+NATIVE = ('sys', 'math', 'pathlib', 'datetime', 'json', 'time', 'random', 're',
+          'collections', 'itertools', 'functools', 'typing', 'base64', 'binascii')
+BINARY = {'zlib', 'struct', 'hashlib', 'array', 'io'}
+STDLIB |= BINARY
 
 MODULES = {
     'numpy': 'numpy', 'pandas': 'pandas', 'PIL': 'pil', 'openpyxl': 'openpyxl',
@@ -12,6 +16,7 @@ MODULES = {
     'sympy': 'sympy', 'sklearn': 'sklearn', 'xlsxwriter': 'xlsxwriter',
 }
 MODULES.update({name: 'stdlib' for name in STDLIB})
+MODULES.update({name: 'binary' for name in BINARY})
 ALIASES = {'fitz': 'pymupdf'}
 REQUIRES = {'pandas': ('numpy',), 'matplotlib': ('numpy', 'PIL'),
             'seaborn': ('numpy', 'pandas', 'matplotlib'),

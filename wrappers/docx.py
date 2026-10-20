@@ -14,17 +14,6 @@ from .files import source, save
 from .bridge import descriptor
 
 
-def run(fs, op, path, paragraphs=None):
-    if op not in ('read', 'write', 'append'):
-        raise ValueError('unknown document operation')
-    document = Document() if op == 'write' else Document(source(fs, path))
-    if op == 'read':
-        return [p.text for p in document.paragraphs]
-    for text in paragraphs or []:
-        document.add_paragraph(text)
-    return save(fs, path, document.save)
-
-
 def exports(fs):
     return {'Document': lambda docx=None: Document() if docx is None else Document(source(fs, docx)),
             'shared': {'Inches': Inches, 'Cm': Cm, 'Mm': Mm, 'Pt': Pt, 'Emu': Emu, 'Twips': Twips,

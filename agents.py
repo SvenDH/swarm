@@ -38,7 +38,6 @@ from pydantic import BaseModel, ConfigDict
 from pydantic_monty import CallbackFile, AsyncMonty, MontyError, MontyCrashedError, MontyClassProxy, OSAccess
 from dotenv import load_dotenv
 from names import num_to_name
-from wrappers import tools as library_tools
 from wrappers.protocol import Bridge
 from wrappers.bridge import backend as library_backend
 from wrappers.imports import BOOTSTRAP, CHECK, DELETE_BOOTSTRAP, prepare as prepare_libraries, cleanup as cleanup_libraries
@@ -304,14 +303,12 @@ class Runtime:
         self.db.execute('PRAGMA journal_mode=WAL')
         self.db.execute('PRAGMA synchronous=FULL')
         columns = [r[1] for r in self.db.execute('PRAGMA table_info(sessions)')]
-        if columns and columns not in (['id', 'name', 'cwd', 'monty', 'messages'],
-                                      ['id', 'name', 'cwd', 'monty', 'messages', 'memory_budget'],
-                                      ['id', 'name', 'cwd', 'monty', 'messages', 'memory_budget', 'paused']):
-            raise RuntimeError('unsupported database schema; choose a new database and workspace root')
+        if columns and columns != ['id', 'name', 'cwd', 'monty', 'messages', 'paused']:
+            raise RuntimeError('unsupported database schema; use a new database and workspace root')
         self.db.executescript('''
             CREATE TABLE IF NOT EXISTS sessions (
                 id INTEGER PRIMARY KEY, name TEXT UNIQUE NOT NULL, cwd TEXT NOT NULL,
-               monty BLOB, messages TEXT NOT NULL DEFAULT '[]', memory_budget INTEGER);
+               monty BLOB, messages TEXT NOT NULL DEFAULT '[]', paused INTEGER NOT NULL DEFAULT 0);
             CREATE TABLE IF NOT EXISTS files (
                 session_id INTEGER NOT NULL, path TEXT NOT NULL, kind TEXT NOT NULL,
                 storage_key TEXT, size INTEGER NOT NULL, PRIMARY KEY(session_id,path));
@@ -320,7 +317,7 @@ class Runtime:
                 tool_id TEXT, output TEXT, error INTEGER NOT NULL DEFAULT 0,
                 PRIMARY KEY(session_id,id));
             CREATE TABLE IF NOT EXISTS runtime_secrets (
-                id INTEGER PRIMARY KEY CHECK(id=1), library_key BLOB NOT NULL);
+                id INTEGER PRIMARY KEY CHECK(id=1), library_key BLOB NOT NULL, memory_budget INTEGER NOT NULL);
             CREATE TABLE IF NOT EXISTS prompts (
                 id INTEGER PRIMARY KEY, session_id INTEGER NOT NULL, prompt TEXT,
                 started INTEGER NOT NULL DEFAULT 0, result TEXT, error TEXT);
@@ -328,13 +325,10 @@ class Runtime:
             CREATE UNIQUE INDEX IF NOT EXISTS one_pending_execution
                 ON executions(session_id) WHERE output IS NULL;
         ''')
-        if 'memory_budget' not in {row[1] for row in self.db.execute('PRAGMA table_info(sessions)')}:
-            self.db.execute('ALTER TABLE sessions ADD COLUMN memory_budget INTEGER')
-        if 'paused' not in {row[1] for row in self.db.execute('PRAGMA table_info(sessions)')}:
-            self.db.execute('ALTER TABLE sessions ADD COLUMN paused INTEGER NOT NULL DEFAULT 0')
-        self.db.execute('UPDATE sessions SET memory_budget=? WHERE memory_budget IS NULL', (self.memory_budget,))
-        self.db.execute('INSERT OR IGNORE INTO runtime_secrets VALUES (1, ?)', (os.urandom(32),))
-        self._library_key = self.db.execute('SELECT library_key FROM runtime_secrets WHERE id=1').fetchone()[0]
+        self.db.execute('INSERT OR IGNORE INTO runtime_secrets VALUES (1, ?, ?)', (os.urandom(32), self.memory_budget))
+        self._library_key, saved_budget = self.db.execute('SELECT library_key,memory_budget FROM runtime_secrets WHERE id=1').fetchone()
+        if saved_budget != self.memory_budget:
+            raise ValueError('worker memory budget changed; use a new database and workspace root')
 
     async def __aenter__(self):
         if self._stack is not None or self._closing:
@@ -420,15 +414,11 @@ class Runtime:
             entries.append((path.relative_to(self.template).as_posix(), content))
         return entries
 
-    async def agent(self, *, session_id=None, model=None, on_output=None, memory_budget=None):
-        if memory_budget is not None and (session_id is not None or type(memory_budget) is not int or memory_budget < 1024**2):
-            raise ValueError('memory_budget must be at least 1 MiB and can only be set for new sessions')
-        if memory_budget is not None and memory_budget > self.memory_budget:
-            raise ValueError('session cap cannot exceed the shared worker memory budget')
+    async def agent(self, *, session_id=None, model=None, on_output=None):
         async with self.operation():
             async with self._creation_slots:
                 entries = await self.offload(self._template_entries) if session_id is None else ()
-                agent = CodeAgent(self, model=model, on_output=on_output, memory_budget=memory_budget)
+                agent = CodeAgent(self, model=model, on_output=on_output)
                 await self.database_call(agent._initialize, session_id, entries)
                 del entries
             lock = self._locks.get(agent.id)
@@ -456,10 +446,10 @@ class Runtime:
 class CodeAgent:
     """Persist pending code, then commit its checkpoint/files/result atomically."""
 
-    def __init__(self, runtime, *, model=None, on_output=None, memory_budget=None):
+    def __init__(self, runtime, *, model=None, on_output=None):
         self.runtime, self.db, self.storage = runtime, runtime.db, runtime.storage
         self.model, self.on_output = model or runtime.model, on_output
-        self.memory_budget = runtime.memory_budget if memory_budget is None else memory_budget
+        self.memory_budget = runtime.memory_budget
         self._streamed_calls = set()
         self._closed = self._owns_runtime = False
 
@@ -502,15 +492,15 @@ class CodeAgent:
                     fs.mkdir(path if content is None else str(Path(path).parent))
                     if content is not None:
                         fs.write(path, content)
-                self.db.execute('INSERT INTO sessions(id,name,cwd,memory_budget) VALUES (?,?,?,?)',
-                                (self.id, self.name, self.home, self.memory_budget))
+                self.db.execute('INSERT INTO sessions(id,name,cwd) VALUES (?,?,?)',
+                                (self.id, self.name, self.home))
                 self._replace_files(self._publish(fs.entries()))
             else:
                 self.id = session_id
-                row = self.db.execute('SELECT name,memory_budget FROM sessions WHERE id=?', (session_id,)).fetchone()
+                row = self.db.execute('SELECT name FROM sessions WHERE id=?', (session_id,)).fetchone()
                 if row is None:
                     raise ValueError(f'unknown session: {session_id}')
-                self.name, self.memory_budget = row
+                self.name = row[0]
 
     @property
     def home(self):
@@ -673,8 +663,6 @@ class CodeAgent:
                 self._emit('python', request['code'])
             printed = []
             try:
-                if self.memory_budget > self.runtime.memory_budget:
-                    raise MemoryError()
                 fs, snapshot, output, stdout, images = await self._evaluate(request['code'], state, files, printed)
             except MontyCrashedError:
                 raise  # Infrastructure failures/cancellation leave the request pending.
@@ -744,7 +732,7 @@ class CodeAgent:
             if type(value) in (list, tuple, dict, str, bytes, bool, int, float, complex, type(None)):
                 return [name for name in dir(value) if not name.startswith('_')]
             raise TypeError('Object does not support attribute discovery')
-        functions = {**library_tools(fs), '_library_rpc': bridge, 'display': display,
+        functions = {'_library_rpc': bridge, 'display': display,
                      '_prepare_exec': prepare_exec, '_object_fields': object_fields}
         # AsyncMonty runs synchronous OS/library callbacks on its worker threads.
         # Keep these synchronous so sandbox callers need not write `await numpy(...)`.
@@ -762,6 +750,8 @@ class CodeAgent:
             if state.monty is not None or cleanup is not None:
                 loaded, helpers_ready = await session.feed_run(CHECK, external_lookup=functions, print_callback=lambda *args: None)
                 active = loaded is not None
+                if active and not helpers_ready:
+                    raise ImportError('session runtime changed; start a new session')
             if cleanup is None:
                 code, libraries = await self.runtime.offload(prepare_libraries, code, active, loaded or ())
             else:
@@ -789,7 +779,7 @@ class CodeAgent:
             snapshot = await session.dump()
             # Checkpoint/restore needs another serialized copy. Reserve that
             # copy plus 25% of the budget for the next feed and cleanup.
-            if len(snapshot) * 2 > min(self.memory_budget, self.runtime.memory_budget) * 3 // 4:
+            if len(snapshot) * 2 > self.memory_budget * 3 // 4:
                 raise MemoryError()
             return fs, snapshot, output, stdout, images
 
@@ -922,17 +912,17 @@ class CodeAgent:
         split = next((index for index in boundaries if index >= target), boundaries[-1] if boundaries else 0)
         return split if sum(sizes[:split]) >= limit // 2 else 0
 
-    def _save_compaction(self, original, compacted, require_smaller=True):
+    def _save_compaction(self, original, compacted):
         encoded = json.dumps(compacted)
-        if require_smaller and len(encoded) >= len(json.dumps(original)):
+        if len(encoded) >= len(json.dumps(original)):
             raise RuntimeError('Context summary did not reduce history; resume to retry')
         with self._transaction():
             if self._pending() or self._turn() != original:
                 raise RuntimeError('Session changed during context compaction; resume to retry')
             self.db.execute('UPDATE sessions SET messages=? WHERE id=?', (encoded, self.id))
 
-    async def _compact(self, messages, *, repair=False):
-        split = len(messages) if repair else await self.runtime.offload(self._compaction_split, messages)
+    async def _compact(self, messages):
+        split = await self.runtime.offload(self._compaction_split, messages)
         if not split:
             return messages
         summary_chars = min(8000, (self.runtime.context_chars or 64000) // 8)
@@ -942,15 +932,10 @@ class CodeAgent:
             raise RuntimeError('Context summary is empty or too long; resume to retry')
         compacted = [{**summary, 'content': 'Session continuation memory (summarized history):\n' + content},
                      *messages[split:]]
-        if repair:
-            compacted.append({'role': 'user', 'content':
-                'Continue the outstanding task from this continuation memory. '
-                'Files and Python globals are unchanged; do not repeat completed actions.'})
-        await self.runtime.database_call(self._save_compaction, messages, compacted, not repair)
+        await self.runtime.database_call(self._save_compaction, messages, compacted)
         return compacted
 
     async def _run(self, prompt=None, *, max_steps=20):
-        repaired = False
         pending = await self.runtime.database_call(self._pending)
         if pending:
             try:
@@ -985,18 +970,7 @@ class CodeAgent:
                     if messages[-1]['role'] == 'assistant':
                         return messages[-1].get('content') or ''
                     messages = await self._compact(messages)
-                    try:
-                        message = await self._response(self.runtime.client, messages)
-                    except BadRequestError as exc:
-                        if repaired or 'reasoning_content' not in str(exc) or 'must be passed back' not in str(exc):
-                            raise
-                        # Old harness versions discarded provider reasoning. A
-                        # fresh summary rebases history without inventing it or
-                        # replaying completed tools; files/globals stay intact.
-                        self._emit('compaction', 'Rebuilding continuation history after missing provider reasoning.\n')
-                        await self._compact(messages, repair=True)
-                        repaired = True
-                        continue
+                    message = await self._response(self.runtime.client, messages)
                     await self.runtime.database_call(self._append_message, message)
                     if not message.get('tool_calls') and prompt is None:
                         return message.get('content') or ''
@@ -1241,10 +1215,10 @@ class Worker:
                     'SELECT id,name FROM sessions ORDER BY id').fetchall())
                 await send({'result': [dict(id=id, name=name) for id, name in rows]})
             elif action == 'agent':
-                if session_id is not None and request.get('memory_budget') is not None:
-                    raise ValueError('memory_budget can only be set for new sessions')
+                if 'memory_budget' in request:
+                    raise ValueError('configure the shared worker budget at startup')
                 if session_id is None:
-                    agent = await self.runtime.agent(memory_budget=request.get('memory_budget'))
+                    agent = await self.runtime.agent()
                     info = {'id': agent.id, 'name': agent.name}
                     await agent.close()
                 else:

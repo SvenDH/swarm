@@ -4,6 +4,7 @@ import unittest
 from unittest.mock import patch
 
 import httpx
+from openai import BadRequestError
 
 import test_agents
 from test_agents import model_client, stream_response, sse, ByteStream
@@ -38,27 +39,21 @@ class ReasoningTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(await self.agent.run(), '42')
         self.assertEqual((await self.agent.state()).messages[-1]['reasoning_content'], '')
 
-    async def test_missing_old_reasoning_rebases_without_replaying_code(self):
-        await self.agent.execute("x=42; open('saved.txt','w').write('saved')")
-        await self.agent.append_message({'role': 'user', 'content': 'Finish the calculation'})
-        requests = []
+    async def test_invalid_old_history_is_not_repaired_or_replayed(self):
+        await self.agent.execute("x=42")
+        await self.agent.append_message({'role':'user','content':'continue'})
+        before=(await self.agent.state()).messages
+        requests=[]
         def respond(request):
-            body = json.loads(request.content)
-            requests.append(body)
-            if len(requests) == 1:
-                return httpx.Response(400, json={'error': {'message':
-                    'The `reasoning_content` in the thinking mode must be passed back to the API.'}})
-            if 'tools' not in body:
-                return stream_response({'role': 'assistant', 'reasoning_content': 'Summary metadata.',
-                                        'content': 'x=42; saved.txt is written. Answer with x.'})
-            self.assertEqual(body['messages'][1]['reasoning_content'], 'Summary metadata.')
-            return stream_response({'role': 'assistant', 'content': '42', 'reasoning_content': 'Done.'})
+            requests.append(request)
+            return httpx.Response(400,json={'error':{'message':'The reasoning_content must be passed back'}})
         async with httpx.AsyncClient(transport=httpx.MockTransport(respond)) as client:
-            with patch.object(self.agent.runtime, 'client', model_client(client)), \
-                    patch.object(self.agent, '_evaluate', side_effect=AssertionError('replayed code')):
-                self.assertEqual(await self.agent.run(), '42')
-        self.assertEqual(len(requests), 3)
-        self.assertEqual(await self.agent.execute("(x,open('saved.txt').read())"), "(42, 'saved')")
+            with patch.object(self.agent.runtime,'client',model_client(client)):
+                with self.assertRaises(BadRequestError):
+                    await self.agent.run()
+        self.assertEqual(len(requests),1)
+        self.assertEqual((await self.agent.state()).messages,before)
+        self.assertEqual(await self.agent.execute('x'),'42')
 
     async def test_worker_does_not_retry_other_bad_requests(self):
         calls = []

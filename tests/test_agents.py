@@ -89,25 +89,18 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
 
     @unittest.skipUnless(all(name in available() for name in ('numpy', 'pandas', 'PIL', 'openpyxl', 'pypdf', 'docx')), 'optional libraries not installed')
     async def test_library_roundtrips(self):
-        from pypdf import PdfWriter
-        self.assertEqual(await self.agent.execute("numpy('dot', [1,2], other=[3,4])"), '11')
-        await self.agent.execute("pandas('to_csv', [{'a': 2}], path='/a.csv')")
-        self.assertEqual(await self.agent.execute("pandas('read_csv', path='/a.csv')"), "[{'a': 2}]")
-        await self.agent.execute("pandas('to_excel', [{'a': 2}], path='/a.xlsx')")
-        self.assertEqual(await self.agent.execute("pandas('read_excel', path='/a.xlsx')"), "[{'a': 2}]")
-        await self.agent.execute("openpyxl('append','/a.xlsx',rows=[[3]])")
-        self.assertIn('[3]', await self.agent.execute("openpyxl('read','/a.xlsx')"))
-        await self.agent.execute("PIL('new',output='/a.png',size=[8,8]); PIL('resize',path='/a.png',output='/b.png',size=[2,2])")
-        self.assertIn('[2, 2]', await self.agent.execute("PIL('info',path='/b.png')"))
-        await self.agent.execute("docx('write','/a.docx',paragraphs=['hello']); docx('append','/a.docx',paragraphs=['world'])")
-        self.assertEqual(await self.agent.execute("docx('read','/a.docx')"), "['hello', 'world']")
-        writer = PdfWriter()
-        writer.add_blank_page(100, 100)
-        out = io.BytesIO()
-        writer.write(out)
-        await self.agent.execute(f"open('/a.pdf','wb').write({out.getvalue()!r})")
-        await self.agent.execute("pypdf('select','/a.pdf',output='/b.pdf',pages=[0])")
-        self.assertEqual(await self.agent.execute("pypdf('read','/b.pdf')"), "['']")
+        self.assertEqual(await self.agent.execute("import numpy as np; np.dot([1,2],[3,4])"), '11')
+        await self.agent.execute("import pandas as pd; pd.DataFrame({'a':[2]}).to_csv('/a.csv',index=False)")
+        self.assertEqual(await self.agent.execute("pd.read_csv('/a.csv').to_dict('records')"), "[{'a': 2}]")
+        await self.agent.execute("pd.DataFrame({'a':[2]}).to_excel('/a.xlsx',index=False)")
+        await self.agent.execute("from openpyxl import load_workbook; book=load_workbook('/a.xlsx'); book.active.append([3]); book.save('/a.xlsx')")
+        self.assertEqual(await self.agent.execute("pd.read_excel('/a.xlsx').to_dict('records')"), "[{'a': 2}, {'a': 3}]")
+        await self.agent.execute("from PIL import Image; image=Image.new('RGB',(8,8)); image.resize((2,2)).save('/a.png')")
+        self.assertEqual(await self.agent.execute("Image.open('/a.png').size"), '(2, 2)')
+        await self.agent.execute("from docx import Document; doc=Document(); doc.add_paragraph('hello'); doc.save('/a.docx')")
+        self.assertEqual(await self.agent.execute("Document('/a.docx').paragraphs[0].text"), "'hello'")
+        await self.agent.execute("from pypdf import PdfReader,PdfWriter; writer=PdfWriter(); writer.add_blank_page(100,100); writer.write('/a.pdf')")
+        self.assertEqual(await self.agent.execute("len(PdfReader('/a.pdf').pages)"), '1')
 
     async def test_resume_partial_batch_without_repeating_effects(self):
         calls = [{'id': str(i), 'type': 'function', 'function': {'name': 'python',

@@ -155,13 +155,12 @@ class Untrusted:
 value=Untrusted()
 ''')
         await self.reject('import numpy as np; np.array([value])')
-        await self.reject("numpy('array',[value])")
 
-    async def test_legacy_pillow_helpers_cannot_invoke_external_eps_renderers(self):
+    async def test_pillow_cannot_invoke_external_eps_renderers(self):
         self.need('PIL')
         eps = b'%!PS-Adobe-3.0 EPSF-3.0\n%%BoundingBox: 0 0 2 2\nshowpage\n'
         await self.agent.execute(f"open('untrusted.eps','wb').write({eps!r})")
-        await self.reject("PIL('convert',path='untrusted.eps',output='output.png')")
+        await self.reject("from PIL import Image; Image.open('untrusted.eps')")
 
 
 if __name__ == '__main__':

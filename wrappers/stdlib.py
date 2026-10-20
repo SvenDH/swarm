@@ -5,7 +5,7 @@ import stat
 import uuid
 
 from .bridge import descriptor
-from .registry import available, ALIASES
+from .registry import available, ALIASES, NATIVE
 
 
 class Result:
@@ -117,7 +117,7 @@ def exports(module, fs):
                       'PIL.Image', 'PIL.ImageDraw', 'PIL.ImageOps', 'PIL.ImageFilter',
                       'matplotlib.pyplot', 'scipy.ndimage', 'scipy.stats', 'scipy.special'}
         if ((parts and name not in namespaces) or
-                root not in available() and root not in ('math', 'pathlib', 'datetime')):
+                root not in available() and root not in NATIVE):
             return None
         return Result({'name': name, 'origin': None, 'loader': None,
                        'submodule_search_locations': None})
