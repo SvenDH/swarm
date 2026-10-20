@@ -190,9 +190,13 @@ uv run main.py --worker                 # or --with-worker for the agent REPL to
 uv run main.py --irc --nick sven
 ```
 
-The TUI has live scrollback and an input box. Type a message or use `/join #channel`,
-`/switch #channel-or-nick`, `/msg nick message`, `/part`, `/names`, `/list`, `/help`,
-or `/quit`; Ctrl-Q also exits, PageUp/PageDown scroll. Human nicknames are prefixed with `user-` so they
+The TUI formats timestamped chat with colored nicknames and muted join/leave events,
+separate channel/DM buffers, unread/mention indicators and a channel user list.
+The side panes hide below 90 columns; buffer tabs remain available on narrow terminals.
+Use Ctrl-P/N, Alt-Left/Right or Alt-1…9 to switch buffers; PageUp/PageDown scroll.
+Type a message or use `/join #channel`, `/query nick`, `/switch #channel-or-nick`,
+`/msg nick message`, `/close`, `/part`, `/names`, `/list`, `/help`, or `/quit`;
+Ctrl-Q also exits. Human nicknames are prefixed with `user-` so they
 cannot impersonate agents. Use the same `--database` / `--socket` as the worker.
 The IRC port is chosen automatically; `--irc-port 6667` pins it at worker startup.
 

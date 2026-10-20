@@ -221,6 +221,13 @@ class IRCServer:
                     else:
                         send(name, f':worker 461 {name} {op} :Invalid parameters')
                 elif op == 'QUIT':
+                    peers = {member for members in self.channels.values() if name in members
+                             for member in members if member != name}
+                    for peer in peers:
+                        try:
+                            send(peer, f':{name} QUIT :{trailing or "Disconnected"}')
+                        except BufferError:
+                            pass  # Disconnect cleanup must not depend on a peer draining its queue.
                     for channel in list(self.channels):
                         self.channels[channel].discard(name)
                         if not self.channels[channel]:

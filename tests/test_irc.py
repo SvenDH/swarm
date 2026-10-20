@@ -8,6 +8,17 @@ from wrappers.irc import IRCServer
 
 
 class IRCServerTests(unittest.TestCase):
+    def test_disconnect_notifies_shared_peers_once(self):
+        server = IRCServer()
+        for name in ('alice', 'bob'):
+            server.exchange(name, 'JOIN #one')
+            server.exchange(name, 'JOIN #two')
+        server.exchange('alice')
+        server.exchange('bob', 'QUIT :bye')
+        self.assertEqual(server.exchange('alice'), [':bob QUIT :bye'])
+        self.assertNotIn('bob', server.clients)
+        self.assertTrue(all('bob' not in members for members in server.channels.values()))
+
     def test_channels_private_messages_and_identity(self):
         server = IRCServer()
         server.exchange('alice', 'JOIN #room')
