@@ -46,9 +46,6 @@ def _backend(module):
     return api.Adapter(module) if module in STDLIB else api
 
 
-def descriptor(module, kind, data):
-    return {'module': module, 'kind': kind, 'data': data}
-
 def member(value, name, module, fs):
     if isinstance(value, TypeRef) and name in ('__name__', '__module__'):
         return value.name if name == '__name__' else value.cls.__module__

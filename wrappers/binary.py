@@ -1,4 +1,6 @@
 """Plain-data stdlib adapters: no paths, descriptors, pointers or host callbacks."""
+
+from .common import Adapter as BaseAdapter
 import array
 import hashlib
 import io
@@ -6,7 +8,6 @@ import operator
 import struct
 import zlib
 
-from .bridge import descriptor
 from .limits import check_memory, memory_bytes
 
 HASHES = ('md5', 'sha1', 'sha224', 'sha256', 'sha384', 'sha512',
@@ -181,50 +182,13 @@ def exports(module, fs):
     raise ImportError(module)
 
 
-class Adapter:
+class Adapter(BaseAdapter):
     def __init__(self, module):
         self.module = module
 
     def exports(self, fs):
         return exports(self.module, fs)
 
-    def pack(self, value):
-        if isinstance(value, Buffer):
-            closed = value.stream.closed
-            data = [value.text, value.saved if closed else value.stream.getvalue(), value.newline,
-                    0 if closed else value.stream.tell(), closed]
-            return descriptor('io', 'buffer', data)
-        if isinstance(value, Hash):
-            return descriptor('hashlib', 'hash', [value.name, value.data, value.options])
-        if isinstance(value, Array):
-            return descriptor('array', 'array', [value.value.typecode, value.value.tobytes()])
-        if isinstance(value, struct.Struct):
-            return descriptor('struct', 'struct', value.format)
-
-    def restore(self, kind, data):
-        if self.module == 'io' and kind == 'buffer':
-            text, content, newline, pos, closed = data
-            result = Buffer(text, None if text else content, newline)
-            if text:
-                check_memory(len(content) * 4)
-                # Restore already-normalized text without translating CRLF twice.
-                # This is native in-memory state, never pickle or user callbacks.
-                result.stream.__setstate__((content, newline, pos, None))
-            else:
-                result.stream.seek(pos)
-            if closed:
-                result.close()
-            return result
-        if self.module == 'hashlib' and kind == 'hash':
-            return Hash(data[0], data[1], **data[2])
-        if self.module == 'array' and kind == 'array':
-            result = Array(data[0])
-            check_memory(len(data[1]))
-            result.value.frombytes(data[1])
-            return result
-        if self.module == 'struct' and kind == 'struct':
-            return exports('struct', None)['Struct'](data)
-        raise ValueError('Invalid library object')
 
     def members(self, value, fs, name=None):
         if isinstance(value, Buffer):
@@ -272,15 +236,3 @@ class Adapter:
                     **{method: (lambda *args, method=method: api[method](value.format, *args))
                        for method in ('pack', 'unpack', 'unpack_from')}}
         return {}
-
-    def is_view(self, value):
-        return False
-
-    def view(self, root, value):
-        return None
-
-    def iterate(self, value):
-        return iter(value)
-
-    def assign(self, value, name, item):
-        raise AttributeError('Attribute is read-only')

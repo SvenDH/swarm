@@ -2,7 +2,7 @@
 import seaborn as sns
 from inspect import signature
 from .matplotlib import Chart, Axis
-from .common import view, is_view, iterate, assign
+from .common import is_view, iterate, assign
 
 FUNCTIONS = {'scatterplot': sns.scatterplot, 'lineplot': sns.lineplot,
              'histplot': sns.histplot, 'boxplot': sns.boxplot, 'barplot': sns.barplot,
@@ -43,11 +43,3 @@ def exports(fs):
 
 def members(value, fs, name=None):
     return {}
-
-
-def pack(value):
-    return None  # The bridge encodes returned axes using the matplotlib adapter.
-
-
-def restore(kind, data):
-    raise ValueError('Seaborn returns matplotlib axes, not standalone Seaborn objects')

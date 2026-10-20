@@ -26,9 +26,7 @@ class NativeMemoryTests(unittest.IsolatedAsyncioTestCase):
                     result=original(bridge,*args,**kwargs)
                     sizes.append(measure(result))
                     return result
-                with patch('wrappers.numpy.pack',side_effect=AssertionError('implicit serialization')), \
-                     patch('wrappers.numpy.restore',side_effect=AssertionError('implicit restore')), \
-                     patch.object(Bridge,'__call__',counted):
+                with patch.object(Bridge,'__call__',counted):
                     self.assertEqual(await agent.execute('''
 import numpy as np
 array=np.ones((1024,1024),dtype=np.float32)

@@ -5,8 +5,7 @@ from pathlib import PurePosixPath
 from matplotlib.figure import Figure
 from matplotlib.backends.backend_agg import FigureCanvasAgg
 from matplotlib import colors, colormaps
-from .bridge import descriptor
-from .common import freeze, thaw, record, iterate, assign
+from .common import record, iterate, assign
 from .files import save
 from .limits import check_memory
 
@@ -29,16 +28,13 @@ CM = {name: (lambda *a, _name=name, **kw: colormaps[_name](*a, **kw)) for name i
 
 
 class Chart:
-    def __init__(self, nrows=1, ncols=1, figsize=(6.4, 4.8), dpi=100, commands=None):
+    def __init__(self, nrows=1, ncols=1, figsize=(6.4, 4.8), dpi=100):
         if ((nrows, ncols) != (0, 0) and (nrows * ncols > 64 or min(nrows, ncols) < 1)) or any(
                 not isinstance(x, (int, float)) or not math.isfinite(x) or x <= 0 for x in (*figsize, dpi)):
             raise ValueError('Figures need 1..64 axes and finite positive dimensions/dpi')
         check_memory(math.ceil(figsize[0] * dpi) * math.ceil(figsize[1] * dpi) * 4)
         self.nrows, self.ncols, self.figsize, self.dpi = nrows, ncols, figsize, dpi
-        self.commands = commands or []
-
-    def data(self):
-        return [self.nrows, self.ncols, self.figsize, self.dpi, self.commands]
+        self.commands = []
 
     def axes_count(self):
         return self.nrows * self.ncols + sum(name == 'add_axes' for (_, name), _, _ in self.commands)
@@ -140,7 +136,6 @@ def render(chart, fs, filename, **kwargs):
         FigureCanvasAgg(figure)
         axes = [figure.add_subplot(chart.nrows, chart.ncols, i + 1) for i in range(chart.nrows * chart.ncols)]
         for (index, name), args, options in chart.commands:
-            args, options = thaw(args), thaw(options)
             if name == 'add_axes' and index is None:
                 axes.append(figure.add_axes(*args, **options))
                 continue
@@ -241,38 +236,6 @@ def set_axis(axis, options):
         if 'set_' + name not in LABELS:
             raise ValueError('Unsupported axes property: ' + name)
         axis.chart.add(axis.index, 'set_' + name, (value,), {})
-
-
-def pack(value):
-    if isinstance(value, Session):
-        return descriptor('matplotlib', 'module', [[chart.data() for chart in value.figures], value.current])
-    if isinstance(value, Chart):
-        return descriptor('matplotlib', 'chart', value.data())
-    if isinstance(value, Axis):
-        return descriptor('matplotlib', 'axis', [value.chart.data(), value.index])
-
-
-def restore(kind, data):
-    if kind == 'module':
-        return Session([Chart(*item) for item in data[0]], data[1])
-    if kind == 'chart':
-        return Chart(*data)
-    if kind == 'axis':
-        return Axis(Chart(*data[0]), data[1])
-    raise ValueError('Unsupported plotting object')
-
-
-def view(root, value):
-    if isinstance(root, Session):
-        chart = value.chart if isinstance(value, Axis) else value
-        for i, figure in enumerate(root.figures):
-            if figure is chart:
-                prefix = [['attr', 'figures'], ['item', i]]
-                return [*prefix, ['attr', 'axes'], ['item', value.index]] if isinstance(value, Axis) else prefix
-    if isinstance(root, Chart) and isinstance(value, Axis) and value.chart is root:
-        return [['attr', 'axes'], ['item', value.index]]
-    if isinstance(root, Axis) and isinstance(value, Chart) and root.chart is value:
-        return [['attr', 'figure']]
 
 
 def is_view(value):

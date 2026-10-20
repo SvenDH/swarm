@@ -1,7 +1,6 @@
 import pdfplumber as pdf
-from pdfplumber.page import Page, CroppedPage
+from pdfplumber.page import Page
 from .files import source
-from .bridge import descriptor
 from .common import iterate, assign
 
 
@@ -10,9 +9,7 @@ def exports(fs):
         if set(kwargs) - {'password', 'unicode_norm', 'laparams'}:
             raise ValueError('Unsupported PDF options')
         stream = source(fs, path)
-        document = pdf.open(stream, **kwargs)
-        document._swarm_source = stream.getvalue(), kwargs
-        return document
+        return pdf.open(stream, **kwargs)
     return {'open': open_pdf}
 
 
@@ -27,31 +24,6 @@ def members(value, fs, name=None):
                 'extract_table': value.extract_table, 'crop': value.crop,
                 'within_bbox': value.within_bbox}
     return {}
-
-
-def pack(value):
-    if isinstance(value, pdf.PDF):
-        return descriptor('pdfplumber', 'document', value._swarm_source)
-    if isinstance(value, Page):
-        return descriptor('pdfplumber', 'page', [value.pdf._swarm_source, value.page_number - 1, list(value.bbox)])
-
-
-def restore(kind, data):
-    original, kwargs = data if kind == 'document' else data[0]
-    import io
-    document = pdf.open(io.BytesIO(original), **kwargs)
-    document._swarm_source = original, kwargs
-    if kind == 'document':
-        return document
-    if kind == 'page':
-        page = document.pages[data[1]]
-        return page if list(page.bbox) == data[2] else page.crop(data[2])
-    raise ValueError('Unsupported PDF object')
-
-
-def view(root, value):
-    if isinstance(root, pdf.PDF) and isinstance(value, Page) and value.pdf is root and not isinstance(value, CroppedPage):
-        return [['attr', 'pages'], ['item', value.page_number - 1]]
 
 
 def is_view(value):

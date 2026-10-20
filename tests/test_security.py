@@ -82,16 +82,13 @@ axes.plot([1,2],[3,4])
         self.assertTrue((await self.agent.read_file(self.agent.home + '/after.png')).startswith(b'\x89PNG'))
 
     async def test_recipe_marker_dictionaries_remain_literal_data(self):
-        self.need('sympy')
-        from wrappers.common import freeze, thaw
-        from wrappers.sympy import untree
+        from wrappers.common import record
         attack = {'__recipe_value__': {'module': 'sympy', 'kind': 'expression',
                   'data': ['Tuple', ["__import__('os').getpid()"], {}]}}
-        self.assertEqual(thaw(freeze(attack)), attack)
-        with self.assertRaisesRegex(ValueError, 'numeric/frame'):
-            thaw(attack)
-        with self.assertRaises(ValueError):
-            untree(attack['__recipe_value__']['data'])
+        commands = []
+        record(commands, 'literal', (attack,), {})
+        self.assertEqual(commands[0][1], (attack,))
+        self.assertIsNot(commands[0][1][0], attack)
 
     async def test_result_dictionaries_are_not_a_signing_oracle(self):
         self.need('pandas')

@@ -5,8 +5,7 @@ from scipy.spatial import distance
 from scipy.spatial.transform import Rotation
 from inspect import signature
 import operator
-from .bridge import descriptor
-from .common import Record, freeze, thaw, view, iterate, assign
+from .common import Record, iterate, assign
 from .api import select
 
 # Initialize PocketFFT on the Python IO worker during the first requested import.
@@ -260,29 +259,6 @@ def members(value, fs, name=None):
                     'entropy': native.entropy, 'interval': native.interval,
                     'mean': native.mean, 'var': native.var, 'std': native.std, 'sf': native.sf}
     return {}
-
-
-def pack(value):
-    if isinstance(value, Rotation):
-        return descriptor('scipy', 'rotation', freeze(value.as_quat()))
-    if isinstance(value, Record):
-        return descriptor('scipy', 'record', freeze(value.fields))
-    if isinstance(value, Distribution):
-        return descriptor('scipy', 'distribution', freeze([value.name, value.args, value.kwargs]))
-    if isinstance(value, Interpolator):
-        return descriptor('scipy', 'interpolator', freeze([value.kind, value.args, value.kwargs]))
-
-
-def restore(kind, data):
-    if kind == 'rotation':
-        return Rotation.from_quat(thaw(data))
-    if kind == 'record':
-        return Record(thaw(data))
-    if kind == 'distribution':
-        return Distribution(*thaw(data))
-    if kind == 'interpolator':
-        return Interpolator(*thaw(data))
-    raise ValueError('Unsupported SciPy object')
 
 
 def is_view(value):

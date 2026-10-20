@@ -1,4 +1,5 @@
 from docx import Document
+from .common import iterate
 from docx.document import Document as DocumentType
 from docx.text.paragraph import Paragraph
 from docx.text.run import Run
@@ -8,10 +9,8 @@ from docx.shared import Inches, Cm, Mm, Pt, Emu, Twips, RGBColor
 from docx.enum import text, table, section, style, shape
 from .api import enums
 from docx.shape import InlineShape
-import io
 
 from .files import source, save
-from .bridge import descriptor
 
 
 def exports(fs):
@@ -51,54 +50,8 @@ def members(value, fs, name=None):
     return {}
 
 
-def pack(value):
-    if isinstance(value, DocumentType):
-        output = io.BytesIO()
-        value.save(output)
-        return descriptor('docx', 'document', output.getvalue())
-
-
-def restore(kind, data):
-    if kind != 'document':
-        raise ValueError('Unsupported document object')
-    return Document(io.BytesIO(data))
-
-
-def view(root, value):
-    if not isinstance(root, DocumentType):
-        return None
-    if isinstance(value, InlineShape):
-        for i, shape in enumerate(root.inline_shapes):
-            if shape._inline is value._inline:
-                return [['attr', 'inline_shapes'], ['item', i]]
-    for i, paragraph in enumerate(root.paragraphs):
-        path = [['attr', 'paragraphs'], ['item', i]]
-        if isinstance(value, Paragraph) and value._p is paragraph._p:
-            return path
-        if isinstance(value, Run):
-            for j, run in enumerate(paragraph.runs):
-                if value._r is run._r:
-                    return [*path, ['attr', 'runs'], ['item', j]]
-    for i, table in enumerate(root.tables):
-        path = [['attr', 'tables'], ['item', i]]
-        if isinstance(value, Table) and value._tbl is table._tbl:
-            return path
-        for j, row in enumerate(table.rows):
-            row_path = [*path, ['attr', 'rows'], ['item', j]]
-            if isinstance(value, _Row) and value._tr is row._tr:
-                return row_path
-            if isinstance(value, _Cell):
-                for k, cell in enumerate(row.cells):
-                    if value._tc is cell._tc:
-                        return [*row_path, ['attr', 'cells'], ['item', k]]
-
-
 def is_view(value):
     return isinstance(value, (Paragraph, Run, Table, _Cell, _Row, InlineShape))
-
-
-def iterate(value):
-    return iter(value)
 
 
 def assign(value, name, item):

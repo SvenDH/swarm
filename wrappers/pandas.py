@@ -1,7 +1,3 @@
-import json
-import io
-from datetime import date, timedelta
-
 import pandas as pd
 import numpy as np
 from pandas.core.indexing import _LocationIndexer
@@ -9,10 +5,8 @@ from pandas.core.strings.accessor import StringMethods
 from pandas.core.indexes.accessors import DatetimeProperties, TimedeltaProperties
 from inspect import signature
 from .api import select
-from .limits import check_memory
 
 from .files import source, save
-from .bridge import descriptor
 from . import numpy as arrays
 
 
@@ -188,76 +182,6 @@ def summarized(function, *args, **kwargs):
     return function(*args, **kwargs)
 
 
-def pack(value):
-    if isinstance(value, pd.Categorical):
-        return descriptor('pandas', 'categorical', [value.codes.tolist(), pack(value.categories), value.ordered])
-    if isinstance(value, Group):
-        return descriptor('pandas', 'group', [pack(value.frame)['data'], value.args, value.kwargs, value.selection])
-    if isinstance(value, (pd.DataFrame, pd.Series)):
-        frame = value.to_frame(name='__series_value__') if isinstance(value, pd.Series) else value
-        check_memory(int(frame.memory_usage(index=True, deep=True).sum()))
-        def plain(item):
-            if item is None or item is pd.NA or item is pd.NaT or isinstance(item, (str, bool, int, float, date, timedelta, np.generic)):
-                return True
-            if isinstance(item, (list, tuple)):
-                return all(plain(part) for part in item)
-            if isinstance(item, dict):
-                return all(isinstance(key, (str, int, float, bool)) and plain(part) for key, part in item.items())
-            return False
-        if not all(plain(item) for item in frame.select_dtypes(include=['object']).to_numpy().flat):
-            raise ValueError('DataFrame object cells must contain plain data, not native library objects')
-        if not all(plain(item) for item in [*frame.columns, *frame.index, *frame.columns.names, *frame.index.names]):
-            raise ValueError('DataFrame labels must contain plain data')
-        if isinstance(value, pd.Series) and not plain(value.name):
-            raise ValueError('Series name must contain plain data')
-        encoded = frame.copy()
-        encoded.columns = [f'__column_{i}__' for i in range(len(frame.columns))]
-        encoded.index.names = [f'__index_{i}__' for i in range(frame.index.nlevels)]
-        table = encoded.to_json(orient='table', date_format='iso')
-        data = {'table': table, 'columns': frame.columns.tolist(), 'column_names': list(frame.columns.names),
-                'multi': isinstance(frame.columns, pd.MultiIndex), 'index_names': list(frame.index.names)}
-        check_memory(len(table.encode()))
-        return descriptor('pandas', 'series', [data, value.name]) if isinstance(value, pd.Series) else descriptor('pandas', 'frame', data)
-    if isinstance(value, pd.DatetimeIndex):
-        return descriptor('pandas', 'datetime_index', [value.as_unit('ns').asi8.tolist(), None if value.tz is None else str(value.tz), value.name])
-    if isinstance(value, pd.TimedeltaIndex):
-        return descriptor('pandas', 'timedelta_index', [value.as_unit('ns').asi8.tolist(), value.name])
-    if isinstance(value, pd.Index):
-        return descriptor('pandas', 'index', value.tolist())
-    if isinstance(value, np.ndarray):
-        return arrays.pack(value)
-    if isinstance(value, np.generic):
-        return descriptor('pandas', 'scalar', value.item())
-
-
-def restore(kind, data):
-    if kind == 'categorical':
-        categories = restore(data[1]['kind'], data[1]['data'])
-        return pd.Categorical.from_codes(data[0], categories, ordered=data[2])
-    if kind == 'datetime_index':
-        result = pd.to_datetime(data[0], unit='ns', utc=data[1] is not None)
-        return (result.tz_convert(data[1]) if data[1] is not None else result).rename(data[2])
-    if kind == 'timedelta_index':
-        return pd.TimedeltaIndex(data[0], unit='ns', name=data[1])
-    if kind == 'index':
-        return pd.Index(data)
-    if kind == 'group':
-        frame, args, kwargs, selection = data
-        return Group(restore('frame', frame), args, kwargs, selection)
-    if kind not in ('frame', 'series'):
-        raise ValueError('Unsupported pandas object')
-    encoded = data[0] if kind == 'series' else data
-    frame = pd.read_json(io.StringIO(encoded['table']), orient='table')
-    frame.columns = (pd.MultiIndex.from_tuples(encoded['columns'], names=encoded['column_names'])
-                     if encoded['multi'] else pd.Index(encoded['columns'], name=encoded['column_names'][0]))
-    frame.index.names = encoded['index_names']
-    if kind == 'series':
-        series = frame.iloc[:, 0]
-        series.name = data[1]
-        return series
-    return frame
-
-
 def is_view(value):
     return isinstance(value, (pd.Series, pd.DataFrame, Group, _LocationIndexer,
                               StringMethods, DatetimeProperties, TimedeltaProperties, pd.Categorical))
@@ -265,10 +189,6 @@ def is_view(value):
 
 def iterate(value):
     return iter(value.native() if isinstance(value, Group) else value)
-
-
-def view(root, value):
-    return None
 
 
 def assign(value, name, item):

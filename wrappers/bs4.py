@@ -1,6 +1,5 @@
 """HTML-only BeautifulSoup. No URL fetches or external XML entities."""
-from bs4 import BeautifulSoup, Tag, NavigableString
-from .bridge import descriptor
+from bs4 import BeautifulSoup, Tag
 from .common import iterate
 from itertools import islice
 from .limits import check_memory
@@ -47,37 +46,6 @@ def members(value, fs, name=None):
             'get': value.get, 'get_text': value.get_text, 'prettify': value.prettify,
             'clear': value.clear, 'append': value.append, 'decompose': value.decompose,
             'extract': value.extract, 'replace_with': value.replace_with}
-
-
-def pack(value):
-    if isinstance(value, NavigableString):
-        return descriptor('bs4', 'scalar', str(value))
-    if isinstance(value, Tag):
-        return descriptor('bs4', 'soup' if isinstance(value, BeautifulSoup) else 'tag', str(value))
-
-
-def restore(kind, data):
-    value = soup(data)
-    if kind == 'soup':
-        return value
-    if kind == 'tag':
-        return value.find()
-    raise ValueError('Unsupported HTML object')
-
-
-def view(root, value):
-    if root is value:
-        return []
-    if not isinstance(root, Tag) or not isinstance(value, Tag):
-        return None
-    path = []
-    node = value
-    while node is not root and node.parent is not None:
-        siblings = node.parent.contents
-        index = next(i for i, sibling in enumerate(siblings) if sibling is node)
-        path[0:0] = [['attr', 'contents'], ['item', index]]
-        node = node.parent
-    return path if node is root else None
 
 
 def is_view(value):

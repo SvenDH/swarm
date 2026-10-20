@@ -4,12 +4,9 @@ from openpyxl.cell.cell import Cell, MergedCell
 from openpyxl import styles
 from openpyxl.styles.proxy import StyleProxy
 from openpyxl.utils import get_column_letter, column_index_from_string, range_boundaries, quote_sheetname
-from openpyxl.xml.functions import tostring, fromstring
 from copy import copy
-import io
 
 from .files import source, save
-from .bridge import descriptor
 
 STYLES = {'Font': styles.Font, 'PatternFill': styles.PatternFill, 'Border': styles.Border,
           'Side': styles.Side, 'Alignment': styles.Alignment, 'Protection': styles.Protection,
@@ -71,35 +68,6 @@ def members(value, fs, name=None):
                 'coordinate': value.coordinate, 'number_format': value.number_format,
                 'data_type': value.data_type}
     return {}
-
-
-def pack(value):
-    if isinstance(value, StyleProxy):
-        value = copy(value)
-    for name, cls in STYLES.items():
-        if isinstance(value, cls):
-            return descriptor('openpyxl', 'style', [name, tostring(value.to_tree())])
-    if isinstance(value, Workbook):
-        output = io.BytesIO()
-        value.save(output)
-        return descriptor('openpyxl', 'workbook', output.getvalue())
-
-
-def restore(kind, data):
-    if kind == 'style' and data[0] in STYLES:
-        return STYLES[data[0]].from_tree(fromstring(data[1]))
-    if kind != 'workbook':
-        raise ValueError('Unsupported workbook object')
-    return load_workbook(io.BytesIO(data), keep_links=False)
-
-
-def view(root, value):
-    if isinstance(root, Workbook):
-        if isinstance(value, Worksheet):
-            return [['attr', 'worksheets'], ['item', root.worksheets.index(value)]]
-        if isinstance(value, (Cell, MergedCell)):
-            return [['attr', 'worksheets'], ['item', root.worksheets.index(value.parent)],
-                    ['item', value.coordinate]]
 
 
 def is_view(value):

@@ -1,4 +1,5 @@
 from pathlib import PurePosixPath as Path
+from .common import iterate
 
 from PIL import Image, ImageOps, ImageEnhance, ImageFilter, ImageDraw, ImageColor, ImageChops, ImageFont
 from .api import select, enum_values
@@ -6,7 +7,7 @@ import math
 from inspect import signature
 
 from .files import source, save
-from .bridge import descriptor, TypeRef
+from .bridge import TypeRef
 
 FORMATS = {'PNG', 'JPEG', 'GIF', 'WEBP', 'TIFF', 'BMP', 'ICO'}
 ENHANCERS = {'Brightness': ImageEnhance.Brightness, 'Contrast': ImageEnhance.Contrast,
@@ -309,56 +310,8 @@ def apply_filter(image, effect):
     return image.filter(factory() if effect.amount is None else factory(effect.amount))
 
 
-def pack(image):
-    if isinstance(image, DefaultFont):
-        return descriptor('PIL', 'default_font', image.size)
-    if isinstance(image, Drawing):
-        return descriptor('PIL', 'drawing', [pack(image.image)['data'], image.mode])
-    if isinstance(image, Filter):
-        return descriptor('PIL', 'filter', [image.kind, image.amount])
-    if isinstance(image, Enhancer):
-        return descriptor('PIL', 'enhancer', [image.kind, pack(image.image)['data']])
-    if isinstance(image, Image.Image):
-        checked_size(image.size, image.mode)
-        return descriptor('PIL', 'image', [image.mode, image.size, image.tobytes(), image.format])
-
-
-def restore(kind, data):
-    if kind == 'default_font':
-        return DefaultFont(data)
-    if kind == 'drawing':
-        return Drawing(restore('image', data[0]), data[1])
-    if kind == 'filter':
-        if data[0] not in FILTERS:
-            raise ValueError('Unsupported image filter')
-        return Filter(*data)
-    if kind == 'enhancer':
-        if data[0] not in ENHANCERS:
-            raise ValueError('Unsupported image enhancer')
-        return Enhancer(data[0], restore('image', data[1]))
-    if kind != 'image':
-        raise ValueError('Invalid image')
-    mode, size, pixels, fmt = data
-    checked_size(size, mode)
-    image = Image.frombytes(mode, tuple(size), pixels)
-    image.format = fmt
-    return image
-
-
 def is_view(value):
     return isinstance(value, (Drawing, PixelAccess))
-
-
-def iterate(value):
-    return iter(value)
-
-
-def view(root, value):
-    if isinstance(root, Image.Image) and isinstance(value, PixelAccess) and value.image is root:
-        return [['call', 'load', [], {}]]
-    if isinstance(root, Image.Image) and isinstance(value, Drawing) and value.image is root:
-        return [['call', 'drawing', [value.mode], {}]]
-    return None
 
 
 def assign(value, name, item):

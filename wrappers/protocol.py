@@ -73,6 +73,8 @@ class NativeMemory:
                     return measure(value.obj)
                 if isinstance(value, (adapter.StringMethods, adapter.DatetimeProperties, adapter.TimedeltaProperties)):
                     return measure(value._parent)
+            if module == 'sklearn':
+                return sys.getsizeof(value) + measure(vars(value))
             if type(value).__module__ == 'wrappers.binary':
                 from .binary import Buffer
                 if isinstance(value, Buffer):

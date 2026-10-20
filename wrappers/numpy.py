@@ -1,15 +1,15 @@
 import numpy as np
+from .common import iterate
 import io
 import math
-import json
 import operator
 from numpy._core._exceptions import _ArrayMemoryError
 
-from .bridge import descriptor, TypeRef
+from .bridge import TypeRef
 from .files import source, save
 from .limits import check_memory
 from .api import select
-from .common import Record, freeze, thaw
+from .common import Record
 
 # Initialize native FFT code on the Python import worker, not a Monty callback.
 np.fft.fft([0.0])
@@ -344,7 +344,7 @@ def exports(fs, rng=None):
     def load(path, *, allow_pickle=False):
         if allow_pickle:
             raise ValueError('pickle-backed arrays are not supported')
-        return restore('array', source(fs, path).getvalue())
+        return load_array(source(fs, path).getvalue())
     def write(path, array, *, allow_pickle=False):
         if allow_pickle:
             raise ValueError('pickle-backed arrays are not supported')
@@ -525,67 +525,7 @@ def members(value, fs, name=None):
     return {}
 
 
-def pack(value):
-    if isinstance(value, Session):
-        return descriptor('numpy', 'module', pack(value.rng)['data'])
-    if isinstance(value, np.random.RandomState):
-        name, keys, pos, gaussian, cached = value.get_state()
-        return descriptor('numpy', 'random_state', [name, keys.tolist(), pos, gaussian, cached])
-    if isinstance(value, type) and value in SCALARS.values():
-        return descriptor('numpy', 'scalar_type', np.dtype(value).name)
-    if isinstance(value, Record):
-        return descriptor('numpy', 'record', freeze(value.fields))
-    if isinstance(value, Ufunc):
-        return descriptor('numpy', 'ufunc', value.name)
-    if isinstance(value, Grid):
-        return descriptor('numpy', 'grid', value.sparse)
-    if isinstance(value, np.random.Generator):
-        return descriptor('numpy', 'rng', json.dumps(value.bit_generator.state))
-    if isinstance(value, np.ndarray):
-        checked_size(value.shape, value.dtype)
-        output = io.BytesIO()
-        # Write the buffer directly: np.save's file-like path builds temporary
-        # byte chunks in addition to the final serialized array.
-        np.lib.format.write_array_header_1_0(output, np.lib.format.header_data_from_array_1_0(value))
-        contiguous = value if value.flags.c_contiguous else np.ascontiguousarray(value.T if value.flags.f_contiguous else value)
-        if contiguous.nbytes:
-            output.write(memoryview(contiguous).cast('B'))
-        return descriptor('numpy', 'array', output.getvalue())
-    if isinstance(value, np.dtype):
-        return descriptor('numpy', 'dtype', value.str)
-    if isinstance(value, np.generic):
-        return descriptor('numpy', 'scalar', value.item())
-
-
-def restore(kind, data, *, copy=True):
-    if kind == 'module':
-        return Session(restore('random_state', data)) if data is not None else Session()
-    if kind == 'random_state':
-        name, keys, pos, gaussian, cached = data
-        value = np.random.RandomState(0)
-        value.set_state((name, np.asarray(keys, dtype=np.uint32), pos, gaussian, cached))
-        return value
-    if kind == 'scalar_type' and data in SCALARS:
-        return SCALARS[data]
-    if kind == 'record':
-        return Record(thaw(data))
-    if kind == 'ufunc' and data in UFUNCS:
-        return Ufunc(data)
-    if kind == 'grid' and type(data) is bool:
-        return Grid(data)
-    if kind == 'rng':
-        value = np.random.default_rng(0)
-        state = json.loads(data)
-        if state['bit_generator'] != 'PCG64':
-            raise ValueError('Only PCG64 generators are supported')
-        value.bit_generator.state = state
-        return value
-    if kind == 'scalar':
-        return data
-    if kind == 'dtype':
-        return np.dtype(data)
-    if kind != 'array':
-        raise ValueError('unsupported numpy object')
+def load_array(data, *, copy=True):
     stream = io.BytesIO(data)
     version = np.lib.format.read_magic(stream)
     if version == (1, 0):
@@ -608,22 +548,6 @@ def restore(kind, data, *, copy=True):
 
 def is_view(value):
     return isinstance(value, (np.ndarray, Ufunc)) or (isinstance(value, type) and value in SCALARS.values())
-
-
-def is_grid(value):
-    return isinstance(value, Grid)
-
-
-def iterate(value):
-    return iter(value)
-
-
-def view(root, value):
-    return None
-
-
-def shares(root, value):
-    return isinstance(root, np.ndarray) and isinstance(value, np.ndarray) and np.shares_memory(root, value)
 
 
 def assign(value, name, item):

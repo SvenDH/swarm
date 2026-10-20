@@ -87,6 +87,9 @@ worker-wide RAM store. Monty holds only small session-authenticated references;
 operations do not copy native payloads through the interpreter. Views and aliases
 refer to the same native data. Explicit exports such as `np.save` or image saving
 still write durable files. `zip`, `iter`, and `enumerate` accept array facades.
+Fitted estimators stay native in RAM. Plot/document commands retain RAM-only
+copies of their input data so later edits do not change previously recorded commands;
+there is no native checkpoint encoding or recipe decoding.
 
 An execution is recorded before it starts. Only a successful checkpoint and
 its associated files commit. A failed block rolls back ordinary variables and files,

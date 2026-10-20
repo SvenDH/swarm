@@ -1,10 +1,8 @@
-import io
 from pptx import Presentation
 from pptx.presentation import Presentation as PresentationType
 from pptx.slide import Slide, SlideLayout, Slides, SlideLayouts
 from pptx.shapes.shapetree import SlideShapes
 from pptx.shapes.base import BaseShape
-from pptx.shapes.placeholder import SlidePlaceholder
 from pptx.shapes.graphfrm import GraphicFrame
 from pptx.text.text import TextFrame, _Paragraph, _Run, Font
 from pptx.table import Table, _Cell
@@ -12,7 +10,6 @@ from pptx.util import Inches, Cm, Mm, Pt, Emu, Centipoints
 from pptx.enum import text, shapes, chart, dml, action, lang
 from .api import enums
 from pptx.dml.color import RGBColor, ColorFormat
-from .bridge import descriptor
 from .files import source, save
 from .common import iterate
 
@@ -65,53 +62,6 @@ def members(value, fs, name=None):
     if isinstance(value, _Cell):
         return {'text': value.text, 'text_frame': value.text_frame}
     return {}
-
-
-def pack(value):
-    if isinstance(value, PresentationType):
-        output = io.BytesIO()
-        value.save(output)
-        return descriptor('pptx', 'presentation', output.getvalue())
-
-
-def restore(kind, data):
-    if kind != 'presentation':
-        raise ValueError('Unsupported presentation object')
-    return Presentation(io.BytesIO(data))
-
-
-def view(root, value):
-    # Other objects use bridge paths (including add_slide/add_textbox call paths).
-    if isinstance(root, PresentationType):
-        if isinstance(value, Slide):
-            for i, slide in enumerate(root.slides):
-                if slide.slide_id == value.slide_id:
-                    return [['attr', 'slides'], ['item', i]]
-        for i, slide in enumerate(root.slides):
-            prefix = [['attr', 'slides'], ['item', i], ['attr', 'shapes']]
-            if isinstance(value, BaseShape):
-                for j, shape in enumerate(slide.shapes):
-                    if shape.shape_id == value.shape_id and shape._element is value._element:
-                        return [['attr', 'slides'], ['item', i], ['attr', 'shapes'], ['item', j]]
-            for j, shape in enumerate(slide.shapes):
-                path = [*prefix, ['item', j]]
-                if shape.has_text_frame:
-                    found = text_view(shape.text_frame, value, [*path, ['attr', 'text_frame']])
-                    if found is not None:
-                        return found
-                if isinstance(shape, GraphicFrame) and shape.has_table:
-                    table = shape.table
-                    table_path = [*path, ['attr', 'table']]
-                    if isinstance(value, Table) and value._tbl is table._tbl:
-                        return table_path
-                    for r, row in enumerate(table.rows):
-                        for c, cell in enumerate(row.cells):
-                            cell_path = [*table_path, ['call', 'cell', [r, c], {}]]
-                            if isinstance(value, _Cell) and value._tc is cell._tc:
-                                return cell_path
-                            found = text_view(cell.text_frame, value, [*cell_path, ['attr', 'text_frame']])
-                            if found is not None:
-                                return found
 
 
 def text_view(frame, value, path):

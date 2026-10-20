@@ -1,11 +1,11 @@
-"""Checkpointable Canvas drawing recipes, rendered only into virtual-file bytes."""
+"""RAM-only Canvas commands, rendered only into virtual-file bytes."""
+from .common import is_view
 import io
 from reportlab.pdfgen.canvas import Canvas as NativeCanvas
 from reportlab.lib import pagesizes, colors
 from reportlab.lib.utils import ImageReader
 from PIL import Image
-from .bridge import descriptor
-from .common import record, thaw, view, iterate, assign
+from .common import record, iterate, assign
 from .files import source
 from .pil import checked_size
 
@@ -15,8 +15,8 @@ FONTS = {'Courier', 'Courier-Bold', 'Courier-Oblique', 'Courier-BoldOblique',
 
 
 class Canvas:
-    def __init__(self, filename, pagesize=pagesizes.A4, commands=None):
-        self.filename, self.pagesize, self.commands = filename, pagesize, commands or []
+    def __init__(self, filename, pagesize=pagesizes.A4):
+        self.filename, self.pagesize, self.commands = filename, pagesize, []
 
 
 def exports(fs):
@@ -62,7 +62,6 @@ def write(value, fs):
     output = io.BytesIO()
     canvas = NativeCanvas(output, pagesize=value.pagesize, invariant=1)
     for name, args, kwargs in value.commands:
-        args, kwargs = thaw(args), thaw(kwargs)
         if name == 'drawImage':
             image = Image.open(io.BytesIO(args[0]), formats=['PNG', 'JPEG', 'GIF', 'WEBP', 'TIFF', 'BMP', 'ICO'])
             checked_size(image.size, image.mode)
@@ -92,18 +91,3 @@ def members(value, fs, name=None):
             'setFillColor': lambda color: draw(value, 'setFillColorRGB', tuple(color), {}),
             'setStrokeColor': lambda color: draw(value, 'setStrokeColorRGB', tuple(color), {}),
             'drawImage': image, 'save': lambda: write(value, fs)}
-
-
-def pack(value):
-    if isinstance(value, Canvas):
-        return descriptor('reportlab', 'canvas', [value.filename, value.pagesize, value.commands])
-
-
-def restore(kind, data):
-    if kind != 'canvas':
-        raise ValueError('Unsupported Canvas object')
-    return Canvas(*data)
-
-
-def is_view(value):
-    return False

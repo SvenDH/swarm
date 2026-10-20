@@ -2,24 +2,14 @@
 import sympy as sp
 from fractions import Fraction
 from keyword import iskeyword
-from .bridge import descriptor
-from .common import is_view, view, iterate, assign
+from .common import is_view, iterate, assign
 from .api import select
 from .limits import check_memory
 import operator
 
-CONSTRUCTORS = {name: value for name, value in (
-    ('Symbol', sp.Symbol), ('Integer', sp.Integer), ('Float', sp.Float),
-    ('Rational', sp.Rational), ('Add', sp.Add), ('Mul', sp.Mul), ('Pow', sp.Pow),
-    ('sin', sp.sin), ('cos', sp.cos), ('tan', sp.tan), ('exp', sp.exp), ('log', sp.log),
-    ('Abs', sp.Abs), ('Equality', sp.Eq), ('Unequality', sp.Ne),
-    ('StrictLessThan', sp.Lt), ('LessThan', sp.Le), ('StrictGreaterThan', sp.Gt),
-    ('GreaterThan', sp.Ge), ('Tuple', sp.Tuple))}
 ELEMENTARY = select(vars(sp), '''asin acos atan atan2 sinh cosh tanh asinh acosh atanh
     sign floor ceiling conjugate re im arg factorial binomial gamma loggamma erf erfc Min Max''')
-CONSTRUCTORS.update(ELEMENTARY)
 SETS = select(vars(sp), 'FiniteSet Interval Union Intersection Complement Contains And Or Not')
-CONSTRUCTORS.update(SETS)
 CONSTANTS = {'pi': sp.pi, 'E': sp.E, 'I': sp.I, 'oo': sp.oo, '-oo': -sp.oo,
              'EulerGamma': sp.EulerGamma, 'Catalan': sp.Catalan, 'GoldenRatio': sp.GoldenRatio,
              'zoo': sp.zoo, 'nan': sp.nan, 'EmptySet': sp.EmptySet, 'UniversalSet': sp.UniversalSet}
@@ -128,76 +118,3 @@ def members(value, fs, name=None):
                 'factor': checked(value.factor), 'diff': checked(value.diff),
                 'integrate': checked(value.integrate), 'is_number': value.is_number}
     return {}
-
-
-def tree(value):
-    if value in (sp.true, sp.false):
-        return ['bool', bool(value)]
-    constants = {value: name for name, value in CONSTANTS.items()}
-    if value in constants:
-        return ['constant', constants[value]]
-    if isinstance(value, sp.Symbol):
-        return ['Symbol', [value.name], {key: flag for key, flag in value.assumptions0.items() if flag is not None}]
-    if isinstance(value, sp.Integer):
-        return ['Integer', [int(value)], {}]
-    if isinstance(value, sp.Rational):
-        return ['Rational', [int(value.p), int(value.q)], {}]
-    if isinstance(value, sp.Float):
-        return ['Float', [str(value), value._prec], {'precision': True}]
-    for name, factory in CONSTRUCTORS.items():
-        if value.func is factory:
-            return [name, [tree(item) for item in value.args], None]
-    raise TypeError(f'Unsupported symbolic expression: {type(value).__name__}')
-
-
-def untree(data, depth=0):
-    if depth > 64 or type(data) not in (list, tuple) or not data:
-        raise ValueError('Invalid symbolic tree')
-    name = data[0]
-    if name == 'bool':
-        if len(data) != 2 or type(data[1]) is not bool:
-            raise ValueError('Invalid symbolic boolean')
-        return sp.true if data[1] else sp.false
-    if name == 'constant':
-        if len(data) != 2 or type(data[1]) is not str:
-            raise ValueError('Invalid symbolic constant')
-        return CONSTANTS[data[1]]
-    if len(data) != 3 or type(data[1]) not in (list, tuple):
-        raise ValueError('Invalid symbolic tree arguments')
-    args, options = data[1:]
-    if name == 'Symbol':
-        if len(args) != 1 or type(options) is not dict:
-            raise ValueError('Invalid symbol')
-        return named(sp.Symbol, args[0], **options)
-    if name in ('Integer', 'Rational'):
-        if len(args) != (1 if name == 'Integer' else 2) or options != {} or any(type(item) is not int for item in args):
-            raise ValueError('Invalid symbolic number')
-        return CONSTRUCTORS[name](*args)
-    if name == 'Float':
-        if len(args) != 2 or type(args[0]) is not str or type(args[1]) is not int or not 1 <= args[1] <= 10000:
-            raise ValueError('Invalid symbolic float')
-        float(args[0])  # Numeric text only, never a symbolic expression string.
-        return sp.Float(args[0], precision=args[1])
-    if options is not None or name not in CONSTRUCTORS:
-        raise ValueError('Composite symbolic nodes require typed child trees')
-    return CONSTRUCTORS[name](*(untree(item, depth + 1) for item in args))
-
-
-def pack(value):
-    if isinstance(value, dict):
-        return descriptor('sympy', 'mapping', [[tree(key), tree(sp.Integer(item) if isinstance(item, int) else item)]
-                                              for key, item in value.items()])
-    if isinstance(value, sp.MatrixBase):
-        return descriptor('sympy', 'matrix', [[tree(item) for item in row] for row in value.tolist()])
-    if isinstance(value, sp.Basic):
-        return descriptor('sympy', 'expression', tree(value))
-
-
-def restore(kind, data):
-    if kind == 'mapping':
-        return {untree(key): untree(item) for key, item in data}
-    if kind == 'expression':
-        return untree(data)
-    if kind == 'matrix':
-        return sp.Matrix([[untree(item) for item in row] for row in data])
-    raise ValueError('Unsupported symbolic object')

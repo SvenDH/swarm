@@ -1,6 +1,6 @@
 """PDF-only PyMuPDF with in-memory documents, pixels and virtual IO."""
+from .common import iterate
 import pymupdf as pdf
-from .bridge import descriptor
 from .files import source
 from .common import assign
 from .limits import check_memory
@@ -64,32 +64,5 @@ def members(value, fs, name=None):
     return {}
 
 
-def pack(value):
-    if isinstance(value, pdf.Document):
-        return descriptor('pymupdf', 'document', value.tobytes() if value.page_count else None)
-    if isinstance(value, pdf.Pixmap):
-        check_memory(value.width * value.height * value.n)
-        return descriptor('pymupdf', 'pixmap', value.tobytes('png'))
-    if isinstance(value, (pdf.Rect, pdf.Point, pdf.Matrix)):
-        return descriptor('pymupdf', type(value).__name__, list(value))
-
-
-def restore(kind, data):
-    if kind == 'document':
-        return pdf.open() if data is None else pdf.open(stream=data, filetype='pdf')
-    if kind == 'pixmap':
-        return pdf.Pixmap(data)
-    return {'Rect': pdf.Rect, 'Point': pdf.Point, 'Matrix': pdf.Matrix}[kind](data)
-
-
-def view(root, value):
-    if isinstance(root, pdf.Document) and isinstance(value, pdf.Page):
-        return [['item', value.number]]
-
-
 def is_view(value):
     return isinstance(value, pdf.Page)
-
-
-def iterate(value):
-    return iter(value)

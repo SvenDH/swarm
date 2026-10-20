@@ -3,15 +3,14 @@ import io
 import xlsxwriter as xlsx
 from xlsxwriter import utility
 from .api import select
-from .bridge import descriptor
-from .common import record, thaw, view, iterate, assign
+from .common import record, iterate, assign
 from .files import source
 
 
 class Workbook:
-    def __init__(self, filename, sheets=None, formats=None, charts=None):
+    def __init__(self, filename):
         self.filename = filename
-        self.sheets, self.formats, self.charts = sheets or [], formats or [], charts or []
+        self.sheets, self.formats, self.charts = [], [], []
 
 
 class Sheet:
@@ -70,12 +69,12 @@ def write(book, fs):
     charts = [workbook.add_chart(options) for options, commands in book.charts]
     for chart, (options, commands) in zip(charts, book.charts):
         for name, args, kwargs in commands:
-            chart_functions(chart)[name](*thaw(args), **thaw(kwargs))
+            chart_functions(chart)[name](*args, **kwargs)
     for title, commands in book.sheets:
         sheet = workbook.add_worksheet(title)
         for name, args, kwargs in commands:
-            args = deref(thaw(args), formats, charts)
-            kwargs = deref(thaw(kwargs), formats, charts)
+            args = deref(args, formats, charts)
+            kwargs = deref(kwargs, formats, charts)
             if name == 'insert_image':
                 cell, pixels, options = args
                 sheet.insert_image(cell, 'image.png', {**options, 'image_data': io.BytesIO(pixels)})
@@ -143,23 +142,6 @@ def members(value, fs, name=None):
                                       ('set_num_format', 'num_format'), ('set_bg_color', 'bg_color'),
                                       ('set_font_color', 'font_color'), ('set_align', 'align'))}
     return {}
-
-
-def pack(value):
-    if isinstance(value, Workbook):
-        return descriptor('xlsxwriter', 'workbook', [value.filename, value.sheets, value.formats, value.charts])
-
-
-def restore(kind, data):
-    if kind != 'workbook':
-        raise ValueError('Unsupported workbook object')
-    return Workbook(*data)
-
-
-def view(root, value):
-    if isinstance(root, Workbook) and isinstance(value, (Sheet, Format, Chart)) and value.book is root:
-        collection = 'sheets' if isinstance(value, Sheet) else 'formats' if isinstance(value, Format) else 'charts'
-        return [['attr', collection], ['item', value.index]]
 
 
 def is_view(value):

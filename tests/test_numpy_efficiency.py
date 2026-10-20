@@ -14,11 +14,14 @@ class NumpyEfficiencyTests(unittest.IsolatedAsyncioTestCase):
 
     def test_array_buffer_serialization_layouts(self):
         import numpy as np
-        from wrappers.numpy import pack, restore
+        import io
+        from wrappers.numpy import load_array
         base = np.arange(24).reshape(4, 6)
         for value in (base, base.T, base[:, ::2], np.zeros((0, 2)), np.array(3)):
             with self.subTest(shape=value.shape, strides=value.strides):
-                np.testing.assert_array_equal(restore('array', pack(value)['data']), value)
+                output = io.BytesIO()
+                np.save(output, value, allow_pickle=False)
+                np.testing.assert_array_equal(load_array(output.getvalue()), value)
 
     async def test_callable_scalar_types_dtype_arguments_and_restart(self):
         result = await self.agent.execute('''
@@ -72,17 +75,20 @@ np.add(a[1:],2,out=b)
 
     async def test_readonly_buffer_restore_and_writable_mutation(self):
         import numpy as np
-        from wrappers.numpy import pack, restore
-        data = pack(np.arange(8))['data']
+        import io
+        from wrappers.numpy import load_array
+        output = io.BytesIO()
+        np.save(output, np.arange(8), allow_pickle=False)
+        data = output.getvalue()
         with patch.object(np, 'load', side_effect=AssertionError('copying np.load path')):
-            readonly = restore('array', data, copy=False)
-            writable = restore('array', data)
+            readonly = load_array(data, copy=False)
+            writable = load_array(data)
         self.assertFalse(readonly.flags.owndata)
         self.assertFalse(readonly.flags.writeable)
         self.assertTrue(writable.flags.writeable)
         self.assertEqual(readonly.tolist(), writable.tolist())
         with self.assertRaises(ValueError):
-            restore('array', data + b'extra')
+            load_array(data + b'extra')
         self.assertEqual(await self.agent.execute('import numpy as np; a=np.array([3,1,2]); a.sort(); a.tolist()'), '[1, 2, 3]')
 
     @unittest.skipUnless('PIL' in available(), 'Pillow not installed')

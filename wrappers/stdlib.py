@@ -1,10 +1,11 @@
 """Reviewed standard-library operations over a session's filesystem only."""
+
+from .common import Adapter as BaseAdapter
 import errno
 import posixpath
 import stat
 import uuid
 
-from .bridge import descriptor
 from .registry import available, ALIASES, NATIVE
 
 
@@ -192,21 +193,13 @@ def exports(module, fs):
     raise ImportError(module)
 
 
-class Adapter:
+class Adapter(BaseAdapter):
     def __init__(self, module):
         self.module = module
 
     def exports(self, fs):
         return exports(self.module, fs)
 
-    def pack(self, value):
-        if isinstance(value, Result):
-            return descriptor(self.module, 'result', [value.fields, value.values])
-
-    def restore(self, kind, data):
-        if kind != 'result':
-            raise ValueError('Invalid result')
-        return Result(*data)
 
     def members(self, value, fs, name=None):
         if isinstance(value, Result):
@@ -214,15 +207,3 @@ class Adapter:
                     'keys': lambda: list(value.fields), 'items': lambda: list(value.fields.items()),
                     'values': lambda: list(value.fields.values())}
         return {}
-
-    def is_view(self, value):
-        return False
-
-    def view(self, root, value):
-        return None
-
-    def iterate(self, value):
-        return iter(value)
-
-    def assign(self, value, name, item):
-        raise AttributeError('Attribute is read-only')

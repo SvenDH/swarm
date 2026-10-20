@@ -1,9 +1,8 @@
 from pypdf import PdfReader, PdfWriter, Transformation
+from .common import iterate
 from pypdf._page import PageObject
-import io
 
 from .files import source, save
-from .bridge import descriptor
 
 
 def exports(fs):
@@ -37,43 +36,8 @@ def members(value, fs, name=None):
     return {}
 
 
-def pack(value):
-    if isinstance(value, Transformation):
-        return descriptor('pypdf', 'transformation', value.ctm)
-    if isinstance(value, (PdfReader, PdfWriter)):
-        output = io.BytesIO()
-        writer = value if isinstance(value, PdfWriter) else PdfWriter(clone_from=value)
-        writer.write(output)
-        return descriptor('pypdf', 'writer' if isinstance(value, PdfWriter) else 'reader', output.getvalue())
-    if isinstance(value, PageObject):
-        writer = PdfWriter()
-        writer.add_page(value)
-        return pack(writer)  # A detached page is represented as a single-page writer.
-
-
-def restore(kind, data):
-    if kind == 'transformation':
-        return Transformation(tuple(data))
-    if kind == 'reader':
-        return PdfReader(io.BytesIO(data))
-    if kind == 'writer':
-        return PdfWriter(clone_from=io.BytesIO(data))
-    raise ValueError('Unsupported PDF object')
-
-
-def view(root, value):
-    if isinstance(root, (PdfReader, PdfWriter)) and isinstance(value, PageObject):
-        for index, page in enumerate(root.pages):
-            if page is value:
-                return [['attr', 'pages'], ['item', index]]
-
-
 def is_view(value):
     return isinstance(value, PageObject)
-
-
-def iterate(value):
-    return iter(value)
 
 
 def assign(value, name, item):

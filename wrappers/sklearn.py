@@ -1,8 +1,7 @@
-"""Explicit estimators with safe learned-array state (no pickle or refitting)."""
+"""Reviewed estimators retained in RAM; no pickle or host file IO."""
 import numpy as np
 from sklearn import preprocessing, model_selection, metrics, linear_model, cluster, decomposition
-from .bridge import descriptor
-from .common import freeze, thaw, view, iterate, assign
+from .common import is_view, iterate, assign
 from .api import select
 
 FACTORIES = {
@@ -12,7 +11,7 @@ FACTORIES = {
     'LogisticRegression': linear_model.LogisticRegression, 'KMeans': cluster.KMeans,
     'PCA': decomposition.PCA,
 }
-# Only these known fitted fields are saved/restored. Never arbitrary native objects.
+# Only these reviewed fitted fields are exposed to agent code.
 FIELDS = {
     'StandardScaler': ('scale_', 'mean_', 'var_', 'n_features_in_', 'n_samples_seen_', 'feature_names_in_'),
     'MinMaxScaler': ('min_', 'scale_', 'data_min_', 'data_max_', 'data_range_', 'n_features_in_', 'n_samples_seen_', 'feature_names_in_'),
@@ -28,16 +27,12 @@ FIELDS = {
 
 
 class Estimator:
-    def __init__(self, name, params=None, state=None):
-        self.name, self.params, self.state = name, params or {}, state or {}
-
-    def native(self):
-        result = FACTORIES[self.name](**self.params)
-        result.__dict__.update(thaw(self.state))
-        return result
+    def __init__(self, name, params):
+        self.name = name
+        self.model = FACTORIES[name](**params)
 
     def call(self, name, *args, **kwargs):
-        model = self.native()
+        model = self.model
         methods = {'fit': model.fit, 'fit_transform': model.fit_transform} if self.name in (
             'StandardScaler', 'MinMaxScaler', 'LabelEncoder', 'OneHotEncoder', 'PCA', 'KMeans') else {'fit': model.fit}
         if self.name in ('StandardScaler', 'MinMaxScaler', 'LabelEncoder', 'OneHotEncoder', 'PCA', 'KMeans'):
@@ -49,8 +44,6 @@ class Estimator:
         if self.name == 'LogisticRegression':
             methods['predict_proba'] = model.predict_proba
         result = methods[name](*args, **kwargs)
-        if name.startswith('fit'):
-            self.state = {field: freeze(model.__dict__[field]) for field in FIELDS[self.name] if field in model.__dict__}
         return self if result is model else result
 
 
@@ -65,7 +58,6 @@ def factory(name):
             kwargs['sparse_output'] = False
         if name in ('KMeans', 'PCA', 'LogisticRegression'):
             kwargs.setdefault('random_state', 0)
-        FACTORIES[name](**kwargs)  # Validate constructor arguments now.
         return Estimator(name, kwargs)
     return create
 
@@ -97,8 +89,8 @@ def exports(fs):
 
 def members(value, fs, name=None):
     if isinstance(value, Estimator):
-        if name in value.state and not name.startswith('_'):
-            item = thaw(value.state[name])
+        if name in FIELDS[value.name] and name in vars(value.model) and not name.startswith('_'):
+            item = vars(value.model)[name]
             if isinstance(item, np.ndarray) and item.dtype.hasobject:
                 item = item.tolist()
             return {name: item}
@@ -113,18 +105,3 @@ def members(value, fs, name=None):
             allowed.add('predict_proba')
         return {method: (lambda *a, _method=method, **kw: value.call(_method, *a, **kw)) for method in allowed}
     return {}
-
-
-def pack(value):
-    if isinstance(value, Estimator):
-        return descriptor('sklearn', 'estimator', [value.name, freeze(value.params), value.state])
-
-
-def restore(kind, data):
-    if kind != 'estimator' or data[0] not in FACTORIES:
-        raise ValueError('Unsupported estimator')
-    return Estimator(data[0], thaw(data[1]), data[2])
-
-
-def is_view(value):
-    return False
