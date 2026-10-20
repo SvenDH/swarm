@@ -8,6 +8,8 @@ from pathlib import Path
 
 from .registry import MODULES, ALIASES, NATIVE, require
 
+IMPORTS = (*MODULES, *ALIASES, 'irc')
+
 BOOTSTRAP = Path(__file__).with_name('sandbox.py').read_text()
 CHECK = 'try:\n    _library_modules\nexcept NameError:\n    _library_ready=None\nelse:\n    _library_ready=list(_library_modules)\n_library_ready'
 BUILTINS = frozenset(vars(builtins))
@@ -75,6 +77,7 @@ def _library_exec_namespace(value):
         value['_prepare_exec'] = _prepare_exec
         value['_object_fields'] = _object_fields
         value['display'] = display
+        value['_irc_exchange'] = _irc_exchange
     return value
 def _library_dunder_import(name, globals=None, locals=None, fromlist=(), level=0):
     if level:
@@ -104,6 +107,8 @@ def _library_import_module(name, package=None):
     if name.startswith('.'):
         raise ImportError('Relative imports are not supported')
     parts = name.split('.')
+    if parts[0] == 'irc':
+        return _library_irc_import(name)
     result = _library_native_import(parts[0]) if parts[0] in _library_native_modules else _library_import(parts[0])
     for part in parts[1:]:
         result = _library_get(result, part)
@@ -179,6 +184,7 @@ DELETE_BOOTSTRAP += '\n_library_native_modules = ' + repr({**_native_names, **{n
 DELETE_BOOTSTRAP += 'def _library_native_import(name):\n' + ''.join(
     f'    if name == {name!r}:\n        import {name}\n        return {name}\n' for name in NATIVE)
 DELETE_BOOTSTRAP += "    raise ModuleNotFoundError(\"No module named '\" + name + \"'\")\n"
+DELETE_BOOTSTRAP += '\n' + Path(__file__).with_name('irc_client.py').read_text() + '\n'
 # Defining functions on every call retains old interpreter code in checkpoints.
 # Refresh once per helper revision, including sessions restored after an update.
 _revision = hashlib.sha256((BOOTSTRAP + DELETE_BOOTSTRAP).encode()).hexdigest()
@@ -213,6 +219,8 @@ def key(node):
 
 
 def module(name):
+    if name.split('.')[0] == 'irc':
+        return call('irc_import', ast.Constant(name))
     parts = name.split('.')
     parts[0] = ALIASES.get(parts[0], parts[0])
     require(parts[0])
@@ -274,7 +282,7 @@ class LibrarySyntax(ast.NodeTransformer):
     def visit_Import(self, node):
         result = []
         for alias in node.names:
-            if alias.name.split('.')[0] in MODULES or alias.name.split('.')[0] in ALIASES:
+            if alias.name.split('.')[0] in IMPORTS:
                 name = alias.asname or alias.name.split('.')[0]
                 result.append(ast.Assign([ast.Name(name, ast.Store())],
                     module(alias.name if alias.asname else name)))
@@ -283,7 +291,7 @@ class LibrarySyntax(ast.NodeTransformer):
         return result
 
     def visit_ImportFrom(self, node):
-        if node.level or not node.module or node.module.split('.')[0] not in (*MODULES, *ALIASES):
+        if node.level or not node.module or node.module.split('.')[0] not in IMPORTS:
             return node
         if any(alias.name == '*' for alias in node.names):
             raise ImportError('Use explicit library imports, not import *')
@@ -413,8 +421,8 @@ def prepare(source, active=False, loaded=()):
     active = active or any(
         isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id in ('exec','getattr','hasattr','callable','vars','dir','globals','__import__','isinstance','iter','zip','enumerate') or
         isinstance(node, ast.Delete) or
-        isinstance(node, ast.Import) and any(alias.name.split('.')[0] in (*MODULES, *ALIASES) for alias in node.names) or
-        isinstance(node, ast.ImportFrom) and node.module and node.module.split('.')[0] in (*MODULES, *ALIASES)
+        isinstance(node, ast.Import) and any(alias.name.split('.')[0] in IMPORTS for alias in node.names) or
+        isinstance(node, ast.ImportFrom) and node.module and node.module.split('.')[0] in IMPORTS
         for node in ast.walk(tree))
     if not active:
         return source, False
