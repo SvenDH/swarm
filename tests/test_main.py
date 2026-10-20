@@ -2,13 +2,25 @@
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import patch, AsyncMock
 
 import main
 from agents import WorkerClient
 
 
 class MainTests(unittest.IsolatedAsyncioTestCase):
+    async def test_irc_mode_attaches_without_creating_an_agent(self):
+        with tempfile.TemporaryDirectory() as directory:
+            database = str(Path(directory) / 'agents.db')
+            async with main.Worker(database) as worker:
+                with patch('sys.argv', ['main.py', '--irc', '--database', database, '--nick', 'sven']):
+                    with patch('main.irc_tui.IRCView') as view:
+                        view.return_value.run = AsyncMock()
+                        await main.main()
+                        view.assert_called_once_with('user-sven', '#general')
+                        self.assertEqual(view.return_value.run.await_args.args[0]['port'], worker.runtime._irc.port)
+                self.assertEqual(await WorkerClient(database).request('sessions'), [])
+
     async def test_combined_mode_runs_real_repl_and_releases_worker(self):
         with tempfile.TemporaryDirectory() as directory:
             database = str(Path(directory) / 'agents.db')

@@ -12,6 +12,7 @@ dependencies = [
     "python-dotenv==1.2.1",
     "rich>=14.3.2",
     "tiktoken>=0.9",
+    "prompt-toolkit>=3.0.52,<4",
 ]
 
 [project.optional-dependencies]

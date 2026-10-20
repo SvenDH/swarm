@@ -1,8 +1,9 @@
 """Worker-local IRC routing and sandbox boundary checks."""
 import tempfile
 import unittest
+import asyncio
 
-from agents import CodeAgent, Worker
+from agents import CodeAgent, Worker, WorkerClient
 from wrappers.irc import IRCServer
 
 
@@ -63,6 +64,48 @@ class IRCServerTests(unittest.TestCase):
 
 
 class IRCIntegrationTests(unittest.IsolatedAsyncioTestCase):
+    async def test_real_tcp_clients_and_authentication(self):
+        with tempfile.TemporaryDirectory() as folder:
+            async with Worker(folder + '/agent.db') as worker:
+                endpoint = await WorkerClient(folder + '/agent.db').request('irc')
+                self.assertEqual(endpoint['host'], '127.0.0.1')
+                peers = []
+                async def connect(name, password):
+                    reader, writer = await asyncio.open_connection(endpoint['host'], endpoint['port'])
+                    peers.append(writer)
+                    writer.write(f'PASS {password}\r\nNICK {name}\r\nUSER {name} 0 * :test\r\n'.encode())
+                    await writer.drain()
+                    line = await asyncio.wait_for(reader.readline(), 2)
+                    return reader, writer, line.decode()
+                try:
+                    ar, aw, welcome = await connect('user-alice', endpoint['password'])
+                    self.assertIn('001 user-alice', welcome)
+                    br, bw, _ = await connect('user-bob', endpoint['password'])
+                    aw.write(b'JOIN #test\r\n')
+                    self.assertIn(b'JOIN #test', await asyncio.wait_for(ar.readline(), 2))
+                    bw.write(b'JOIN #test\r\n')
+                    await asyncio.wait_for(br.readline(), 2)
+                    await asyncio.wait_for(ar.readline(), 2)
+                    aw.write(b'PRIVMSG #test :over TCP\r\n')
+                    self.assertEqual(await asyncio.wait_for(br.readline(), 2), b':user-alice PRIVMSG #test :over TCP\r\n')
+                    _, _, denied = await connect('user-evil', 'wrong')
+                    self.assertIn('464', denied)
+                    _, _, denied = await connect('one-mountain', endpoint['password'])
+                    self.assertIn('464', denied)
+                    agent = await worker.runtime.agent()
+                    await agent.execute("from irc.client import Reactor; r=Reactor(); c=r.server().connect('worker',6667); c.join('#test')")
+                    self.assertEqual(worker.runtime._irc.agents[agent.name].writer.get_extra_info('peername'),
+                                     (endpoint['host'], endpoint['port']))
+                    self.assertIn(agent.name.encode(), await asyncio.wait_for(br.readline(), 2))
+                    bw.write(f'PRIVMSG {agent.name} :from human\r\n'.encode())
+                    self.assertIn('from human', await agent.execute("seen=[]; r.add_global_handler('privmsg',lambda c,e:seen.append(e.arguments)); r.process_once(); seen"))
+                finally:
+                    for writer in peers:
+                        writer.close()
+                        await writer.wait_closed()
+            with self.assertRaises(OSError):
+                await asyncio.open_connection(endpoint['host'], endpoint['port'])
+
     async def test_import_forms_and_callback_order(self):
         with tempfile.TemporaryDirectory() as folder:
             async with Worker(folder + '/agent.db') as worker:

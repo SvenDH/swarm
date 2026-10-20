@@ -5,6 +5,8 @@ import os
 import sys
 import termios
 import tty
+import uuid
+import irc_tui
 from agents import Worker, WorkerClient
 from rich.console import Console
 from rich.live import Live
@@ -106,6 +108,10 @@ async def main():
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument('--worker', action='store_true', help='run the session worker instead of the REPL')
     mode.add_argument('--with-worker', action='store_true', help='run the worker and REPL in this process')
+    mode.add_argument('--irc', action='store_true', help='open the worker IRC terminal client')
+    parser.add_argument('--irc-port', type=int, default=0, help='worker loopback IRC port (default: auto)')
+    parser.add_argument('--nick', help='IRC human nickname (automatically prefixed with user-)')
+    parser.add_argument('--channel', default='#general', help='initial IRC channel')
     parser.add_argument('--socket', help='local worker socket (defaults to DATABASE.sock)')
     parser.add_argument('--session', type=int, help='reopen a saved session ID')
     parser.add_argument('--database', default='agent.db')
@@ -119,13 +125,21 @@ async def main():
     parser.add_argument('--execution-seconds', type=float, default=60,
                         help='wall-clock budget per Python block, including host calls (default: 60)')
     args = parser.parse_args()
+    if args.irc:
+        try:
+            endpoint = await WorkerClient(args.database, socket=args.socket).request('irc')
+            await irc_tui.IRCView('user-' + (args.nick or uuid.uuid4().hex[:8]), args.channel).run(endpoint)
+        except (FileNotFoundError, ConnectionRefusedError):
+            Console().print(f'Worker is not running. Start: uv run main.py --worker --database {args.database}')
+        return
     if args.worker or args.with_worker:
-        async with Worker(args.database, socket=args.socket, workspaces=args.workspaces,
+        async with Worker(args.database, socket=args.socket, workspaces=args.workspaces, irc_port=args.irc_port,
                           workers=args.workers, model_concurrency=args.model_concurrency,
                           template=args.template, context_tokens=args.context_tokens, response_tokens=args.response_tokens,
                           execution_timeout=args.execution_seconds,
                           memory_budget=None if args.memory_mb is None else args.memory_mb * 1024**2) as worker:
             print(f'Monty worker listening on {worker.socket}', flush=True)
+            print(f'IRC listening on 127.0.0.1:{worker.runtime._irc.port}', flush=True)
             if args.with_worker:
                 await repl(args)
             else:

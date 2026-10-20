@@ -94,6 +94,23 @@ class _LibraryIRCConnection:
     def privmsg(self, target, text):
         self.send_raw('PRIVMSG ' + target + ' :' + text)
 
+    def send_file(self, target, path):
+        if not self.connected:
+            raise _LibraryIRCError('Not connected')
+        if path is None:
+            raise TypeError('Choose a source file')
+        reference = _irc_file('share', str(path))
+        self.privmsg(target, '[file] ' + reference)
+        return reference
+
+    def file_info(self, reference):
+        return _irc_file('info', reference)
+
+    def receive_file(self, reference, destination, overwrite=False):
+        if destination is None:
+            raise TypeError('Choose a destination file')
+        return _irc_file('receive', reference, str(destination), overwrite=overwrite)
+
     def names(self, channels=None):
         for channel in ([channels] if isinstance(channels, str) else (channels or [])):
             self.send_raw('NAMES ' + channel)
