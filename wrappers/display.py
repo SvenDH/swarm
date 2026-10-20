@@ -7,17 +7,17 @@ from .protocol import plain
 def preview(fs, bridge, value):
     with memory_scope(fs.memory_budget):
         bridge.initialize('PIL')
-        from .pil import exports, restore
+        from .pil import exports
         value = plain(value)
         if isinstance(value, str):
             image = exports(fs)['Image']['open'](value)
         elif type(value) is dict and set(value) == {'__library_value__', 'path', 'auth'}:
             spec = value['__library_value__']
-            bridge.check(spec)
-            bridge.check_path(spec, value['path'], value['auth'])
-            if spec['module'] != 'PIL' or spec['kind'] != 'image' or value['path']:
+            from PIL import Image
+            original = bridge.resolve(spec, value['path'], value['auth'])
+            if spec['module'] != 'PIL' or not isinstance(original, Image.Image):
                 raise TypeError('display expects an image or image file path')
-            image = restore('image', spec['data'])
+            image = original.copy()
         else:
             raise TypeError('display expects an image or image file path')
         try:

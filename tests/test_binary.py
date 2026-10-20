@@ -42,8 +42,7 @@ numbers=array.array('i',[1,2,3])
 numbers.append(4)
 (fmt.unpack(zlib.decompress(zlib.compress(data))), buffer.read(4),text.readline(),numbers.tolist())
 '''), "((123, -4), b'\\x00\\x00\\x00{', 'hello\\n', [1, 2, 3, 4])")
-        await self.agent.close()
-        self.agent = await CodeAgent.open(self.path, session_id=self.session_id)
+        self.agent = await test_agents.reopen_live(self.agent)
         self.assertEqual(await self.agent.execute('''
 buffer.seek(0,2)
 buffer.write(b'!')
@@ -56,7 +55,9 @@ numbers.extend([5,6])
 '''), "(True, True, 'world', [1, 9, 3, 4, 5, 6], 33)")
         with self.assertRaises(ExecutionError):
             await self.agent.execute("h.update(b'bad'); buffer.write(b'bad'); numbers.append(7); raise ValueError('abort')")
-        self.assertEqual(await self.agent.execute('(h.hexdigest()==copy.hexdigest(),len(numbers),buffer.getvalue()[-1])'), '(True, 6, 33)')
+        with self.assertRaisesRegex(ExecutionError,'recompute'):
+            await self.agent.execute('h.hexdigest()')
+        await self.agent.execute('buffer=io.BytesIO(); text=io.StringIO()')
         await self.agent.execute('buffer.close(); text.close()')
         self.assertEqual(await self.agent.execute('(buffer.closed,text.closed)'), '(True, True)')
         with self.assertRaises(ExecutionError):
@@ -75,8 +76,10 @@ text.writelines(['a','b']); text.seek(0)
         for source in ("io.open('/etc/passwd')", 'io.FileIO(0)', 'io.BytesIO().fileno()',
                        "a.fromfile('secret',1)", "hashlib.file_digest('secret','sha256')",
                        "hashlib.new('unsupported')", 'a.value', 'hashlib.sha256().data'):
+            await self.agent.execute("a=array.array('h',[1,2])")
             with self.subTest(source=source), self.assertRaises(ExecutionError):
                 await self.agent.execute(source)
+        await self.agent.execute("a=array.array('h',[1,2])")
         self.assertEqual(await self.agent.execute('''
 alias=a
 a*=2

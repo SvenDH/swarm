@@ -62,10 +62,9 @@ class OptionalTests(unittest.IsolatedAsyncioTestCase):
         finally:
             registry.available.cache_clear()
 
-    async def restart(self):
+    async def reopen(self):
         session_id = self.agent.id
-        await self.runtime.close()
-        self.runtime = await Runtime(self.database, workers=2).__aenter__()
+        await self.agent.close()
         self.agent = await self.runtime.agent(session_id=session_id)
 
     async def test_expanded_plotting_recipes_and_scipy(self):
@@ -94,7 +93,7 @@ fig.savefig('extended.png')
 '''), '([0.5, 0.5], 0.5, [3.0, 1.5, 1.5], 1.5)')
         before = await self.agent.read_file(self.agent.home + '/extended.png')
         self.assertTrue(before.startswith(b'\x89PNG'))
-        await self.restart()
+        await self.reopen()
         await self.agent.execute("fig.savefig('restored.png'); fig.savefig('restored.svg')")
         self.assertEqual(before, await self.agent.read_file(self.agent.home + '/restored.png'))
         for code in ("axes[0][0].text(0,0,'unsafe',usetex=True)",
@@ -117,7 +116,7 @@ fig.savefig('plot.png')
 ''')
         first = await self.agent.read_file(self.agent.home + '/plot.png')
         self.assertTrue(first.startswith(b'\x89PNG'))
-        await self.restart()
+        await self.reopen()
         await self.agent.execute("fig.savefig('again.png'); plt.savefig('pyplot.svg')")
         self.assertEqual(first, await self.agent.read_file(self.agent.home + '/again.png'))
         self.assertIn(b'<svg', await self.agent.read_file(self.agent.home + '/pyplot.svg'))
@@ -133,7 +132,7 @@ result = stats.ttest_1samp([1,2,3,4,5],3)
 f = interp1d([0,1,2], [0,10,20])
 (result.statistic, result.pvalue, f([0.5,1.5]).tolist(), signal.find_peaks([0,2,0])[0].tolist(), fft.fft([1,0]).real.tolist())
 '''), '(0.0, 1.0, [5.0, 15.0], [1], [1.0, 1.0])')
-        await self.restart()
+        await self.reopen()
         self.assertEqual(await self.agent.execute('(f([1.0]).tolist(), stats.norm.cdf(0))'), '([10.0], 0.5)')
         self.assertEqual(await self.agent.execute('normal=stats.norm(loc=2,scale=3); normal.mean()'), '2.0')
         self.assertEqual(await self.agent.execute('''
@@ -180,7 +179,7 @@ book=xlsxwriter.Workbook({str(host)!r}); book.add_worksheet().write('A1','safe')
         self.assertEqual(host.read_bytes(), b'secret')
         self.assertTrue((await self.agent.read_file(str(host))).startswith(b'PK'))
 
-    async def test_presentation_text_tables_pictures_and_restart(self):
+    async def test_presentation_text_tables_pictures_and_live_reopen(self):
         self.need('pptx', 'PIL')
         await self.agent.execute('''
 from pptx import Presentation
@@ -202,7 +201,7 @@ slide.shapes.add_picture('pic.png',0,0,width=Inches(1))
 deck.save('deck.pptx')
 ''')
         self.assertTrue((await self.agent.read_file(self.agent.home + '/deck.pptx')).startswith(b'PK'))
-        await self.restart()
+        await self.reopen()
         self.assertEqual(await self.agent.execute("(run.text,run.font.bold,table.cell(0,0).text,Presentation('deck.pptx').slides[0].shapes.title.text)"),
                          "('bold', True, 'cell', 'Hello')")
 
@@ -215,7 +214,7 @@ c=canvas.Canvas('report.pdf',pagesize=A4)
 c.setFont('Helvetica',12)
 c.drawString(72,720,'Hello PDF')
 ''')
-        await self.restart()
+        await self.reopen()
         self.assertEqual(await self.agent.execute('''
 c.save()
 import pdfplumber
@@ -228,7 +227,7 @@ page.get_pixmap(dpi=72).save('page.png')
 doc.save('changed.pdf')
 (pdf.pages[0].extract_text(), doc.page_count, 'Added' in page.get_text())
 '''), "('Hello PDF', 1, True)")
-        await self.restart()
+        await self.reopen()
         self.assertEqual(await self.agent.execute("('Added' in page.get_text(), pdf.pages[0].crop((0,0,500,800)).extract_text())"), "(True, 'Hello PDF')")
         self.assertTrue((await self.agent.read_file(self.agent.home + '/page.png')).startswith(b'\x89PNG'))
         self.assertEqual(await self.agent.execute("import fitz; len(fitz.open('changed.pdf'))"), '1')
@@ -242,10 +241,10 @@ tag=soup.select_one('p.x')
 tag.string='Changed'
 (soup.get_text(), soup.find('a')['href'], len(soup.select('p')))
 '''), "('ChangedLink', '/url', 1)")
-        await self.restart()
+        await self.reopen()
         self.assertEqual(await self.agent.execute("tag['id']='ok'; soup.find('p')['id']"), "'ok'")
 
-    async def test_sympy_expressions_solve_matrix_and_restart(self):
+    async def test_sympy_expressions_solve_matrix_and_live_reopen(self):
         self.need('sympy')
         self.assertEqual(await self.agent.execute('''
 import sympy as sp
@@ -253,13 +252,13 @@ x=sp.Symbol('x')
 expression=(x+1)**2
 str(sp.expand(expression))
 '''), "'x**2 + 2*x + 1'")
-        await self.restart()
+        await self.reopen()
         self.assertEqual(await self.agent.execute("(str(sp.diff(expression,x)), str(sp.solve(sp.Eq(x+1,3),x)[0]), str(sp.Matrix([[1,2],[3,4]]).det()))"),
                          "('2*x + 2', '2', '-2')")
         self.assertEqual(await self.agent.execute('(float(sp.Rational(1,2)), int(sp.Integer(3)), str(sp.pi))'), "(0.5, 3, 'pi')")
         self.assertEqual(await self.agent.execute('y=sp.Symbol("y"); solved=sp.solve([sp.Eq(x+y,3),sp.Eq(x-y,1)],[x,y]); int(solved[x])'), '2')
 
-    async def test_sklearn_fit_transform_predict_survive_restart(self):
+    async def test_sklearn_fit_transform_predict_survive_live_reopen(self):
         self.need('sklearn')
         self.assertEqual(await self.agent.execute('''
 from sklearn.preprocessing import StandardScaler, OneHotEncoder, LabelEncoder
@@ -279,7 +278,7 @@ kmeans=KMeans(n_clusters=2,n_init=1).fit([[0,0],[0,1],[8,8],[8,9]])
 pca=PCA(n_components=1).fit([[0,0],[1,1],[2,2]])
 (scaled.tolist(), model.predict([[3]]).round(6).tolist(), accuracy_score([1,0],[1,0]))
 '''), '([[-1.0], [1.0]], [7.0], 1.0)')
-        await self.restart()
+        await self.reopen()
         self.assertEqual(await self.agent.execute("(model.predict([[4]]).round(6).tolist(), scaler.transform([[1]]).tolist(), encoder.transform([['b']]).tolist(), labels.transform(['b']).tolist(), classifier.predict([[10]]).tolist(), len(kmeans.predict([[0,0]])), pca.transform([[3,3]]).shape)"),
                          '([9.0], [[0.0]], [[0.0, 1.0]], [1], [1], 1, (1, 1))')
         self.assertEqual(await self.agent.execute('model.coef_.round(6).tolist()'), '[2.0]')
@@ -298,7 +297,7 @@ chart=book.add_chart({'type':'line'})
 chart.add_series({'categories':'=Data!$A$2:$A$3','values':'=Data!$B$2:$B$3'})
 sheet.insert_chart('D1',chart)
 ''')
-        await self.restart()
+        await self.reopen()
         self.assertEqual(await self.agent.execute('''
 sheet.write_formula('C2','=A2+B2')
 book.close()
@@ -339,6 +338,7 @@ loaded=load_workbook('generated.xlsx')
         self.assertNotEqual(before, await other.read_file(other.home + '/b.png'))
         with self.assertRaises(ExecutionError):
             await self.agent.execute("plt.plot([1,2],[99,99]); plt.savefig('bad.png'); raise ValueError('rollback')")
+        await self.agent.execute("plt.plot([1,2],[3,4])")
         await self.agent.execute("plt.savefig('after.png')")
         self.assertEqual(before, await self.agent.read_file(self.agent.home + '/after.png'))
 

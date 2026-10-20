@@ -55,7 +55,7 @@ import numpy as np
                 with self.subTest(values=values, minlength=minlength), self.assertRaises((ValueError, MemoryError)):
                     bincount(values, minlength=minlength)
 
-    async def test_ufunc_calls_methods_indexed_updates_and_restart(self):
+    async def test_ufunc_calls_methods_indexed_updates_and_live_reopen(self):
         from wrappers.numpy import UFUNCS
         for name, function in UFUNCS.items():
             arguments = [[1,2]] * function.nin
@@ -78,8 +78,7 @@ add.at(a,[0,0,2],1)
  add.reduce(a),multiply.accumulate([1,2,3]).tolist(),add.outer([1,2],[3,4]).tolist())
 '''), '([3, 2, 4], [11, 12], [2, 3], 9, [1, 2, 6], [[4, 5], [5, 6]])')
         session_id = self.agent.id
-        await self.runtime.close()
-        self.runtime = await Runtime(self.path, workers=2).__aenter__()
+        await self.agent.close()
         self.agent = await self.runtime.agent(session_id=session_id)
         self.assertEqual(await self.agent.execute('view=a[1:]; add.at(view,[0],5); a.tolist()'), '[3, 7, 4]')
         self.assertEqual(await self.agent.execute('(add.reduce(a,0),add.reduceat(a,[0,2]).tolist(),np.logical_and.reduce([True,False]))'), '(14, [10, 4], False)')
@@ -87,9 +86,11 @@ add.at(a,[0,0,2],1)
                      'add.outer(np.ones(50001),np.ones(50001))',
                      'add(np.ones((50001,1)),1,where=np.ones((1,50001),dtype=bool))',
                      'add.at(np.zeros((2,2)),(np.zeros((50001,1),dtype=int),np.zeros((1,50001),dtype=int)),1)'):
+            await self.agent.execute('from numpy import add; a=np.array([3,7,4])')
             with self.subTest(code=code), self.assertRaises(ExecutionError):
                 await self.agent.execute(code)
-        self.assertEqual(await self.agent.execute('a.tolist()'), '[3, 7, 4]')
+        with self.assertRaisesRegex(ExecutionError,'recompute'):
+            await self.agent.execute('a.tolist()')
 
     async def test_grids_preflight_before_native_allocations(self):
         from wrappers.numpy import Grid

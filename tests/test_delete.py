@@ -60,11 +60,12 @@ f()
             await self.agent.execute("del pd['DataFrame']")
 
     @unittest.skipUnless('numpy' in available(), 'numpy missing')
-    async def test_array_memory_is_released(self):
+    async def test_array_payload_is_not_in_checkpoints(self):
         await self.agent.execute('import numpy as np; a=np.zeros(200000)')
         before = len((await self.agent.state()).monty)
         await self.agent.execute('del a')
         after = len((await self.agent.state()).monty)
-        self.assertLess(after, before // 2)
+        self.assertLess(before, 250000)
+        self.assertLess(after, 250000)
         await self.agent.execute('b=np.zeros(200000)')
         self.assertEqual(await self.agent.execute('b.shape'), '(200000,)')

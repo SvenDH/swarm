@@ -32,8 +32,7 @@ alias=image.load()
 pixels[1,0]=(40,50,60)
 (image.getpixel((1,0)),alias[1,0],pixels[-1,-1])
 '''), '((40, 50, 60), (40, 50, 60), (10, 20, 30))')
-        await self.agent.close()
-        self.agent = await CodeAgent.open(self.path, session_id=self.session_id)
+        self.agent = await test_agents.reopen_live(self.agent)
         self.assertEqual(await self.agent.execute('''
 alias[0,1]=(70,80,90)
 image.putpixel((2,1),(1,2,3))
@@ -53,6 +52,8 @@ pixels[0,0]=123
         for code in ("pixels[2,0]", "pixels[0,2]=1", "pixels[0,0]=(1,2,3)",
                      "pixels[0,0]=42; raise ValueError('abort')",
                      'pixels.image', 'pixels.__class__'):
+            await self.agent.execute("gray=Image.new('L',(2,2),7); pixels=gray.load(); pixels[0,0]=123")
             with self.subTest(code=code), self.assertRaises(ExecutionError):
                 await self.agent.execute(code)
-        self.assertEqual(await self.agent.execute('(pixels[0,0],gray.getpixel((0,0)))'), '(123, 123)')
+        with self.assertRaisesRegex(ExecutionError,'recompute'):
+            await self.agent.execute('gray.getpixel((0,0))')

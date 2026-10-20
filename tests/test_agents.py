@@ -42,6 +42,16 @@ def model_client(client):
     return AsyncOpenAI(api_key='test', base_url='http://test/v1', http_client=client, max_retries=0)
 
 
+async def reopen_live(agent):
+    """Reopen a handle without restarting the owner of RAM-only library objects."""
+    owns = agent._owns_runtime
+    agent._owns_runtime = False
+    await agent.close()
+    replacement = await agent.runtime.agent(session_id=agent.id)
+    replacement._owns_runtime = owns
+    return replacement
+
+
 class ByteStream(httpx.AsyncByteStream):
     def __init__(self, chunks):
         self.chunks = chunks

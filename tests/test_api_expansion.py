@@ -22,10 +22,9 @@ class ExpandedApiTests(unittest.IsolatedAsyncioTestCase):
         if not all(name in available() for name in names):
             self.skipTest('optional host packages not installed')
 
-    async def restart(self):
+    async def reopen(self):
         session_id = self.agent.id
-        await self.runtime.close()
-        self.runtime = await Runtime(self.database, workers=2).__aenter__()
+        await self.agent.close()
         self.agent = await self.runtime.agent(session_id=session_id)
 
     async def reject(self, code):
@@ -42,7 +41,7 @@ info=np.iinfo(np.uint8)
 (np.pad([1,2],(1,2)).tolist(),np.take([[1,2],[3,4]],[1],axis=1).tolist(),
  info.max, np.finfo(np.float32).bits, np.sinh([0]).tolist(),np.union1d([1,2],[2,3]).tolist())
 '''), '([0, 1, 2, 0, 0], [[2], [4]], 255, 32, [0.0], [1, 2, 3])')
-        await self.restart()
+        await self.reopen()
         import numpy as np
         native = np.random.default_rng(5)
         native.exponential(size=3)
@@ -65,7 +64,7 @@ other=ImageChops.invert(im).transpose(Image.Transpose.FLIP_LEFT_RIGHT).filter(ef
 (ImageColor.getrgb('rebeccapurple'),other.size,ImageOps.scale(im,0.5).size,
  Image.Transform.AFFINE,Image.Dither.NONE)
 '''), '((102, 51, 153), (80, 40), (40, 20), 0, 0)')
-        await self.restart()
+        await self.reopen()
         self.assertEqual(await self.agent.execute("draw.text((30,2),'ok',font=font); font.size"), '12')
         self.assertEqual(await self.agent.execute('im.filter(effect).filter(ImageFilter.RankFilter(3,4)).size'), '(80, 40)')
         await self.reject("ImageFont.truetype('/etc/passwd',12)")
@@ -80,7 +79,7 @@ dist=stats.gamma(2)
  special.jv(0,0),ndimage.zoom([[1.,2.],[3.,4.]],2,order=0).shape,
  float(dist.mean()),float(stats.bernoulli(0.25).pmf(1)))
 '''), '(299792458.0, 299792458.0, 1.0, (4, 4), 2.0, 0.25)')
-        await self.restart()
+        await self.reopen()
         self.assertEqual(await self.agent.execute('float(dist.mean())'), '2.0')
         await self.reject('ndimage.generic_filter([[1]],lambda x:1,size=1)')
         await self.reject('special.jv(0,[0],out=[0])')
@@ -99,7 +98,7 @@ cat=pd.Categorical(['b','a','b'])
 (df['key'].str.upper().tolist(),dates.dt.year.tolist(),
  df.pivot_table(index='key',values='value',aggfunc='sum')['value'].tolist(),cat.codes.tolist())
 '''), "(['A', 'A', 'B'], [2024, 2025], [3, 3], [1, 0, 1])")
-        await self.restart()
+        await self.reopen()
         self.assertEqual(await self.agent.execute('cat.tolist()'), "['b', 'a', 'b']")
         for reducer in ('to_pickle', 'eval', 'to_csv'):
             await self.reject(f"pd.pivot_table(df,index='key',values='value',aggfunc={reducer!r})")
@@ -121,7 +120,7 @@ cell.alignment=Alignment(horizontal='center')
 book.save('styled.xlsx')
 (cell.font.bold,cell.alignment.horizontal,WD_ALIGN_PARAGRAPH.JUSTIFY,WD_BREAK.PAGE,MSO_SHAPE.STAR_5_POINT)
 '''), "(True, 'center', 3, 7, 92)")
-        await self.restart()
+        await self.reopen()
         self.assertEqual(await self.agent.execute('cell.font.bold'), 'True')
         await self.reject("book.active.add_image('/etc/passwd')")
 
@@ -155,7 +154,7 @@ solutions=sp.linsolve([x-2],[x])
 transform=Transformation().translate(2,3)
 (str(expr),str(solutions),transform.apply_on((1,1)))
 '''), "('sinh(x) + gamma(x)', '{(2,)}', (3.0, 4.0))")
-        await self.restart()
+        await self.reopen()
         self.assertEqual(await self.agent.execute('str(expr)'), "'sinh(x) + gamma(x)'")
         await self.reject("sp.sympify('__import__(\"os\")')")
 

@@ -345,6 +345,10 @@ class LibrarySyntax(ast.NodeTransformer):
             return ast.Call(ast.Name('_library_dunder_import', ast.Load()),
                             [self.visit(arg) for arg in node.args],
                             [self.visit(item) for item in node.keywords])
+        if isinstance(node.func, ast.Name) and node.func.id in ('iter', 'zip', 'enumerate'):
+            name = 'builtin_iter' if node.func.id == 'iter' else node.func.id
+            return ast.Call(ast.Name('_library_' + name, ast.Load()),
+                            [self.visit(arg) for arg in node.args], [self.visit(item) for item in node.keywords])
         if isinstance(node.func, ast.Name) and node.func.id == 'globals':
             node.func = ast.Name('_library_globals', ast.Load())
             node.args = [self.visit(arg) for arg in node.args]
@@ -407,7 +411,7 @@ def prepare(source, active=False, loaded=()):
             backend(name)
     tree = ast.parse(source)
     active = active or any(
-        isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id in ('exec','getattr','hasattr','callable','vars','dir','globals','__import__','isinstance') or
+        isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id in ('exec','getattr','hasattr','callable','vars','dir','globals','__import__','isinstance','iter','zip','enumerate') or
         isinstance(node, ast.Delete) or
         isinstance(node, ast.Import) and any(alias.name.split('.')[0] in (*MODULES, *ALIASES) for alias in node.names) or
         isinstance(node, ast.ImportFrom) and node.module and node.module.split('.')[0] in (*MODULES, *ALIASES)

@@ -28,8 +28,7 @@ a=np.array([1,2],dtype=dtype)
 (dtype(1.25),np.uint8(7),a.astype(np.int32).tolist(),np.zeros(2,np.float32).dtype.name)
 ''')
         self.assertEqual(result, "(1.25, 7, [1, 2], 'float32')")
-        await self.agent.close()
-        self.agent = await CodeAgent.open(self.path, session_id=self.session_id)
+        self.agent = await test_agents.reopen_live(self.agent)
         self.assertEqual(await self.agent.execute('dtype(2.5)'), '2.5')
 
     async def test_empty_is_initialized_and_bounded(self):
@@ -52,9 +51,12 @@ np.add(a[1:],2,out=b)
         self.assertEqual(await self.agent.execute('v=a[1:]; np.add(v,1,out=v,where=[True,False]); a.tolist()'), '[0, 2, 4]')
         with self.assertRaises(ExecutionError):
             await self.agent.execute("np.clip(a,0,1,out=a); raise ValueError('abort')")
-        self.assertEqual(await self.agent.execute('a.tolist()'), '[0, 2, 4]')
+        with self.assertRaisesRegex(ExecutionError, 'recompute'):
+            await self.agent.execute('a.tolist()')
+        await self.agent.execute('a=np.array([0,2,4])')
         self.assertEqual(await self.agent.execute('s=np.zeros((),dtype=np.int64); np.add.reduce(a,out=s); s.item()'), '6')
         for code in ('np.add(a,1,out=[0,0,0])', "np.add(a,1,out={'__library_value__':{}})"):
+            await self.agent.execute('a=np.array([0,2,4])')
             with self.assertRaises(ExecutionError):
                 await self.agent.execute(code)
 

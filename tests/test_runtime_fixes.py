@@ -29,7 +29,7 @@ ns['answer']
         self.agent = await CodeAgent.open(self.path, session_id=self.session_id)
         self.assertEqual(await self.agent.execute("ns['answer']"), '11')
 
-    async def test_random_legacy_and_out_persist_and_rollback(self):
+    async def test_random_legacy_out_and_explicit_reseeding(self):
         self.assertEqual(await self.agent.execute('''
 import numpy as np
 np.random.seed(123)
@@ -52,11 +52,11 @@ result=rng.standard_normal(dtype=np.float32,out=out32)
         await self.agent.execute('np.random.seed(42)')
         with self.assertRaises(ExecutionError):
             await self.agent.execute("np.random.rand(5); raise ValueError('abort')")
-        self.assertEqual(await self.agent.execute('np.random.rand(3).tolist()==np.random.RandomState(42).rand(3).tolist()'), 'True')
+        self.assertEqual(await self.agent.execute('np.random.seed(42); np.random.rand(3).tolist()==np.random.RandomState(42).rand(3).tolist()'), 'True')
         await self.agent.execute('np.random.seed(7)')
         await self.agent.close()
         self.agent = await CodeAgent.open(self.path, session_id=self.session_id)
-        self.assertEqual(await self.agent.execute('np.random.rand(3).tolist()==np.random.RandomState(7).rand(3).tolist()'), 'True')
+        self.assertEqual(await self.agent.execute('np.random.seed(7); np.random.rand(3).tolist()==np.random.RandomState(7).rand(3).tolist()'), 'True')
 
     async def test_point_callbacks_and_import(self):
         self.assertEqual(await self.agent.execute('''

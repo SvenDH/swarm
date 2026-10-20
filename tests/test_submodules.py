@@ -25,10 +25,9 @@ class SubmoduleTests(unittest.IsolatedAsyncioTestCase):
         if not all(name in available() for name in names):
             self.skipTest('optional packages not installed')
 
-    async def restart(self):
+    async def reopen(self):
         session_id = self.agent.id
-        await self.runtime.close()
-        self.runtime = await Runtime(self.database, workers=2).__aenter__()
+        await self.agent.close()
         self.agent = await self.runtime.agent(session_id=session_id)
 
     async def test_numpy_fft_imports_and_checkpoint(self):
@@ -41,7 +40,7 @@ spectrum = rfft([1.,2.,3.,4.])
 (np.round(irfft(spectrum),6).tolist(), fft.fftfreq(4).tolist(),
  fft.fftshift(np.arange(4)).tolist(), np.round(fft.ifft(fft.fft([1.,2.])).real,6).tolist())
 '''), '([1.0, 2.0, 3.0, 4.0], [0.0, 0.25, -0.5, -0.25], [2, 3, 0, 1], [1.0, 2.0])')
-        await self.restart()
+        await self.reopen()
         self.assertEqual(await self.agent.execute('np.round(irfft(spectrum),6).tolist()'), '[1.0, 2.0, 3.0, 4.0]')
         from wrappers.numpy import fft_transform
         with patch('wrappers.numpy.np.fft.fft', side_effect=AssertionError('native allocation reached')) as native:
@@ -60,7 +59,7 @@ rotation = Rotation.from_euler('z',90,degrees=True)
  cumulative_simpson([0.,1.,4.],initial=0).shape,
  np.round(rotation.apply([1.,0.,0.]),6).tolist())
 '''), '(2.0, 2.6666666666666665, [0.0, 0.5, 2.0], (3,), [0.0, 1.0, 0.0])')
-        await self.restart()
+        await self.reopen()
         self.assertEqual(await self.agent.execute('np.round(rotation.inv().apply([0.,1.,0.]),6).tolist()'), '[1.0, 0.0, 0.0]')
         with self.assertRaises(ExecutionError):
             await self.agent.execute('from scipy.integrate import quad')
@@ -81,7 +80,7 @@ processed.save('processed.png')
  image.filter(filters.MedianFilter(size=3)).size, image.filter(filters.SHARPEN).size)
 '''), "((200, 100, 40), (6, 6), (2, 2), (3, 3), (2, 1), 'L', (4, 2), (4, 2))")
         self.assertTrue((await self.agent.read_file(self.agent.home + '/processed.png')).startswith(b'\x89PNG'))
-        await self.restart()
+        await self.reopen()
         self.assertEqual(await self.agent.execute('contrast.enhance(0.5).filter(blur).getpixel((0,0))'), '(50, 25, 10)')
         for code in ('ImageOps.expand(image,1000000)', 'ImageOps.pad(image,(100000,100000))',
                      'ImageOps.cover(Image.new("RGB",(100,1)),(1,100000))',
@@ -114,7 +113,7 @@ plt.savefig('agg.png')
                 with self.subTest(backend=backend), self.assertRaises(ExecutionError):
                     await self.agent.execute(f'matplotlib.use({backend!r}, force=False)')
         self.assertTrue((await self.agent.read_file(self.agent.home + '/agg.png')).startswith(b'\x89PNG'))
-        await self.restart()
+        await self.reopen()
         self.assertEqual(await self.agent.execute("matplotlib.use('Agg'); matplotlib.get_backend()"), "'Agg'")
 
     async def test_image_draw_mutates_shared_image_and_survives_restart(self):
@@ -130,19 +129,21 @@ draw.text((0,15),'hello',fill='black',font_size=10)
 image.save('drawing.png')
 (image.getpixel((1,1)),image.getpixel((20,1)),image.getpixel((35,5)),draw.textbbox((0,0),'hello')[2]>0)
 '''), '((255, 0, 0), (0, 0, 255), (0, 128, 0), True)')
-        await self.restart()
+        await self.reopen()
         self.assertEqual(await self.agent.execute("draw.point((1,1),fill='blue'); image.getpixel((1,1))"), '(0, 0, 255)')
         # Multiple drawing views and image writes retain one authenticated root.
         self.assertEqual(await self.agent.execute("other=ImageDraw.Draw(image); image.putpixel((2,2),(1,2,3)); other.point((3,3),fill='black'); (image.getpixel((2,2)),image.getpixel((3,3)))"), '((1, 2, 3), (0, 0, 0))')
         with self.assertRaises(ExecutionError):
             await self.agent.execute("draw.point((1,1),fill='red'); raise ValueError('rollback')")
-        self.assertEqual(await self.agent.execute('image.getpixel((1,1))'), '(0, 0, 255)')
+        with self.assertRaisesRegex(ExecutionError,'recompute'):
+            await self.agent.execute('image.getpixel((1,1))')
         for code in ("draw.text((0,0),'bad',font='/etc/passwd')",
                      "draw.text((0,0),'bad','black','/etc/passwd')",
                      "draw.text((0,0),'bad',font_size=1000000)",
                      "draw.line([(0,0),(1,1)],'black',1000000)",
                      "draw.regular_polygon((10,10,5),1000000000)",
                      "draw.text((0,0),'x'*1000,font_size=512)", 'draw._image'):
+            await self.agent.execute("image=Image.new('RGB',(64,32)); draw=ImageDraw.Draw(image)")
             with self.subTest(code=code), self.assertRaises(ExecutionError):
                 await self.agent.execute(code)
 

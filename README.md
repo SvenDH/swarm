@@ -61,8 +61,8 @@ Ordinary and dynamic imports share the approved module set. Native Monty modules
 include `sys`, `json`, `time`, `random`, `base64`, and `binascii`; introspection of
 these modules stays inside the interpreter. Additional adapters provide `zlib`
 compression/checksums, `struct` packing, `hashlib` hashes, typed `array.array`
-values, and in-memory `io.BytesIO`/`StringIO` streams. These objects survive
-checkpoints and failed operations roll back. Binary streams also work with
+values, and in-memory `io.BytesIO`/`StringIO` streams. These objects stay in RAM,
+not in checkpoints. Binary streams also work with
 Pillow's open/save operations.
 
 `isinstance(image, Image.Image)` and `isinstance(array, np.ndarray)` are supported
@@ -82,10 +82,21 @@ SQLite stores conversation history, interpreter checkpoints, file metadata,
 pending prompts and executions. File bytes live in immutable objects outside
 SQLite, accessed through the `Storage` interface. Checkouts are disposable.
 
+Native arrays, images, frames, figures, buffers and similar objects live in a
+worker-wide RAM store. Monty holds only small session-authenticated references;
+operations do not copy native payloads through the interpreter. Views and aliases
+refer to the same native data. Explicit exports such as `np.save` or image saving
+still write durable files. `zip`, `iter`, and `enumerate` accept array facades.
+
 An execution is recorded before it starts. Only a successful checkpoint and
-its associated files commit. A failed block rolls back variables and files;
+its associated files commit. A failed block rolls back ordinary variables and files,
+and invalidates that session's native objects rather than preserving partial mutations;
 printed output remains visible but does not prove a write committed.
-After a restart, pending work resumes from the last committed state.
+After a restart, pending work resumes from the last committed state. Native
+objects are deliberately not restored: their old references raise an error
+instructing the agent to recompute or reload them. Python code, ordinary values,
+conversation history and saved files remain durable. Merely reopening a session
+handle in the same worker preserves its resident native objects.
 Completed execution IDs are deduplicated. Escape persists a paused state until
 explicitly resumed.
 
@@ -99,8 +110,11 @@ uv run main.py --with-worker --database fresh.db --workspaces fresh-workspaces
 
 ## Shared memory
 
-The default execution budget is **1 GiB per worker**, not per agent. Idle
-checkpoints stay on disk. Code blocks queue for one shared heap reservation;
+The default execution budget is **1 GiB per worker**, not per agent. Interpreter
+checkpoints stay on disk; native objects stay in the shared, budgeted RAM store.
+Least-recently-used native references may be evicted to make space and must then
+be recomputed or reloaded. Shared NumPy backing buffers are counted once.
+Code blocks queue for one shared heap reservation;
 model requests remain concurrent.
 
 Configure it with `--memory-mb 1024`, `SWARM_MEMORY_BYTES=1073741824`, or
@@ -109,12 +123,31 @@ The budget is fixed for a database because Monty embeds it in checkpoints;
 changing it requires a fresh database.
 
 Checkpointing reserves space for two serialized copies plus 25% headroom.
-Known native allocations are preflighted, but native scratch memory, package
-caches and host serialization are outside Monty's heap accounting. This is
+Known native allocations are preflighted and retained payloads are budgeted with
+checkpoint headroom, but arbitrary native internals, scratch memory, package
+caches and host serialization are not fully accounted for. This is
 **not a hard process-RSS quota**; use OS-level isolation for that.
 
 General allocation errors are plain `MemoryError`; NumPy allocation errors
 retain its requested-size, shape and dtype diagnostic.
+
+## Execution deadlines
+
+Python blocks have a 60-second wall-clock budget, including interpreter loading,
+host-library calls and checkpointing. Set `--execution-seconds 120` on the worker
+or `Runtime(..., execution_timeout=120)` to change it. The REPL shows elapsed time
+and library-call counts during long blocks, and identifies waiting agents.
+
+Timeouts roll back the block and are saved as completed tool errors, not replayed
+as interrupted executions after a restart. The model can use the error to split
+its work. Escape still pauses the turn and leaves interrupted work resumable.
+
+An in-flight native operation cannot safely be killed inside the shared Python
+process: timeout/cancellation stops further callbacks, then waits for that operation
+to drain before releasing the shared memory slot. That drain can exceed the
+deadline and is shown in the REPL. This is not a hard native-code kill deadline.
+Native operations use RAM references; explicitly fetching large plain lists or
+bytes still transfers that data to the interpreter.
 
 ## Embedded use
 

@@ -42,7 +42,8 @@ class SecurityTests(unittest.IsolatedAsyncioTestCase):
                          "state['module']='sympy'", "state['seal']='0'*64", "state['extra']=1"):
             with self.subTest(mutation=mutation):
                 await self.reject(f"state=dict(original); {mutation}; _library_rpc('repr',state)")
-        self.assertEqual(await self.agent.execute('a.tolist()'), '[1, 2]')
+        with self.assertRaisesRegex(ExecutionError, 'recompute'):
+            await self.agent.execute('a.tolist()')
 
     async def test_forged_paths_and_embedded_arguments_are_rejected(self):
         self.need('numpy')
@@ -63,7 +64,7 @@ class SecurityTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaisesRegex(ExecutionError, 'signature'):
             await other.execute(f"_library_rpc('repr', {root!r})")
 
-    async def test_signed_state_and_views_survive_restart(self):
+    async def test_signed_state_and_views_survive_live_reopen(self):
         self.need('numpy', 'matplotlib')
         await self.agent.execute('''
 import numpy as np
@@ -74,8 +75,7 @@ figure,axes=plt.subplots(figsize=(2,2))
 axes.plot([1,2],[3,4])
 ''')
         session_id = self.agent.id
-        await self.runtime.close()
-        self.runtime = await Runtime(self.database, workers=2).__aenter__()
+        await self.agent.close()
         self.agent = await self.runtime.agent(session_id=session_id)
         self.assertEqual(await self.agent.execute('view[0,0]=9; array.tolist()'), '[9, 2, 3, 4]')
         await self.agent.execute("axes.set_title('after'); figure.savefig('after.png')")
@@ -119,8 +119,10 @@ isinstance(payload,dict)
                      f'sp.Symbol({payload!r})', f'sp.symbols({payload!r})',
                      f'sp.simplify({payload!r})'):
             with self.subTest(code=code):
+                await self.agent.execute('matrix=sp.Matrix([[1]])')
                 await self.reject(code)
-        self.assertEqual(await self.agent.execute('int(matrix[0,0])'), '1')
+        with self.assertRaisesRegex(ExecutionError, 'recompute'):
+            await self.agent.execute('int(matrix[0,0])')
 
     async def test_replayed_callbacks_cannot_be_passed_to_native_apis(self):
         self.need('numpy')

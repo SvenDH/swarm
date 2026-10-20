@@ -70,8 +70,7 @@ df.groupby('g')['y'].sum().to_dict()
                     f'import numpy as np; np.tile({data!r},{reps!r}).tolist()'), repr(expected))
         await self.agent.execute('from numpy import tile; tiled=tile(np.array([1,2],dtype="int32"),[2,1])')
         session_id = self.agent.id
-        await self.runtime.close()
-        self.runtime = await Runtime(self.database, workers=2).__aenter__()
+        await self.agent.close()
         self.agent = await self.runtime.agent(session_id=session_id)
         self.assertEqual(await self.agent.execute('(tiled.tolist(),tiled.dtype.name)'), "([[1, 2], [1, 2]], 'int32')")
         from wrappers.numpy import tile
@@ -112,8 +111,7 @@ gx, gy = np.meshgrid([1,2],[3,4])
  np.allclose(np.nan_to_num([np.nan,2]), [0,2]), base.repeat(2, axis=0).shape)
 '''), '([[1, 2], [1, 2]], [[3, 3], [4, 4]], [1, 2], True, (4, 3))')
         session_id = self.agent.id
-        await self.runtime.close()
-        self.runtime = await Runtime(self.database, workers=2).__aenter__()
+        await self.agent.close()
         self.agent = await self.runtime.agent(session_id=session_id)
         self.assertEqual(await self.agent.execute('flipped[1,0]=8; base.tolist()'), '[[0, 1, 9], [3, 4, 8]]')
 
@@ -182,7 +180,7 @@ copy.write('copy.pdf')
 '''), "(1, [''], 1)")
         self.assertEqual(await self.agent.execute("len(PdfReader('copy.pdf').pages)"), '1')
 
-    async def test_library_objects_survive_runtime_restart_and_rollback(self):
+    async def test_library_objects_share_live_handles_and_expire_on_failure(self):
         await self.agent.execute('''
 import numpy as np
 import pandas as pd
@@ -202,14 +200,15 @@ writer = PdfWriter()
 writer.add_blank_page(width=10,height=10)
 ''')
         session_id = self.agent.id
-        await self.runtime.close()
-        self.runtime = await Runtime(self.database, workers=2).__aenter__()
+        await self.agent.close()
         self.agent = await self.runtime.agent(session_id=session_id)
         self.assertEqual(await self.agent.execute('(array.sum(),df["x"].sum(),cell.value,paragraph.text,image.size,len(writer.pages))'),
                          "(3, 7, 'before', 'before', (2, 2), 1)")
         with self.assertRaises(ExecutionError):
             await self.agent.execute("array[0]=99; cell.value='bad'; paragraph.text='bad'; raise ValueError('rollback')")
-        self.assertEqual(await self.agent.execute('(array.tolist(),cell.value,paragraph.text)'), "([1, 2], 'before', 'before')")
+        with self.assertRaisesRegex(ExecutionError,'recompute'):
+            await self.agent.execute('(array.tolist(),cell.value,paragraph.text)')
+        await self.agent.execute("book=Workbook(); cell=book.active['A1']; doc=Document(); paragraph=doc.add_paragraph('before')")
         await self.agent.execute("cell.value='after'; book.save('after.xlsx'); paragraph.text='after'; doc.save('after.docx')")
 
     async def test_standard_python_still_works_after_library_imports(self):
@@ -271,16 +270,17 @@ Path('standard.txt').write_text('ok')
         self.assertEqual(await a.execute('x.tolist()'), '[9, 2]')
         self.assertEqual(await b.execute('x.tolist()'), '[3, 4]')
 
-    async def test_random_generator_state_is_checkpointed_not_shared_host_state(self):
+    async def test_random_generator_live_state_and_recompute_after_error(self):
         import numpy as np
         expected = np.random.default_rng(123)
         first = expected.integers(0, 100, size=4).tolist()
         second = expected.integers(0, 100, size=4).tolist()
         self.assertEqual(await self.agent.execute('import numpy as np; rng=np.random.default_rng(123); rng.integers(0,100,size=4).tolist()'), repr(first))
         session_id = self.agent.id
-        await self.runtime.close()
-        self.runtime = await Runtime(self.database, workers=2).__aenter__()
+        await self.agent.close()
         self.agent = await self.runtime.agent(session_id=session_id)
         with self.assertRaises(ExecutionError):
             await self.agent.execute("rng.integers(0,100,size=4); raise ValueError('rollback')")
-        self.assertEqual(await self.agent.execute('rng.integers(0,100,size=4).tolist()'), repr(second))
+        with self.assertRaisesRegex(ExecutionError,'recompute'):
+            await self.agent.execute('rng.integers(0,100,size=4)')
+        self.assertEqual(await self.agent.execute('rng=np.random.default_rng(123); rng.integers(0,100,size=4); rng.integers(0,100,size=4).tolist()'), repr(second))

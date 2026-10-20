@@ -69,12 +69,6 @@ def _library_unpack(value, root):
 def _library_request(_lib_receiver, _lib_action, *args, **kwargs):
     value, action = _lib_receiver, _lib_action
     response = _library_rpc(action, value.root, value.path, _library_pack(args), _library_pack(kwargs), value.auth)
-    if 'state' in response:
-        state = response['state']
-        value.root.update(state)
-    if response.get('updates'):
-        _library_update(args, response['updates'])
-        _library_update(kwargs, response['updates'])
     if 'argument_result' in response:
         spec = response['argument_result']
         original = _library_find((args, kwargs), spec)
@@ -98,19 +92,6 @@ def _library_find(value, spec):
     return None
 
 
-def _library_update(value, updates):
-    if isinstance(value, _LibraryValue):
-        for update in updates:
-            if value.root['module'] == update['module'] and value.root['identity'] == update['identity']:
-                value.root.update(update['state'])
-    elif isinstance(value, (list, tuple)):
-        for item in value:
-            _library_update(item, updates)
-    elif isinstance(value, dict):
-        for item in value.values():
-            _library_update(item, updates)
-
-
 def _library_invoke(function, *args, **kwargs):
     if isinstance(function, _LibraryValue):
         return _library_request(function, 'call', *args, **kwargs)
@@ -131,8 +112,6 @@ def _library_get(value, name):
     if value.root['module'] == 'traceback' and not value.path and name == 'format_exception_only':
         return _library_exception_only
     response = _library_rpc('get', value.root, value.path, [name], {}, value.auth)
-    if 'state' in response:
-        value.root.update(response['state'])
     if response.get('call'):
         target = _LibraryValue(value.root, response['path'], response['auth'])
         def invoke(*args, **kwargs):
@@ -175,6 +154,18 @@ def _library_iter(value):
     if isinstance(value, _LibraryValue):
         return _library_request(value, 'iterate')
     return value
+
+
+def _library_builtin_iter(value):
+    return iter(_library_iter(value))
+
+
+def _library_zip(*values, **kwargs):
+    return zip(*[_library_iter(value) for value in values], **kwargs)
+
+
+def _library_enumerate(value, start=0):
+    return enumerate(_library_iter(value), start)
 
 
 def _library_display(value):

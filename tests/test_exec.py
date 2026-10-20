@@ -34,6 +34,9 @@ class ExecTests(unittest.IsolatedAsyncioTestCase):
                          '(15, [[0, 1, 2], [3, 4, 5]], (3, 2))')
         await self.agent.close()
         self.agent = await CodeAgent.open(self.path, session_id=self.session_id)
+        with self.assertRaisesRegex(ExecutionError, 'recompute'):
+            await self.agent.execute('a.tolist()')
+        await self.agent.execute("exec(open('draw.py').read())")
         self.assertEqual(await self.agent.execute("exec('a += 1'); a.tolist()"), '[[1, 2, 3], [4, 5, 6]]')
 
     async def test_nested_exec_and_variables_in_caller_scope(self):
