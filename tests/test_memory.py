@@ -64,3 +64,5 @@ class MemoryTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn('too many library calls per code block', HELP)
         self.assertIn('MEMORY.md', HELP)
         self.assertLess(len(HELP), 650)
+        for text in ('monty', 'virtual', 'sandbox', '1,000,000', '4,000,000'):
+            self.assertNotIn(text, HELP.lower())

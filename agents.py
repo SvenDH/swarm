@@ -65,17 +65,17 @@ def unfinished(messages):
 
 
 class PythonCode(BaseModel):
-    """Run Python in the Unix REPL environment."""
+    """Execute Python code to inspect data and work with files."""
     model_config = ConfigDict(extra='forbid')
     code: str
 
-HELP = """You are a code-mode assistant. Execute Python with the python REPL tool to
-inspect and modify your persistent filesystem. No host shell/network.
-Use print for observations. Batch related work; avoid dumping large files.
-No wildcard imports, pickle, arbitrary callbacks/apply/query/eval, or unsupported APIs.
-Use explicit methods and assignments; context managers/custom special methods are
-not supported. Arrays are capped at 1,000,000 elements; images at 4,000,000 pixels.
-Finish with a concise answer based on actual execution results.
+HELP = """Use python to inspect data and work with files. Reload saved data or recompute
+if a value is unavailable. Shell commands and network access are unavailable.
+Use explicit imports and vectorized operations; avoid too many library calls per code block.
+Use print for concise observations, exec() for Python files, and display(image_or_path)
+to inspect images. Avoid dumping large outputs; delete unused large variables.
+You are running on a small, shared, restricted machine. Keep brief durable notes in 
+~/MEMORY.md; correct stale notes. Finish with a concise answer grounded in execution results.
 """
 
 
