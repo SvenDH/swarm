@@ -113,7 +113,8 @@ async def main():
     parser.add_argument('--template', help='starter files copied into each new agent home')
     parser.add_argument('--workers', type=int, default=4, help='shared Monty workers in this host process')
     parser.add_argument('--model-concurrency', type=int, default=128)
-    parser.add_argument('--context-chars', type=int, default=120_000, help='conversation compaction threshold')
+    parser.add_argument('--context-tokens', type=int, default=32_000, help='context window budget in tokens (includes response headroom)')
+    parser.add_argument('--response-tokens', type=int, default=8192, help='response token cap, limited to a quarter of the context window')
     parser.add_argument('--memory-mb', type=int, help='shared worker execution budget in MiB (default: 1024)')
     parser.add_argument('--execution-seconds', type=float, default=60,
                         help='wall-clock budget per Python block, including host calls (default: 60)')
@@ -121,7 +122,7 @@ async def main():
     if args.worker or args.with_worker:
         async with Worker(args.database, socket=args.socket, workspaces=args.workspaces,
                           workers=args.workers, model_concurrency=args.model_concurrency,
-                          template=args.template, context_chars=args.context_chars,
+                          template=args.template, context_tokens=args.context_tokens, response_tokens=args.response_tokens,
                           execution_timeout=args.execution_seconds,
                           memory_budget=None if args.memory_mb is None else args.memory_mb * 1024**2) as worker:
             print(f'Monty worker listening on {worker.socket}', flush=True)

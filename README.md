@@ -117,6 +117,40 @@ or deleted. Use a fresh database and workspace root when upgrading:
 uv run main.py --with-worker --database fresh.db --workspaces fresh-workspaces
 ```
 
+## Context compaction
+
+Compaction adapts the prune-first, protected-tail and structured-handoff approach
+from [Hermes Agent](https://github.com/NousResearch/hermes-agent/blob/71633f762d2d74faebe604d0b8a2a2e6cf48346a/agent/context_compressor.py)
+(MIT), without importing its framework. Agent instructions are unchanged.
+
+Use `--context-tokens 32000` (or `Runtime(context_tokens=32000)`) to set the
+context-window budget; `context_tokens=None` disables automatic compaction.
+This replaces `--context-chars`. Reserve the smaller of 8,192 tokens or one quarter
+of the window for the response; compression starts at 80% of the remaining input
+budget. Set the window for your actual model/provider, not just its model name.
+`--response-tokens` / `Runtime(response_tokens=...)` changes the response cap.
+DeepSeek summary requests explicitly disable thinking; normal agent calls are unchanged.
+Local token estimates use tiktoken (a fallback encoding for unknown models), image
+estimates and the current instructions/tools/MEMORY.md. Provider-reported prompt
+usage anchors subsequent estimates and survives restarts; model, prompt or history
+changes invalidate that anchor. Counts for other providers are estimates, not exact
+vendor tokenization.
+If tokenizer data cannot be downloaded on an offline first boot, a conservative
+UTF-8 byte estimate keeps context handling available until the next restart.
+
+Old tool results are pruned before requesting a summary. Recent complete tool
+rounds and the latest user request remain intact. Summaries use Task, Constraints,
+State, Progress, Next and Risks sections; incomplete/refused/truncated summaries
+never replace history. A provider context-overflow error permits one forced
+compaction and retry. Oversized active requests fail explicitly rather than being
+silently truncated. Invalid/truncated checkpoints stop the pending worker turn
+until `/resume`, instead of repeatedly paying for the same failed summary.
+
+Every replacement atomically archives the previous transcript in SQLite. Agents
+can recover bounded, session-scoped excerpts using `session_search('exact term')`
+from Python. Summarizer inputs are bounded and mark omitted text; archives retain
+the originals. No extra model call is needed when tool pruning alone makes room.
+
 ## Shared memory
 
 The default execution budget is **1 GiB per worker**, not per agent. Interpreter

@@ -92,7 +92,7 @@ class ExecutionBudget:
             await settled(asyncio.create_task(asyncio.to_thread(drain)))
 
 
-async def evaluate(runtime, fs, owner, code, checkpoint, printed, emit, budget, *, memory_budget):
+async def evaluate(runtime, fs, owner, code, checkpoint, printed, emit, budget, *, memory_budget, search):
     bridge = Bridge(fs,
                      owner,
                      lambda module: runtime.offload.submit(library_backend, module).result(),
@@ -132,7 +132,8 @@ async def evaluate(runtime, fs, owner, code, checkpoint, printed, emit, budget, 
             return [name for name in dir(value) if not name.startswith('_')]
         raise TypeError('Object does not support attribute discovery')
     functions = {'_library_rpc': budget.wrap(bridge, library=True), 'display': budget.wrap(display),
-                 '_prepare_exec': budget.wrap(prepare_exec), '_object_fields': budget.wrap(object_fields)}
+                 '_prepare_exec': budget.wrap(prepare_exec), '_object_fields': budget.wrap(object_fields),
+                 'session_search': budget.wrap(search)}
     # AsyncMonty runs synchronous OS/library callbacks on its worker threads.
     # Keep these synchronous so sandbox callers need not write `await numpy(...)`.
     async with runtime._pool.checkout(limits={'max_memory': memory_budget,
