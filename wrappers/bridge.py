@@ -51,6 +51,8 @@ def member(value, name, module, fs):
         return value.name if name == '__name__' else value.cls.__module__
     if name == '__version__' and module not in STDLIB and (type(value) is dict or
             (module == 'numpy' and isinstance(value, backend(module).Session))):
+        if module == 'cv2':
+            return backend(module).cv2.__version__
         distribution = {'PIL': 'Pillow', 'docx': 'python-docx', 'pptx': 'python-pptx',
                         'bs4': 'beautifulsoup4', 'sklearn': 'scikit-learn'}.get(module, module)
         return version(distribution)

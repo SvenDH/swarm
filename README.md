@@ -37,6 +37,10 @@ del pixels
 Supported packages are discovered from the host, but imports and operations go
 through explicit allowlists. Host modules, attributes, paths, arbitrary callbacks,
 pickle and subprocess access are not exposed.
+OpenCV (`import cv2`) supports reviewed image-processing operations, NumPy arrays,
+and workspace-only image reads/writes. The optional `libraries` extra installs
+`opencv-python-headless`; discovery also accepts an existing host OpenCV install.
+GUI, cameras/video, model loaders and host file APIs are not exposed.
 
 Keep code simple:
 

@@ -13,14 +13,14 @@ MODULES = {
     'pypdf': 'pypdf', 'docx': 'docx', 'matplotlib': 'matplotlib', 'scipy': 'scipy',
     'seaborn': 'seaborn', 'pptx': 'pptx', 'reportlab': 'reportlab',
     'pdfplumber': 'pdfplumber', 'pymupdf': 'pymupdf', 'bs4': 'bs4',
-    'sympy': 'sympy', 'sklearn': 'sklearn', 'xlsxwriter': 'xlsxwriter',
+    'sympy': 'sympy', 'sklearn': 'sklearn', 'xlsxwriter': 'xlsxwriter', 'cv2': 'cv2',
 }
 MODULES.update({name: 'stdlib' for name in STDLIB})
 MODULES.update({name: 'binary' for name in BINARY})
 ALIASES = {'fitz': 'pymupdf'}
 REQUIRES = {'pandas': ('numpy',), 'matplotlib': ('numpy', 'PIL'),
             'seaborn': ('numpy', 'pandas', 'matplotlib'),
-            'scipy': ('numpy',), 'sklearn': ('numpy', 'scipy')}
+            'scipy': ('numpy',), 'sklearn': ('numpy', 'scipy'), 'cv2': ('numpy', 'PIL')}
 
 
 @lru_cache(maxsize=1)
