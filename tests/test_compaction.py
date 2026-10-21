@@ -157,7 +157,6 @@ class CompactionTests(unittest.IsolatedAsyncioTestCase):
         await self.agent.append_message({'role': 'user', 'content': 'continue'})
         before = (await self.agent.state()).messages
         for message in ({'role': 'assistant', 'content': ''},
-                        {'role': 'assistant', 'content': '長' * 1000},
                         {'role': 'assistant', 'refusal': 'No summary'},
                         {'role': 'assistant', 'tool_calls': [{'id': 'blocked', 'type': 'function',
                           'function': {'name': 'python', 'arguments': '{"code":"counter=0"}'}}]}):
@@ -169,6 +168,56 @@ class CompactionTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual((await self.agent.state()).messages, before)
         with self.assertRaisesRegex(RuntimeError, 'did not reduce'):
             await self.agent.runtime.database_call(self.agent._save_compaction, before, before)
+
+    async def test_finished_summaries_allow_different_headings_and_token_estimates(self):
+        for checkpoint in ('### Task\nDone.\n### Next\nContinue with saved.txt.',
+                           '**Progress:** Saved saved.txt; counter=1. Follow the latest request.',
+                           'Verified state: ' + 'detail ' * 500 + 'verified.'):
+            with self.subTest(checkpoint=checkpoint[:30]):
+                await self.seed()
+                def respond(request):
+                    body = json.loads(request.content)
+                    return stream_response({'role': 'assistant', 'content': checkpoint if 'tools' not in body else 'continued'})
+                async with httpx.AsyncClient(transport=httpx.MockTransport(respond)) as client:
+                    with patch.object(self.agent.runtime, 'client', model_client(client)):
+                        self.assertEqual(await self.agent.run('next request'), 'continued')
+                history = (await self.agent.state()).messages
+                self.assertTrue(any(checkpoint in message.get('content', '') for message in history))
+                self.assertEqual(history[-2]['content'], 'next request')
+                self.assertEqual(await self.agent.execute('counter'), '1')
+
+    async def test_empty_or_truncated_summary_recovers_with_one_retry(self):
+        for truncated in (False, True):
+            with self.subTest(truncated=truncated):
+                await self.seed()
+                requests = []
+                def respond(request):
+                    body = json.loads(request.content)
+                    requests.append(body)
+                    if len(requests) == 1:
+                        if truncated:
+                            return httpx.Response(200, headers={'content-type': 'text/event-stream'},
+                                content=sse({'role': 'assistant', 'content': 'partial'}, 'length') + b'data: [DONE]\n\n')
+                        return stream_response({'role': 'assistant', 'content': ''})
+                    return self.respond(request)
+                async with httpx.AsyncClient(transport=httpx.MockTransport(respond)) as client:
+                    with patch.object(self.agent.runtime, 'client', model_client(client)):
+                        self.assertEqual(await self.agent.run('continue'), 'continued')
+                self.assertEqual(len(requests), 3)
+                self.assertGreater(requests[1]['max_completion_tokens'], requests[0]['max_completion_tokens'])
+                self.assertIn('tools', requests[2])
+
+    async def test_finished_summary_that_cannot_fit_preserves_history(self):
+        await self.seed()
+        await self.agent.append_message({'role': 'user', 'content': 'continue'})
+        before = (await self.agent.state()).messages
+        async with httpx.AsyncClient(transport=httpx.MockTransport(lambda request:
+                stream_response({'role': 'assistant', 'content': '長' * 10000}))) as client:
+            with patch.object(self.agent.runtime, 'client', model_client(client)):
+                with self.assertRaises(ContextLimit):
+                    await self.agent.run()
+        self.assertEqual((await self.agent.state()).messages, before)
+        self.assertEqual((await self.agent.runtime.query('SELECT count(*) AS n FROM compactions'))[0]['n'], 0)
 
     async def test_pruning_avoids_summary_call_and_archived_output_is_searchable(self):
         await self.agent.append_message({'role': 'user', 'content': 'Inspect the log.'})
@@ -358,10 +407,12 @@ class CompactionTests(unittest.IsolatedAsyncioTestCase):
         async with httpx.AsyncClient(transport=httpx.MockTransport(respond)) as client:
             async with Worker(self.path, context_tokens=4096, retry_delay=.01, client=model_client(client)) as worker:
                 remote = WorkerClient(self.path)
-                with self.assertRaisesRegex(RuntimeError, 'Incomplete model response'):
+                with self.assertRaisesRegex(RuntimeError, 'Incomplete model response') as failure:
                     await remote.request('run', session_id=self.session_id, prompt='continue')
+                self.assertIn('history unchanged', str(failure.exception))
+                self.assertNotIn('fix configuration/history', str(failure.exception))
                 await asyncio.sleep(.05)
-                self.assertEqual(len(requests), 1)
+                self.assertEqual(len(requests), 2)
                 agent = await worker.runtime.agent(session_id=self.session_id)
                 self.assertEqual((await agent.state()).messages, [*before, {'role': 'user', 'content': 'continue'}])
                 await agent.close()

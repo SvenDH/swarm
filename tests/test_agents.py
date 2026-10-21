@@ -493,7 +493,7 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(await self.agent.execute('n'), '2')
         tables = {r[0] for r in self.agent.db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
         self.assertEqual(tables, {'sessions', 'files', 'executions', 'runtime_secrets', 'prompts',
-                                  'compactions', 'context_usage', 'irc_attachments'})
+                                  'compactions', 'context_usage', 'irc_attachments', 'irc_messages', 'sqlite_sequence'})
 
     async def test_execution_ids_are_idempotent(self):
         await self.agent.execute('n=0')

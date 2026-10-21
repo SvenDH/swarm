@@ -4,12 +4,13 @@ import hashlib
 import hmac
 import re
 import secrets
+import sqlite3
 import threading
 from collections import deque
 
 
 class IRCServer:
-    def __init__(self):
+    def __init__(self, history=None):
         self.lock = threading.Lock()
         self.clients = {}
         self.channels = {}
@@ -21,6 +22,10 @@ class IRCServer:
         self.secret = secrets.token_bytes(32)
         self.password = secrets.token_hex(32)
         self.closing = False
+        self.history = history
+        self.tagged, self.echo = set(), set()
+        self.capabilities = {}
+        self.dispatch_lock = asyncio.Lock()
 
     async def start(self, port=0):
         self.listener = await asyncio.start_server(self._connection, '127.0.0.1', port, limit=512)
@@ -49,7 +54,7 @@ class IRCServer:
         if client is None:
             client = IRCTransport()
             try:
-                await asyncio.wait_for(client.connect('127.0.0.1', self.port, name, self._password(name)), 3)
+                await asyncio.wait_for(client.connect('127.0.0.1', self.port, name, self._password(name), tags=True), 3)
             except BaseException:
                 await client.close()
                 raise
@@ -76,10 +81,11 @@ class IRCServer:
             if self.closing or len(self.tasks) > 10000:
                 return
             writer.transport.set_write_buffer_limits(high=16384)
-            password, nick, user = '', '', False
+            password, nick, user, caps = '', '', False, set()
             async def register():
                 nonlocal password, nick, user
-                for _ in range(8):
+                negotiating = False
+                for _ in range(16):
                     raw = await reader.readline()
                     if not raw:
                         raise ConnectionError('IRC registration closed')
@@ -93,13 +99,18 @@ class IRCServer:
                     elif op.upper() == 'USER':
                         user = True
                     elif op.upper() == 'CAP':
+                        negotiating = value.upper() != 'END'
                         if value.split(' ', 1)[0].upper() == 'LS':
-                            await write([':worker CAP * LS :'])
+                            await write([':worker CAP * LS :message-tags server-time echo-message batch draft/chathistory'])
                         elif value.split(' ', 1)[0].upper() == 'REQ':
-                            await write([':worker CAP * NAK :' + value.partition(' :')[2]])
+                            requested = value.partition(' :')[2].split()
+                            accepted = set(requested) <= {'message-tags', 'server-time', 'echo-message', 'batch', 'draft/chathistory'}
+                            if accepted:
+                                caps.update(requested)
+                            await write([f':worker CAP * {"ACK" if accepted else "NAK"} :' + ' '.join(requested)])
                     else:
                         raise ValueError('Expected PASS, NICK and USER')
-                    if password and nick and user:
+                    if password and nick and user and not negotiating:
                         return
                 raise ValueError('Incomplete IRC registration')
             await asyncio.wait_for(register(), 5)
@@ -114,8 +125,13 @@ class IRCServer:
                 await write([f':worker 433 * {nick} :Nickname is already in use'])
                 return
             name = nick
+            self.capabilities[name] = caps
+            if 'message-tags' in caps:
+                self.tagged.add(name)
+            if 'echo-message' in caps:
+                self.echo.add(name)
             signal = self.signals[name] = asyncio.Event()
-            await write(self.exchange(name))
+            await write(self.exchange(name) + [f':worker 005 {name} CHATHISTORY=100 MSGREFTYPES=msgid,timestamp :are supported by this server'])
             async def outbound():
                 while True:
                     await signal.wait()
@@ -130,10 +146,10 @@ class IRCServer:
                     break
                 line = raw.decode().rstrip('\r\n')
                 valid_line(line)
-                await write(self.exchange(name, line))
+                await write(await self.dispatch(name, line))
                 if line.split(' ', 1)[0].upper() == 'QUIT':
                     break
-        except (ValueError, UnicodeError, ConnectionError, OSError, asyncio.TimeoutError, BufferError):
+        except (ValueError, UnicodeError, ConnectionError, OSError, sqlite3.Error, asyncio.TimeoutError, BufferError):
             pass
         finally:
             if pump is not None:
@@ -141,6 +157,9 @@ class IRCServer:
                 await asyncio.gather(pump, return_exceptions=True)
             if name is not None:
                 self.signals.pop(name, None)
+                self.tagged.discard(name)
+                self.echo.discard(name)
+                self.capabilities.pop(name, None)
                 if name in self.clients:
                     self.exchange(name, 'QUIT')
             writer.close()
@@ -150,11 +169,78 @@ class IRCServer:
                 writer.transport.abort()
             self.tasks.discard(task)
 
-    def exchange(self, name, command=''):
+    async def dispatch(self, name, command):
+        async with self.dispatch_lock:
+            head, _, text = command.partition(' :')
+            words = head.split()
+            op = words[0].upper() if words else ''
+            target = words[1].lower() if len(words) > 1 else ''
+            if op == 'CHATHISTORY':
+                sub = words[1].upper() if len(words) > 1 else '*'
+                target = words[2].lower() if len(words) > 2 else '*'
+                code = 'INVALID_PARAMS'
+                try:
+                    if 'draft/chathistory' not in self.capabilities.get(name, ()):
+                        raise ValueError('Negotiate draft/chathistory first')
+                    if self.history is None or sub not in ('LATEST', 'BEFORE', 'AFTER', 'BETWEEN', 'AROUND', 'TARGETS') or len(words) != (6 if sub == 'BETWEEN' else 5):
+                        raise ValueError('Use CHATHISTORY LATEST/BEFORE/AFTER/AROUND/BETWEEN target reference [reference] limit')
+                    if sub == 'TARGETS':
+                        channels = tuple(channel for channel, members in self.channels.items() if name in members)
+                        rows = await self.history(name, channels, None, int(words[-1]), sub, words[2:4])
+                        batch = secrets.token_hex(8)
+                        lines = [f'@batch={batch} :worker CHATHISTORY TARGETS {row["target"]} {row["timestamp"].replace("+00:00", "Z")}' for row in rows]
+                        if 'batch' in self.capabilities[name]:
+                            lines = [f':worker BATCH +{batch} draft/chathistory-targets'] + lines + [f':worker BATCH -{batch}']
+                        else:
+                            lines = [line.partition(' ')[2] for line in lines]
+                        return self.exchange(name) + lines
+                    if not re.fullmatch(r'(?:#[a-z0-9_-]{1,63}|[a-z][a-z0-9_-]{0,63})', target):
+                        code = 'INVALID_TARGET'
+                        raise ValueError('Invalid history target')
+                    if target.startswith('#') and name not in self.channels.get(target, ()):
+                        code = 'INVALID_TARGET'
+                        raise ValueError('Join the channel before reading its history')
+                    if any(ref != '*' and not ref.startswith(('msgid=', 'timestamp=')) for ref in words[3:-1]):
+                        code = 'INVALID_MSGREFTYPE'
+                        raise ValueError('Use msgid= or timestamp= references')
+                    rows = await self.history(name, target, None, int(words[-1]), sub, words[3:-1])
+                    batch = secrets.token_hex(8)
+                    caps = self.capabilities[name]
+                    lines = []
+                    for row in rows:
+                        tags = ([f'batch={batch}'] if 'batch' in caps else [])
+                        if 'message-tags' in caps:
+                            tags.append(f'msgid={row["id"]}')
+                        if 'server-time' in caps:
+                            tags.append('time=' + row['timestamp'].replace('+00:00', 'Z'))
+                        prefix = '@' + ';'.join(tags) + ' ' if tags else ''
+                        lines.append(f'{prefix}:{row["sender"]} PRIVMSG {row["target"]} :{row["text"]}')
+                    if 'batch' in caps:
+                        lines = [f':worker BATCH +{batch} chathistory {target}'] + lines + [f':worker BATCH -{batch}']
+                    return self.exchange(name) + lines
+                except ValueError as error:
+                    return [f':worker FAIL CHATHISTORY {code} {sub} {target} :{error}']
+                except (OSError, sqlite3.Error):
+                    return [f':worker FAIL CHATHISTORY MESSAGE_ERROR {sub} {target} :Messages could not be retrieved']
+            record = None
+            allowed = name in self.channels.get(target, ()) if target.startswith('#') else target in self.clients
+            if self.history is not None and op == 'PRIVMSG' and text and allowed:
+                # Persist exactly the message delivered on the wire, before delivery.
+                wire = f':{name} PRIVMSG {target} :{text}'.encode()[:510].decode(errors='ignore')
+                record = await self.history(name, target, wire.partition(' :')[2])
+            return self.exchange(name, command, record=record)
+
+    def exchange(self, name, command='', *, record=None):
         valid_line(command)
         with self.lock:
             def send(target, line):
                 line = line.encode()[:510].decode(errors='ignore')
+                if record is not None and ' PRIVMSG ' in line:
+                    tags = [f'msgid={record["id"]}'] if target in self.tagged else []
+                    if 'server-time' in self.capabilities.get(target, ()):
+                        tags.append('time=' + record['timestamp'].replace('+00:00', 'Z'))
+                    if tags:
+                        line = '@' + ';'.join(tags) + ' ' + line
                 queue = self.clients[target]
                 removed = len(queue[0].encode()) if len(queue) == queue.maxlen else 0
                 size = len(line.encode()) - removed
@@ -218,6 +304,8 @@ class IRCServer:
                             send(target, f':{name} PRIVMSG {target} :{trailing}')
                         else:
                             send(name, f':worker 401 {name} {target} :No such nick')
+                        if name in self.echo and (channel or target in self.clients) and target != name:
+                            send(name, f':{name} PRIVMSG {target} :{trailing}')
                     else:
                         send(name, f':worker 461 {name} {op} :Invalid parameters')
                 elif op == 'QUIT':
@@ -255,9 +343,13 @@ class IRCTransport:
         self.reader = self.writer = None
         self.lock = asyncio.Lock()
 
-    async def connect(self, host, port, name, password):
-        self.reader, self.writer = await asyncio.open_connection(host, port, limit=512)
-        for line in (f'PASS {password}', f'NICK {name}', f'USER {name} 0 * :{name}'):
+    async def connect(self, host, port, name, password, *, tags=False):
+        self.reader, self.writer = await asyncio.open_connection(host, port, limit=4096)
+        lines = [f'PASS {password}', f'NICK {name}', f'USER {name} 0 * :{name}']
+        if tags:
+            lines.insert(0, 'CAP REQ :message-tags server-time batch draft/chathistory')
+            lines.append('CAP END')
+        for line in lines:
             valid_line(line)
             self.writer.write(line.encode() + b'\r\n')
         await self.writer.drain()

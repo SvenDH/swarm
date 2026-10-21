@@ -87,6 +87,8 @@ class IRCIntegrationTests(unittest.IsolatedAsyncioTestCase):
                     writer.write(f'PASS {password}\r\nNICK {name}\r\nUSER {name} 0 * :test\r\n'.encode())
                     await writer.drain()
                     line = await asyncio.wait_for(reader.readline(), 2)
+                    if '001 ' in line.decode():
+                        self.assertIn(b'CHATHISTORY=100', await asyncio.wait_for(reader.readline(), 2))
                     return reader, writer, line.decode()
                 try:
                     ar, aw, welcome = await connect('user-alice', endpoint['password'])

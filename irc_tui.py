@@ -4,7 +4,7 @@ import hashlib
 import re
 from collections import deque
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 
 from prompt_toolkit import Application
 from prompt_toolkit.document import Document
@@ -17,6 +17,15 @@ from prompt_toolkit.styles import Style
 from prompt_toolkit.widgets import Label, TextArea
 
 from wrappers.irc import valid_line
+
+
+@dataclass
+class ChatLine:
+    timestamp: datetime
+    nick: str
+    text: str
+    kind: str
+    identity: int = 0
 
 
 @dataclass
@@ -44,6 +53,8 @@ class IRCView:
         self.commands = asyncio.Queue(maxsize=32)
         self.joined, self.names_pending = set(), {}
         self.connected, self.status = False, 'connecting'
+        self.echo = False
+        self.history_pending = {}
         self.lexer = TranscriptLexer()
         self.history = TextArea(read_only=True, lexer=self.lexer, style='class:history')
         self.entry = TextArea(height=1, multiline=False, prompt=lambda: f'{self.target}> ', accept_handler=self.accept)
@@ -140,8 +151,9 @@ class IRCView:
 
     def refresh(self, follow=False):
         rows = []
-        for stamp, nick, text, kind in self.buffers[self.target].messages:
-            row = [('class:muted', stamp + ' ')]
+        for message in self.buffers[self.target].messages:
+            nick, text, kind = message.nick, message.text, message.kind
+            row = [('class:muted', message.timestamp.astimezone().strftime('%H:%M') + ' ')]
             if kind == 'message':
                 row += [(self.nick_style(nick), '<' + nick + '> '),
                         ('class:mention' if nick != self.nickname and self.nickname in text.lower() else '', text)]
@@ -156,21 +168,50 @@ class IRCView:
                                          bypass_readonly=True)
         self.app.invalidate()
 
-    def show(self, text, target=None, *, nick='', kind='status'):
+    @staticmethod
+    def chat_line(text, nick='', kind='status', identity=0, timestamp=None):
+        text = ''.join(char if char.isprintable() else ' ' for char in text)[:2048]
+        nick = ''.join(char if char.isprintable() else ' ' for char in nick)[:64]
+        stamp = datetime.fromisoformat(timestamp.replace('Z', '+00:00')) if timestamp else datetime.now(timezone.utc)
+        return ChatLine(stamp, nick, text, kind, identity)
+
+    def show(self, text, target=None, *, nick='', kind='status', identity=0, timestamp=None):
         target = target or self.target
         try:
             buffer = self.buffer(target)
         except ValueError:
             target, buffer = '*server', self.buffers['*server']
-        text = ''.join(char if char.isprintable() else ' ' for char in text)[:2048]
-        nick = ''.join(char if char.isprintable() else ' ' for char in nick)[:64]
-        buffer.messages.append((datetime.now().strftime('%H:%M'), nick, text, kind))
+        if identity and any(message.identity == identity for message in buffer.messages):
+            return
+        message = self.chat_line(text, nick, kind, identity, timestamp)
+        buffer.messages.append(message)
         if target != self.target:
             buffer.unread += 1
             buffer.highlighted |= kind == 'message' and self.nickname in text.lower()
         self.refresh()
 
+    def request_history(self, target):
+        if self.connected and target != '*server':
+            self.commands.put_nowait(f'CHATHISTORY LATEST {target} * 50')
+
+    def merge_history(self, target, records):
+        if target not in self.buffers:
+            return
+        buffer = self.buffers[target]
+        known = {message.identity for message in buffer.messages if message.identity}
+        messages = list(buffer.messages)
+        for record in records:
+            if record['id'] not in known:
+                known.add(record['id'])
+                messages.append(self.chat_line(record['text'], record['sender'], 'message', record['id'], record['timestamp']))
+        buffer.messages = deque(sorted(messages, key=lambda message: (message.timestamp, message.identity))[-500:], maxlen=500)
+        self.refresh()
+
     def handle_line(self, line):
+        tags = {}
+        if line.startswith('@'):
+            raw, _, line = line.partition(' ')
+            tags = dict(tag.partition('=')[::2] for tag in raw[1:].split(';'))
         head, sep, trailing = line.partition(' :')
         words = head.split()
         if not words:
@@ -180,16 +221,38 @@ class IRCView:
             return
         command, params = words[0].upper(), words[1:] + ([trailing] if sep else [])
         nick = source.split('!', 1)[0].lower()
-        if command == '001' and params:
+        if command == 'CAP':
+            if 'ACK' in params and 'echo-message' in params[-1].split():
+                self.echo = True
+        elif command == 'BATCH' and params:
+            if params[0].startswith('+') and len(params) == 3 and params[1] == 'chathistory':
+                self.history_pending[params[0][1:]] = (params[2].lower(), [])
+            elif params[0].startswith('-'):
+                batch = self.history_pending.pop(params[0][1:], None)
+                if batch is not None:
+                    self.merge_history(*batch)
+        elif command == 'FAIL' and params and params[0] == 'CHATHISTORY':
+            self.show(params[-1], kind='error')
+        elif command == '001' and params:
             self.nickname, self.connected, self.status = params[0].lower(), True, 'connected'
             self.show('Connected as ' + self.nickname, '*server')
         elif command in ('PRIVMSG', 'NOTICE') and len(params) >= 2:
+            if tags.get('batch') in self.history_pending:
+                _, records = self.history_pending[tags['batch']]
+                if len(records) < 100:
+                    records.append(dict(id=int(tags['msgid']), timestamp=tags['time'], sender=nick,
+                                        target=params[0], text=params[-1]))
+                return
             target = params[0].lower() if params[0].startswith('#') or nick == self.nickname else nick
+            fresh = target not in self.buffers
             message = params[-1]
+            metadata = {'identity': int(tags.get('msgid', 0)), 'timestamp': tags.get('time')}
             if message.startswith('\x01ACTION ') and message.endswith('\x01'):
-                self.show(nick + ' ' + message[8:-1], target)
+                self.show(nick + ' ' + message[8:-1], target, **metadata)
             else:
-                self.show(message, target, nick=nick, kind='message' if command == 'PRIVMSG' else 'status')
+                self.show(message, target, nick=nick, kind='message' if command == 'PRIVMSG' else 'status', **metadata)
+            if fresh:
+                self.request_history(target)
         elif command == 'JOIN' and params:
             target = params[0].lower()
             self.buffer(target).members.add(nick)
@@ -199,6 +262,7 @@ class IRCView:
                 self.joined.add(target)
                 try:
                     self.commands.put_nowait('NAMES ' + target)
+                    self.request_history(target)
                 except asyncio.QueueFull:
                     pass
             self.show(nick + ' joined ' + target, target)
@@ -248,11 +312,13 @@ class IRCView:
                 self.app.exit()
                 return False
             if command == '/help':
-                self.show('/join #channel · /query nick · /msg nick text · /switch target · /close · /part · /names · /list · /quit')
+                self.show('/join #channel · /query nick · /msg nick text · /history [target] · /switch target · /close · /part · /names · /list · /quit')
                 self.show('Alt-←/→ or Ctrl-P/N: buffers · Alt-1…9: select · PageUp/Down: scroll · Ctrl-Q: quit')
                 return False
             if command in ('/switch', '/query'):
                 self.switch(rest)
+                if command == '/query':
+                    self.request_history(self.target)
                 return False
             if command == '/close':
                 target = self.valid_target(rest or self.target)
@@ -267,6 +333,11 @@ class IRCView:
                 return False
             if not self.connected:
                 raise ValueError('Not connected')
+            if command == '/history':
+                target = self.valid_target(rest or self.target)
+                self.switch(target)
+                self.request_history(target)
+                return False
             target = self.target
             if command == '/join':
                 target = self.valid_target(rest)
@@ -300,7 +371,7 @@ class IRCView:
             self.commands.put_nowait(line)
             if command in ('/join', '/msg'):
                 self.switch(target)
-            if line.startswith('PRIVMSG '):
+            if line.startswith('PRIVMSG ') and not self.echo:
                 self.show(message, target, nick=self.nickname, kind='message')
         except (ValueError, asyncio.QueueFull) as error:
             self.show(str(error) or 'Send queue is full', kind='error')
@@ -308,7 +379,7 @@ class IRCView:
 
     async def run(self, endpoint):
         reader, writer = await asyncio.wait_for(
-            asyncio.open_connection(endpoint['host'], endpoint['port'], limit=512), 3)
+            asyncio.open_connection(endpoint['host'], endpoint['port'], limit=4096), 3)
         tasks = []
         async def receive():
             while True:
@@ -333,8 +404,8 @@ class IRCView:
                 self.connected, self.status = False, 'disconnected'
                 self.show(f'Disconnected: {error}. Ctrl-Q to exit.', kind='error')
         try:
-            for line in (f'PASS {endpoint["password"]}', f'NICK {self.nickname}',
-                         f'USER {self.nickname} 0 * :Swarm TUI', f'JOIN {self.target}'):
+            for line in ('CAP REQ :message-tags server-time echo-message batch draft/chathistory', f'PASS {endpoint["password"]}', f'NICK {self.nickname}',
+                         f'USER {self.nickname} 0 * :Swarm TUI', 'CAP END', f'JOIN {self.target}'):
                 valid_line(line)
                 writer.write(line.encode() + b'\r\n')
             await writer.drain()

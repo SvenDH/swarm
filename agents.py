@@ -22,6 +22,7 @@ import stat
 import threading
 import time
 import uuid
+from datetime import datetime, timezone
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from functools import partial, wraps, lru_cache
@@ -130,19 +131,19 @@ def unfinished(messages):
 class PythonCode(BaseModel):
     """Execute Python code to inspect data and work with files.
 
-    IRC connections support send_file(target, path), file_info(reference), and
-    receive_file(reference, destination). Receiving refuses existing files unless overwrite=True.
+    Use vectorized operations; avoid too many library calls per code block.
+    Use print for concise observations, exec() for Python files, and display(image_or_path)
+    to inspect images.
     """
     model_config = ConfigDict(extra='forbid')
     code: str
 
 HELP = """Use python to inspect data and work with files. Reload saved data or recompute
-if a value is unavailable. Shell commands and network access are unavailable.
-Use vectorized operations; avoid too many library calls per code block.
-Use print for concise observations, exec() for Python files, and display(image_or_path)
-to inspect images. Avoid dumping large outputs; delete unused large variables.
-You are running on a small, shared, restricted machine. Keep brief durable notes in 
-~/MEMORY.md; correct stale notes. Finish with a concise answer grounded in execution results.
+if a value is unavailable. Shell commands and network access are unavailable. Avoid dumping 
+large outputs; delete unused large variables. You are running on a small, shared, restricted 
+machine. Keep non-final files in /tmp.
+Keep brief durable notes in ~/MEMORY.md; correct stale notes.
+Finish with a concise answer grounded in execution results.
 
 # IRC Chat
 ```python
@@ -150,6 +151,9 @@ import irc.client; r=irc.client.Reactor();
 c=r.server().connect('worker', 6667); c.join('#channel'); c.privmsg('#channel', 'text').
 ```
 Register event handlers with `r.add_global_handler`; poll with `r.process_once()`.
+Read conversation history with `c.history(target, limit=50, after=0, before=0)`.
+IRC connections support `send_file(target, path)`, `file_info(reference)`, and
+`receive_file(reference, destination)`. Receiving refuses existing files unless `overwrite=True`.
 """
 
 
@@ -429,6 +433,10 @@ class Runtime:
             CREATE TABLE IF NOT EXISTS irc_attachments (
                 id TEXT PRIMARY KEY, owner TEXT NOT NULL, filename TEXT NOT NULL,
                 storage_key TEXT NOT NULL, size INTEGER NOT NULL);
+            CREATE TABLE IF NOT EXISTS irc_messages (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, conversation TEXT NOT NULL,
+                timestamp TEXT NOT NULL, sender TEXT NOT NULL, target TEXT NOT NULL, text TEXT NOT NULL);
+            CREATE INDEX IF NOT EXISTS irc_conversation ON irc_messages(conversation,id);
             CREATE INDEX IF NOT EXISTS pending_prompts ON prompts(session_id) WHERE result IS NULL;
             CREATE UNIQUE INDEX IF NOT EXISTS one_pending_execution
                 ON executions(session_id) WHERE output IS NULL;
@@ -1095,11 +1103,21 @@ class CodeAgent:
                 not any(m.get('content', '').startswith(SUMMARY_PREFIX) for m in messages[:3] if isinstance(m.get('content'), str)) and
                 sum(message_tokens(m, self.model) for m in messages[:2]) < window // 10) else []
         budget = min(2048, max(128, window // 12))
-        summary = await self._response(self.runtime.client, pruned[len(head):split], summary_tokens=budget)
-        content = summary.get('content', '').strip()
-        if (not content or tokens(content, self.model) > budget or
-                not all('## ' + section in content for section in SUMMARY_SECTIONS)):
-            raise CompactionError('Context summary is empty, incomplete or too long; resume to retry')
+        for attempt in range(2):
+            try:
+                summary = await self._response(self.runtime.client, pruned[len(head):split], summary_tokens=budget)
+                content = summary.get('content', '').strip()
+                if not content:
+                    raise CompactionError('Context summary was empty; resume to retry')
+                break
+            except CompactionError:
+                if attempt:
+                    raise
+                budget = min(window // 4, budget * 2)
+                self._emit('status', 'Retrying context summary with more output headroom.\n')
+        # Headings are guidance, not a validity test. Local token estimates can
+        # also differ from the provider's output budget. The context-fit and
+        # reduction checks below are the actual bounds; never truncate a summary.
         # Copy the latest request verbatim even when it predates the retained tail.
         latest_user = next((i for i in range(len(messages)-1, -1, -1)
                             if messages[i]['role'] == 'user' and not messages[i].get('_images')), -1)
@@ -1208,7 +1226,7 @@ class Worker:
         if retry_delay <= 0:
             raise ValueError('retry_delay must be positive')
         self.runtime = Runtime(database, **options)
-        self.runtime._irc = IRCServer()
+        self.runtime._irc = IRCServer(history=lambda *args: self.runtime.database_call(self._irc_history, *args))
         self.irc_port = irc_port
         self.socket = HostPath(socket or self.runtime.database.with_suffix('.sock')).absolute()
         self.retry_delay = retry_delay
@@ -1217,6 +1235,76 @@ class Worker:
         self._paused = set()
         self._server = None
         self._guards = []
+
+    def _irc_history(self, sender, target, text=None, limit=50, mode='LATEST', references=('*',)):
+        if mode == 'TARGETS':
+            if not 1 <= limit <= 100:
+                raise ValueError('History limit must be 1..100')
+            stamps = []
+            for ref in references:
+                if not ref.startswith('timestamp=') or not ref.endswith('Z'):
+                    raise ValueError('TARGETS requires timestamp references')
+                stamps.append(datetime.fromisoformat(ref[10:-1] + '+00:00').isoformat(timespec='microseconds'))
+            placeholders = ','.join('?' for _ in target) or 'NULL'
+            rows = self.runtime.db.execute(f'''SELECT conversation, MAX(timestamp) AS stamp,
+                CASE WHEN conversation LIKE '#%' THEN conversation
+                     WHEN sender=? THEN target ELSE sender END AS name
+                FROM irc_messages WHERE conversation IN ({placeholders}) OR
+                    (conversation LIKE 'dm:%' AND (sender=? OR target=?))
+                GROUP BY conversation HAVING stamp>? AND stamp<? ORDER BY stamp {"ASC" if stamps[0] < stamps[1] else "DESC"} LIMIT ?''',
+                (sender, *target, sender, sender, min(stamps), max(stamps), limit)).fetchall()
+            return [{'target': row[2], 'timestamp': row[1]} for row in rows]
+        conversation = target if target.startswith('#') else 'dm:' + ':'.join(sorted((sender, target)))
+        if text is not None:
+            stamp = datetime.now(timezone.utc).isoformat(timespec='microseconds')
+            identity = self.runtime.db.execute(
+                'INSERT INTO irc_messages(conversation,timestamp,sender,target,text) VALUES (?,?,?,?,?)',
+                (conversation, stamp, sender, target, text)).lastrowid
+            return {'id': identity, 'timestamp': stamp, 'sender': sender, 'target': target, 'text': text}
+        if type(limit) is not int or not 1 <= limit <= 100:
+            raise ValueError('History limit must be 1..100')
+        selectors = []
+        for reference in references:
+            kind, _, value = reference.partition('=')
+            if kind == 'msgid' and value.isascii() and value.isdigit() and 0 <= int(value) < 2**63:
+                selectors.append(('id', int(value)))
+            elif kind == 'timestamp' and value.endswith('Z'):
+                stamp = datetime.fromisoformat(value[:-1] + '+00:00')
+                selectors.append(('timestamp', stamp.isoformat(timespec='microseconds')))
+            elif reference != '*' or mode != 'LATEST':
+                raise ValueError('Invalid history reference')
+        filters, values = ['conversation=?'], [conversation]
+        order = 'ASC' if mode == 'AFTER' else 'DESC'
+        if mode == 'AROUND':
+            column, value = selectors[0]
+            # Take the nearest older half, then fill from the anchor forwards.
+            older = self.runtime.db.execute(f'''SELECT id FROM irc_messages
+                WHERE conversation=? AND {column}<? ORDER BY id DESC LIMIT ?''',
+                (conversation, value, limit // 2)).fetchall()
+            if older:
+                filters.append('id>=?')
+                values.append(older[-1][0])
+            else:
+                filters.append(f'{column}>=?')
+                values.append(value)
+            order = 'ASC'
+        elif mode == 'BETWEEN':
+            (column, first), (other, last) = selectors
+            if column != other:
+                raise ValueError('BETWEEN references must use the same type')
+            forward = first < last
+            filters.extend((f'{column}>?', f'{column}<?'))
+            values.extend((min(first, last), max(first, last)))
+            order = 'ASC' if forward else 'DESC'
+        elif selectors:
+            column, value = selectors[0]
+            filters.append(f'{column}{"<" if mode == "BEFORE" else ">"}?')
+            values.append(value)
+        rows = self.runtime.db.execute(f'''SELECT id,timestamp,sender,target,text FROM irc_messages
+            WHERE {" AND ".join(filters)} ORDER BY id {order} LIMIT ?''', (*values, limit)).fetchall()
+        if order == 'DESC':
+            rows.reverse()
+        return [dict(zip(('id', 'timestamp', 'sender', 'target', 'text'), row)) for row in rows]
 
     def _claim(self):
         self.socket.parent.mkdir(parents=True, exist_ok=True)
@@ -1348,7 +1436,11 @@ class Worker:
                 except StepLimit:
                     continue
                 except (BadRequestError, ContextLimit, CompactionError) as exc:
-                    error = f'{type(exc).__name__}: {exc}; request rejected, fix configuration/history then resume'
+                    if isinstance(exc, CompactionError):
+                        detail = str(exc).removesuffix('; resume to retry')
+                        error = f'CompactionError: {detail}; history unchanged; /resume to retry'
+                    else:
+                        error = f'{type(exc).__name__}: {exc}; request rejected, fix configuration/history then resume'
                     await self.runtime.database_call(self.runtime.db.execute,
                         'UPDATE prompts SET error=? WHERE id=?', (error, job_id))
                     self._broadcast(session_id, {'job': job_id, 'error': error})
