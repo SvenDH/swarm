@@ -10,6 +10,27 @@ class StdlibTests(unittest.IsolatedAsyncioTestCase):
     asyncSetUp = test_agents.AgentTests.asyncSetUp
     asyncTearDown = test_agents.AgentTests.asyncTearDown
 
+    async def test_public_platform_metadata(self):
+        self.assertEqual(await self.agent.execute('''
+import sys as runtime_sys
+from sys import platform, version
+import platform as platform_module
+(runtime_sys.platform, platform, version, platform_module.system(), type(runtime_sys).__name__)
+'''), "('linux', 'linux', '3.14.0', 'Linux', 'module')")
+        self.assertEqual(await self.agent.execute('''
+import importlib
+s = importlib.import_module('sys')
+(getattr(s,'platform'),vars(s)['platform'],__import__('sys').platform,s.version)
+'''), "('linux', 'linux', 'linux', '3.14.0')")
+        self.assertEqual(await self.agent.execute('''
+scope={}
+exec('import sys; result=(sys.platform,sys.version)',scope)
+scope['result']
+'''), "('linux', '3.14.0')")
+        await self.agent.close()
+        self.agent = await CodeAgent.open(self.path, session_id=self.session_id)
+        self.assertEqual(await self.agent.execute('(runtime_sys.platform,runtime_sys.version)'), "('linux', '3.14.0')")
+
     async def test_native_modules_and_seeded_randomness(self):
         self.assertEqual(await self.agent.execute('''
 import sys, pathlib, json, time, random

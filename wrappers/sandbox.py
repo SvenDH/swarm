@@ -106,6 +106,11 @@ def _library_import(module):
 
 def _library_get(value, name):
     if not isinstance(value, _LibraryValue):
+        if type(value).__name__ == 'module' and str(value) == "<module 'sys'>":
+            if name == 'platform':
+                return 'linux'
+            if name == 'version':
+                return value.version.split()[0]
         return getattr(value, name)
     if value.root['module'] == 'importlib' and not value.path and name == 'import_module':
         return _library_import_module

@@ -8,7 +8,7 @@ from pathlib import Path
 
 from .registry import MODULES, ALIASES, NATIVE, require
 
-IMPORTS = (*MODULES, *ALIASES, 'irc')
+IMPORTS = (*MODULES, *ALIASES, 'irc', 'sys')
 
 BOOTSTRAP = Path(__file__).with_name('sandbox.py').read_text()
 CHECK = 'try:\n    _library_modules\nexcept NameError:\n    _library_ready=None\nelse:\n    _library_ready=list(_library_modules)\n_library_ready'
@@ -127,7 +127,7 @@ def _library_getattr(value, name, *default):
             if name == 'auth':
                 return value.auth
             return _library_get(value, name)
-        return getattr(value, name)
+        return _library_get(value, name)
     except AttributeError:
         if default:
             return default[0]
@@ -147,7 +147,7 @@ def _library_vars(value):
     if isinstance(value, _LibraryValue):
         return {name: _library_get(value, name) for name in _library_request(value, 'dir')}
     if type(value).__name__ == 'module':
-        return {name: getattr(value, name) for name in _library_dir(value)}
+        return {name: _library_get(value, name) for name in _library_dir(value)}
     return {name: getattr(value, name) for name in _object_fields(value, True)}
 def _library_dir(value):
     if isinstance(value, _LibraryValue):
@@ -222,6 +222,8 @@ def key(node):
 def module(name):
     if name.split('.')[0] == 'irc':
         return call('irc_import', ast.Constant(name))
+    if name == 'sys':
+        return call('native_import', ast.Constant(name))
     parts = name.split('.')
     parts[0] = ALIASES.get(parts[0], parts[0])
     require(parts[0])
