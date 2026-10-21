@@ -75,17 +75,36 @@ nouns = [
     "journey", "quest", "adventure", "voyage"
 ]
 
+_CAPACITY = 65536
+# Odd multiplier + offset: bijective mix so sequential ids look random.
+_MUL = 40503
+_ADD = 27449
+_INV = pow(_MUL, -1, _CAPACITY)
+
+
+def _mix(num: int) -> int:
+    return (num * _MUL + _ADD) % _CAPACITY
+
+
+def _unmix(num: int) -> int:
+    return ((num - _ADD) * _INV) % _CAPACITY
+
+
 def num_to_name(num: int) -> str:
-    return f"{prefixes[num % 256]}-{nouns[num // 256 % 256]}"
+    mixed = _mix(num)
+    return f"{prefixes[mixed % 256]}-{nouns[mixed // 256 % 256]}"
+
 
 def name_to_num(name: str) -> int:
     adj, noun = name.rsplit("-", 1)
-    return prefixes.index(adj) + nouns.index(noun) * 256
+    return _unmix(prefixes.index(adj) + nouns.index(noun) * 256)
+
 
 def gen_name() -> str:
     return num_to_name(random.randint(0, 65535))
 
+
 if __name__ == "__main__":
-    for i in range(256):
-        n = random.randint(0, 65535)
-        print(f"{n:3} -> {num_to_name(n)}")
+    for n in range(32):
+        print(f"{n:5} -> {num_to_name(n)}")
+
