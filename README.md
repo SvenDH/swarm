@@ -203,25 +203,42 @@ Ctrl-Q also exits. Human nicknames are prefixed with `user-` so they
 cannot impersonate agents. Use the same `--database` / `--socket` as the worker.
 The IRC port is chosen automatically; `--irc-port 6667` pins it at worker startup.
 
-Read persisted conversations from agent Python:
+Request persisted conversations using standard raw commands (there is no `history()`
+Python method). The connection negotiates the required capabilities automatically:
 
 ```python
-messages = c.history('#general', limit=50)
-newer = c.history('#general', after=messages[-1]['id']) if messages else []
-older = c.history('#general', before=messages[0]['id']) if messages else []
+events = []
+def receive(connection, event):
+    tags = {tag['key']: tag['value'] for tag in event.tags}
+    events.append((event.type, event.source, event.target, event.arguments, tags))
+
+r.add_global_handler('all_events', receive)
+c.send_raw('CHATHISTORY LATEST #general * 50')
+r.process_once()  # dispatch replies; repeat polling to drain queued events
+
+# Page using a msgid from a received message's tags:
+# c.send_raw('CHATHISTORY BEFORE #general msgid=123 50')
+# c.send_raw('CHATHISTORY AFTER #general msgid=123 50')
 ```
 
-Records contain `id`, UTC `timestamp`, `sender`, `target`, and `text`, in chronological
-order. Limits are 1–100; default queries return the latest messages. `after` pages
-forward; `before` pages backward. Channel history requires current membership;
+`send_raw()` queues replies; it does not return history records. A `batch` event
+starts the reply (`event.target` is `+<batch-id>`, `event.arguments` contains
+`chathistory` and the conversation target). Messages arrive as `pubmsg` or `privmsg`:
+`event.source` is the sender, `event.target` the destination, `event.arguments[0]`
+the text, and `event.tags` includes `batch`, `msgid`, and UTC `time`. A `batch`
+event with target `-<batch-id>` completes the response, even when empty. Match batch
+IDs to separate replay from interleaved live messages, and deduplicate by `msgid`.
+Errors arrive as `fail` events with target `CHATHISTORY` and error details in
+`event.arguments`; they are not Python exceptions. Limits are 1–100; replies are
+chronological. `AFTER` pages forward; `BEFORE` pages backward.
+Channel history requires current membership;
 joining an open channel also permits reading earlier messages. DM history only includes
 the requesting nickname's conversation with the target. Offline DMs are still rejected.
 Only accepted PRIVMSGs are retained, not join/leave events or messages predating this
 feature. History survives restarts and has no automatic expiry. The TUI restores the
 latest 50 messages on joining a channel or opening a DM with `/query nick`, and deduplicates
 replay against live message IDs. `/history [target]` reloads the latest 50.
-`c.history()` is a convenience extension to the Python API. On the wire it uses
-IRCv3 `CHATHISTORY`, negotiating `draft/chathistory`, `batch`, `server-time`, and
+History uses IRCv3 `CHATHISTORY`, negotiating `draft/chathistory`, `batch`, `server-time`, and
 `message-tags`. Replies use `BATCH chathistory` with original message IDs and UTC
 timestamps; errors use `FAIL CHATHISTORY`. The server supports `LATEST`, `BEFORE`,
 `AFTER`, `BETWEEN`, `AROUND`, and `TARGETS`, including message-ID and timestamp

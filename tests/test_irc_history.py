@@ -17,6 +17,34 @@ SETUP = "from irc.client import Reactor; r=Reactor(); c=r.server().connect('work
 
 
 class IRCHistoryTests(unittest.IsolatedAsyncioTestCase):
+    async def history(self, agent, target, selection='LATEST', reference='*', limit=50):
+        # Exercise the public raw-command/event interface, not a host shortcut.
+        request = f'CHATHISTORY {selection} {target} {reference} {limit}'
+        events = ast.literal_eval(await agent.execute(f'''
+captured=[]
+def capture(connection,event):
+    captured.append((event.type,event.source,event.target,event.arguments,event.tags))
+r.add_global_handler('all_events',capture)
+c.send_raw({request!r})
+r.process_once()
+r.remove_global_handler('all_events',capture)
+captured
+'''))
+        rows, batch, complete = [], None, False
+        for kind, sender, destination, arguments, raw_tags in events:
+            tags = {tag['key']: tag['value'] for tag in raw_tags}
+            if kind == 'fail' and destination == 'CHATHISTORY':
+                raise ValueError(arguments[-1])
+            if kind == 'batch' and destination.startswith('+'):
+                batch = destination[1:]
+            elif kind == 'batch' and destination == '-' + (batch or ''):
+                complete = True
+            elif batch and tags.get('batch') == batch:
+                rows.append(dict(id=int(tags['msgid']), timestamp=tags['time'],
+                                 sender=sender, target=destination, text=arguments[0]))
+        self.assertTrue(complete, 'History batch was incomplete')
+        return rows
+
     async def test_standard_wire_commands_and_cap_negotiation(self):
         with tempfile.TemporaryDirectory() as directory:
             async with Worker(directory + '/agent.db') as worker:
@@ -97,10 +125,11 @@ class IRCHistoryTests(unittest.IsolatedAsyncioTestCase):
                 self.assertFalse(any('must not arrive' in line for line in server.exchange(bob.name)))
                 text = '雪' * 100
                 await alice.execute(f"c.privmsg('#general',{text!r})")
-                rows = ast.literal_eval(await bob.execute("c.history('#general')"))
+                await bob.execute("seen=[]; r.add_global_handler('pubmsg',lambda c,e: seen.append(e.arguments[0]))")
+                rows = await self.history(bob, '#general')
                 self.assertEqual([row['text'] for row in rows], [text])
                 # Querying history must not discard interleaved live events.
-                events = await bob.execute("seen=[]; r.add_global_handler('pubmsg',lambda c,e: seen.append(e.arguments[0])); r.process_once(); seen")
+                events = await bob.execute("seen")
                 self.assertIn(text, events)
 
     async def test_paging_privacy_and_restart(self):
@@ -114,22 +143,20 @@ class IRCHistoryTests(unittest.IsolatedAsyncioTestCase):
                 await alice.execute("c.join('#general')")
                 for text in ('first', 'second', 'third'):
                     await alice.execute(f"c.privmsg('#general', {text!r})")
-                with self.assertRaisesRegex(ExecutionError, 'Join the channel'):
-                    await bob.execute("c.history('#general')")
+                with self.assertRaisesRegex(ValueError, 'Join the channel'):
+                    await self.history(bob, '#general')
                 await bob.execute("c.join('#general')")
-                rows = ast.literal_eval(await bob.execute("c.history('#general')"))
+                rows = await self.history(bob, '#general')
                 self.assertEqual([row['text'] for row in rows], ['first', 'second', 'third'])
                 self.assertEqual(len({row['id'] for row in rows}), 3)
-                self.assertTrue(all(row['timestamp'].endswith('+00:00') for row in rows))
-                self.assertEqual(ast.literal_eval(await bob.execute("c.history('#general',limit=1)")), rows[-1:])
-                self.assertEqual(ast.literal_eval(await bob.execute(
-                    f"c.history('#general',after={rows[0]['id']})")), rows[1:])
-                self.assertEqual(ast.literal_eval(await bob.execute(
-                    f"c.history('#general',before={rows[-1]['id']})")), rows[:-1])
+                self.assertTrue(all(row['timestamp'].endswith('Z') for row in rows))
+                self.assertEqual(await self.history(bob, '#general', limit=1), rows[-1:])
+                self.assertEqual(await self.history(bob, '#general', 'AFTER', f"msgid={rows[0]['id']}"), rows[1:])
+                self.assertEqual(await self.history(bob, '#general', 'BEFORE', f"msgid={rows[-1]['id']}"), rows[:-1])
                 await alice.execute(f"c.privmsg({bob.name!r}, 'private')")
-                private = ast.literal_eval(await bob.execute(f"c.history({alice.name!r})"))
+                private = await self.history(bob, alice.name)
                 self.assertEqual([row['text'] for row in private], ['private'])
-                self.assertEqual(ast.literal_eval(await eve.execute(f"c.history({alice.name!r})")), [])
+                self.assertEqual(await self.history(eve, alice.name), [])
                 targets = await worker.runtime._irc.agent_exchange(eve.name,
                     'CHATHISTORY TARGETS timestamp=2000-01-01T00:00:00.000Z timestamp=2100-01-01T00:00:00.000Z 50')
                 self.assertFalse(any(' CHATHISTORY TARGETS ' in line for line in targets))
@@ -137,19 +164,21 @@ class IRCHistoryTests(unittest.IsolatedAsyncioTestCase):
                     'CHATHISTORY TARGETS timestamp=2000-01-01T00:00:00.000Z timestamp=2100-01-01T00:00:00.000Z 50')
                 self.assertTrue(any(' CHATHISTORY TARGETS ' + bob.name + ' ' in line for line in targets))
                 await bob.execute("c.part('#general')")
-                with self.assertRaisesRegex(ExecutionError, 'Join the channel'):
-                    await bob.execute("c.history('#general')")
-                for arguments in ('limit=101', 'limit=True', 'after=-1', 'before=2**64'):
-                    with self.subTest(arguments=arguments), self.assertRaises(ExecutionError):
-                        await alice.execute(f"c.history('#general',{arguments})")
+                with self.assertRaisesRegex(ValueError, 'Join the channel'):
+                    await self.history(bob, '#general')
+                for reference, limit in (('*', 101), ('*', 'True'), ('msgid=-1', 50), ('msgid=18446744073709551616', 50)):
+                    with self.subTest(reference=reference, limit=limit), self.assertRaises(ValueError):
+                        await self.history(alice, '#general', reference=reference, limit=limit)
+                with self.assertRaisesRegex(ExecutionError, 'AttributeError'):
+                    await alice.execute("c.history('#general')")
                 await alice.execute("c.privmsg('#absent','not accepted'); c.privmsg('nobody','offline')")
                 self.assertEqual((await worker.runtime.query('SELECT count(*) AS n FROM irc_messages'))[0]['n'], 4)
             async with Worker(path) as worker:
                 alice = await worker.runtime.agent(session_id=identities[0])
                 await alice.execute(SETUP + "; c.join('#general')")
-                self.assertEqual(ast.literal_eval(await alice.execute("c.history('#general')")), rows)
+                self.assertEqual(await self.history(alice, '#general'), rows)
                 await alice.execute("c.privmsg('#general','after restart')")
-                latest = ast.literal_eval(await alice.execute("c.history('#general',limit=1)"))[0]
+                latest = (await self.history(alice, '#general', limit=1))[0]
                 self.assertGreater(latest['id'], private[-1]['id'])
 
     async def test_tui_replay_deduplicates_ids_not_text(self):

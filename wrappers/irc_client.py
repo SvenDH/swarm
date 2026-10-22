@@ -111,45 +111,6 @@ class _LibraryIRCConnection:
             raise TypeError('Choose a destination file')
         return _irc_file('receive', reference, str(destination), overwrite=overwrite)
 
-    def history(self, target, limit=50, after=0, before=0):
-        if not self.connected:
-            raise _LibraryIRCError('Not connected')
-        if (type(limit) is not int or not 1 <= limit <= 100 or
-                any(type(value) is not int or not 0 <= value < 2**63 for value in (after, before))):
-            raise ValueError('History needs limit 1..100 and nonnegative integer cursors')
-        if after and before:
-            request = 'BETWEEN ' + target + ' msgid=' + str(after) + ' msgid=' + str(before)
-        elif after or before:
-            request = ('AFTER ' if after else 'BEFORE ') + target + ' msgid=' + str(after or before)
-        else:
-            request = 'LATEST ' + target + ' *'
-        rows, batch, complete, error = [], None, False, None
-        for original in _irc_exchange('CHATHISTORY ' + request + ' ' + str(limit)):
-            line, tags = original, {}
-            if line.startswith('@'):
-                raw, _, line = line.partition(' ')
-                for tag in raw[1:].split(';'):
-                    key, _, value = tag.partition('=')
-                    tags[key] = value
-            head, _, text = line.partition(' :')
-            words = head.split()
-            if len(words) >= 5 and words[1] == 'BATCH' and words[2].startswith('+') and words[3] == 'chathistory' and words[4].lower() == target.lower():
-                batch = words[2][1:]
-            elif batch is not None and len(words) >= 3 and words[1] == 'BATCH' and words[2] == '-' + batch:
-                complete = True
-            elif batch is not None and tags.get('batch') == batch and len(words) >= 3 and words[1] == 'PRIVMSG':
-                rows.append({'id': int(tags['msgid']), 'timestamp': tags['time'].replace('Z', '+00:00'),
-                             'sender': words[0][1:].split('!')[0], 'target': words[2], 'text': text})
-            elif len(words) >= 3 and words[1:3] == ['FAIL', 'CHATHISTORY']:
-                error = text
-            else:
-                self.pending.append(original)
-        if error is not None:
-            raise _LibraryIRCError(error)
-        if not complete:
-            raise _LibraryIRCError('Incomplete history response; retry with a smaller limit')
-        return rows
-
     def names(self, channels=None):
         for channel in ([channels] if isinstance(channels, str) else (channels or [])):
             self.send_raw('NAMES ' + channel)

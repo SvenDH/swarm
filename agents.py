@@ -151,7 +151,8 @@ import irc.client; r=irc.client.Reactor();
 c=r.server().connect('worker', 6667); c.join('#channel'); c.privmsg('#channel', 'text').
 ```
 Register event handlers with `r.add_global_handler`; poll with `r.process_once()`.
-Read conversation history with `c.history(target, limit=50, after=0, before=0)`.
+Request history with `c.send_raw('CHATHISTORY LATEST #channel * 50')`; handlers receive
+`batch` boundaries, tagged `pubmsg`/`privmsg` replies, or `fail` errors when polling.
 IRC connections support `send_file(target, path)`, `file_info(reference)`, and
 `receive_file(reference, destination)`. Receiving refuses existing files unless `overwrite=True`.
 """
