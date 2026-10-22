@@ -7,6 +7,7 @@ import secrets
 import sqlite3
 import threading
 from collections import deque
+from wrappers.dcc import DCC
 
 
 class IRCServer:
@@ -26,6 +27,7 @@ class IRCServer:
         self.tagged, self.echo = set(), set()
         self.capabilities = {}
         self.dispatch_lock = asyncio.Lock()
+        self.dcc = DCC()
 
     async def start(self, port=0):
         self.listener = await asyncio.start_server(self._connection, '127.0.0.1', port, limit=512)
@@ -39,6 +41,7 @@ class IRCServer:
 
     async def close(self):
         self.closing = True
+        await self.dcc.close()
         if self.listener is not None:
             self.listener.close()
             await self.listener.wait_closed()
@@ -224,6 +227,13 @@ class IRCServer:
                     return [f':worker FAIL CHATHISTORY MESSAGE_ERROR {sub} {target} :Messages could not be retrieved']
             record = None
             allowed = name in self.channels.get(target, ()) if target.startswith('#') else target in self.clients
+            if op == 'PRIVMSG' and text.startswith('\x01DCC SEND '):
+                try:
+                    if not allowed:
+                        raise ValueError('DCC recipient is not connected')
+                    self.dcc.offer(name, target, text)
+                except (ValueError, PermissionError) as error:
+                    return [f':worker FAIL PRIVMSG INVALID_PARAMS {target} :{error}']
             if self.history is not None and op == 'PRIVMSG' and text and allowed:
                 # Persist exactly the message delivered on the wire, before delivery.
                 wire = f':{name} PRIVMSG {target} :{text}'.encode()[:510].decode(errors='ignore')

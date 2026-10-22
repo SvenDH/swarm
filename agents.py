@@ -153,8 +153,9 @@ c=r.server().connect('worker', 6667); c.join('#channel'); c.privmsg('#channel', 
 Register event handlers with `r.add_global_handler`; poll with `r.process_once()`.
 Request history with `c.send_raw('CHATHISTORY LATEST #channel * 50')`; handlers receive
 `batch` boundaries, tagged `pubmsg`/`privmsg` replies, or `fail` errors when polling.
-IRC connections support `send_file(target, path)`, `file_info(reference)`, and
-`receive_file(reference, destination)`. Receiving refuses existing files unless `overwrite=True`.
+Use `r.dcc('raw').listen()` and `c.ctcp('DCC', nick, 'SEND filename address port size')`
+for file offers; accept explicitly with `r.dcc('raw').connect(address, port)`.
+DCC callbacks use `dcc_connect`, `dccmsg` (bytes), and `dcc_disconnect`.
 """
 
 
@@ -431,9 +432,6 @@ class Runtime:
             CREATE TABLE IF NOT EXISTS context_usage (
                 session_id INTEGER PRIMARY KEY, model TEXT NOT NULL, basis TEXT NOT NULL,
                 prefix TEXT NOT NULL, count INTEGER NOT NULL, tokens INTEGER NOT NULL);
-            CREATE TABLE IF NOT EXISTS irc_attachments (
-                id TEXT PRIMARY KEY, owner TEXT NOT NULL, filename TEXT NOT NULL,
-                storage_key TEXT NOT NULL, size INTEGER NOT NULL);
             CREATE TABLE IF NOT EXISTS irc_messages (
                 id INTEGER PRIMARY KEY AUTOINCREMENT, conversation TEXT NOT NULL,
                 timestamp TEXT NOT NULL, sender TEXT NOT NULL, target TEXT NOT NULL, text TEXT NOT NULL);
@@ -835,44 +833,6 @@ class CodeAgent:
             self.runtime._native.clear(self._native_key())
             raise
 
-    def _irc_file(self, fs, action, value, destination=None, overwrite=False):
-        if self.runtime._irc is None:
-            raise ConnectionError('Attachments require a running worker')
-        if action == 'share':
-            source = fs.path(value)
-            data = fs.path_read_bytes(source)
-            key = self.runtime.offload.submit(self.storage.put, self.name, data).result()
-            identity = json.dumps((self.name, str(source), key)).encode()
-            token = hmac.new(self.runtime._library_key, b'irc-attachment\0' + identity, hashlib.sha256).hexdigest()
-            self.runtime.database_call.submit(self.db.execute,
-                'INSERT OR IGNORE INTO irc_attachments VALUES (?,?,?,?,?)',
-                (token, self.name, source.name, key, len(data))).result()
-            return 'irc-file:' + token
-        if not isinstance(value, str) or not value.startswith('irc-file:'):
-            raise ValueError('Expected an irc-file: reference')
-        token = value.removeprefix('irc-file:')
-        if len(token) != 64 or any(char not in '0123456789abcdef' for char in token):
-            raise ValueError('Invalid attachment reference')
-        row = self.runtime.database_call.submit(lambda: self.db.execute(
-            'SELECT owner,filename,storage_key,size FROM irc_attachments WHERE id=?', (token,)).fetchone()).result()
-        if row is None:
-            raise FileNotFoundError('Unknown attachment')
-        if action == 'info':
-            return {'reference': value, 'owner': row[0], 'filename': row[1], 'size': row[3]}
-        if action != 'receive':
-            raise ValueError('Unknown attachment operation')
-        if type(overwrite) is not bool:
-            raise TypeError('overwrite must be a boolean')
-        if not isinstance(destination, str) or not destination:
-            raise ValueError('Choose a destination file')
-        target = fs.path(destination)
-        if fs.path_exists(target) and not overwrite:
-            raise FileExistsError(str(target))
-        with memory_scope(self.memory_budget):
-            check_memory(row[3])
-        data = self.runtime.offload.submit(self.storage.read, row[2]).result()
-        fs.write(str(target), data)
-        return str(target)
 
     async def _evaluate(self, code, state, files, printed, budget):
         fs = await self.runtime.offload(lambda: Unix([
@@ -895,10 +855,15 @@ class CodeAgent:
             if command is None:
                 return {'nickname': self.name, 'lines': lines}
             return lines
+        def dcc(*args):
+            if self.runtime._irc is None:
+                raise ConnectionError('DCC requires a running worker')
+            return asyncio.run_coroutine_threadsafe(
+                self.runtime._irc.dcc.call(self.name, *args), self.runtime._loop).result()
         result = await evaluate(self.runtime, fs, self._native_key(), code, state.monty, printed,
                                 self._emit, budget, memory_budget=self.memory_budget,
                                 irc=irc,
-                                attachment=lambda *args, **kwargs: self._irc_file(fs, *args, **kwargs),
+                                dcc=dcc,
                                 search=lambda *a, **kw: self.runtime.database_call.submit(self._search_history, *a, **kw).result())
         return fs, *result
 

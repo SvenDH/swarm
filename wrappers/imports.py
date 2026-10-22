@@ -78,7 +78,7 @@ def _library_exec_namespace(value):
         value['_object_fields'] = _object_fields
         value['display'] = display
         value['_irc_exchange'] = _irc_exchange
-        value['_irc_file'] = _irc_file
+        value['_irc_dcc'] = _irc_dcc
     return value
 def _library_dunder_import(name, globals=None, locals=None, fromlist=(), level=0):
     if level:

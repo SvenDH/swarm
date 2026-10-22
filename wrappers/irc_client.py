@@ -19,9 +19,16 @@ class _LibraryIRCReactor:
         self.handlers = []
 
     def server(self):
-        if self.connections:
+        if any(isinstance(c, _LibraryIRCConnection) for c in self.connections):
             raise _LibraryIRCError('Only one connection per reactor is supported')
         connection = _LibraryIRCConnection(self)
+        self.connections.append(connection)
+        return connection
+
+    def dcc(self, dcctype='chat'):
+        if dcctype != 'raw':
+            raise ValueError("Use dcc('raw') for file transfers")
+        connection = _LibraryDCCConnection(self)
         self.connections.append(connection)
         return connection
 
@@ -39,14 +46,14 @@ class _LibraryIRCReactor:
     def process_once(self, timeout=0):
         if timeout != 0:
             raise ValueError('Use process_once(timeout=0) for nonblocking polling')
-        for connection in self.connections:
+        for connection in self.connections[:]:
             connection.process_once()
 
     def process_forever(self, timeout=0.2):
         raise NotImplementedError('Use bounded process_once(timeout=0) calls')
 
     def disconnect_all(self, message=''):
-        for connection in self.connections:
+        for connection in self.connections[:]:
             connection.disconnect(message)
 
 
@@ -94,22 +101,8 @@ class _LibraryIRCConnection:
     def privmsg(self, target, text):
         self.send_raw('PRIVMSG ' + target + ' :' + text)
 
-    def send_file(self, target, path):
-        if not self.connected:
-            raise _LibraryIRCError('Not connected')
-        if path is None:
-            raise TypeError('Choose a source file')
-        reference = _irc_file('share', str(path))
-        self.privmsg(target, '[file] ' + reference)
-        return reference
-
-    def file_info(self, reference):
-        return _irc_file('info', reference)
-
-    def receive_file(self, reference, destination, overwrite=False):
-        if destination is None:
-            raise TypeError('Choose a destination file')
-        return _irc_file('receive', reference, str(destination), overwrite=overwrite)
+    def ctcp(self, ctcp_type, target, parameter=''):
+        self.privmsg(target, '\x01' + ctcp_type + (' ' + parameter if parameter else '') + '\x01')
 
     def names(self, channels=None):
         for channel in ([channels] if isinstance(channels, str) else (channels or [])):
@@ -162,10 +155,81 @@ class _LibraryIRCConnection:
             event = _LibraryIRCEvent(numeric.get(command, command.lower()), source, target, arguments, tags)
             if command == 'PRIVMSG' and target.startswith('#'):
                 event.type = 'pubmsg'
+            if command == 'PRIVMSG' and trailing.startswith('\x01') and trailing.endswith('\x01'):
+                ctcp_type, _, payload = trailing[1:-1].partition(' ')
+                event.type, event.arguments = 'ctcp', [ctcp_type, payload]
             for priority, name, handler in self.reactor.handlers[:]:
                 if name in (event.type, 'all_events'):
                     if handler(self, event) == 'NO MORE':
                         break
+
+
+class _LibraryDCCConnection:
+    def __init__(self, reactor):
+        self.reactor = reactor
+        self.identity = None
+        self.connected = False
+        self.localaddress = None
+        self.localport = None
+
+    def listen(self, addr=None):
+        if addr not in (None, '127.0.0.1'):
+            raise ValueError('Use a worker DCC listener')
+        return self._open('listen', None)
+
+    def connect(self, address, port):
+        return self._open('connect', (address, port))
+
+    def _open(self, action, value):
+        if self.identity is not None:
+            raise RuntimeError('DCC connection already opened')
+        reply = _irc_dcc(action, None, value)
+        self.identity = reply['id']
+        self.localaddress, self.localport = reply['localaddress'], reply['localport']
+        return self
+
+    def is_connected(self):
+        return self.connected
+
+    def send_bytes(self, data):
+        _irc_dcc('send', self.identity, data)
+
+    def disconnect(self, message=''):
+        if self.identity is not None:
+            _irc_dcc('close', self.identity)
+            self.identity = None
+        self.connected = False
+        if self in self.reactor.connections:
+            self.reactor.connections.remove(self)
+
+    def process_once(self):
+        if self.identity is None:
+            return
+        for kind, data in _irc_dcc('poll', self.identity):
+            self.connected = kind != 'dcc_disconnect'
+            event = _LibraryIRCEvent(kind, self.localaddress, None, [data] if data is not None else [])
+            for priority, name, handler in self.reactor.handlers[:]:
+                if name in (kind, 'all_events') and handler(self, event) == 'NO MORE':
+                    break
+            if kind == 'dcc_disconnect':
+                self.identity = None
+                self.connected = False
+                if self in self.reactor.connections:
+                    self.reactor.connections.remove(self)
+
+
+def _library_ip_numstr_to_quad(value):
+    number = int(value)
+    if not 0 <= number < 2**32:
+        raise ValueError('Invalid IPv4 address')
+    return '.'.join(str((number >> shift) & 255) for shift in (24, 16, 8, 0))
+
+
+def _library_ip_quad_to_numstr(value):
+    parts = value.split('.')
+    if len(parts) != 4 or any(not part.isdigit() or not 0 <= int(part) <= 255 for part in parts):
+        raise ValueError('Invalid IPv4 address')
+    return str(sum(int(parts[i]) << (24 - 8*i) for i in range(4)))
 
 
 class _LibraryIRCModule:
@@ -174,6 +238,9 @@ class _LibraryIRCModule:
         self.ServerConnection = _LibraryIRCConnection
         self.ServerConnectionError = _LibraryIRCError
         self.Event = _LibraryIRCEvent
+        self.DCCConnection = _LibraryDCCConnection
+        self.ip_numstr_to_quad = _library_ip_numstr_to_quad
+        self.ip_quad_to_numstr = _library_ip_quad_to_numstr
 
 
 class _LibraryIRCPackage:

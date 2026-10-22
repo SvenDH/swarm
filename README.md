@@ -247,24 +247,76 @@ references (`TARGETS` uses timestamps). It advertises `CHATHISTORY=100` and
 `CHATHISTORY LATEST #general * 50`. The old custom `HISTORY` command is removed.
 Ordinary clients can still exchange live messages unchanged.
 
-Agents can share immutable attachments without DCC or direct connections:
+Files use the Python IRC library's raw DCC interface, not custom attachment methods.
+The sender opens a worker-owned listener and sends a standard CTCP offer to one nick:
 
 ```python
-reference = c.send_file('#general', 'plot.png')  # announces [file] irc-file:...
-info = c.file_info(reference)                   # filename, owner, size
-c.receive_file(reference, 'received.png')       # explicit destination in recipient's workspace
+import irc.client
+r = irc.client.Reactor()
+c = r.server().connect('worker', 6667)
+d = r.dcc('raw').listen()
+address = irc.client.ip_quad_to_numstr(d.localaddress)
+c.ctcp('DCC', recipient_nick, f'SEND sample.bin {address} {d.localport} 7')
+
+def connected(connection, event):
+    connection.send_bytes(b'abc\\x00def')
+
+r.add_global_handler('dcc_connect', connected)
+r.process_once()  # keep polling in subsequent calls while transferring
 ```
 
-`send_file` / `file_info` / `receive_file` are worker extensions, not standard IRC APIs.
-References are bearer access tokens: anyone with the reference in the same worker
-can receive or forward it. Nothing is downloaded automatically; existing destination
-files are refused unless `overwrite=True`. Receiving never extracts or executes files.
-Bytes use the existing immutable storage backend, with metadata only in SQLite;
-snapshots survive source edits/deletion and worker restarts.
-Identical shares of the same source snapshot reuse a reference. Publication is immediate,
-like sending a message, not rolled back by later Python errors. Attachments are retained
-with worker storage; there is no automatic expiry. The TUI displays references; the
-agent API copies them into virtual workspaces, not arbitrary host paths.
+The recipient sees a `ctcp` event with `event.arguments == ['DCC', 'SEND ...']`.
+Record and inspect the offer first; accepting it must be an explicit choice.
+Do not trust the offered filename, path or declared size. Choose a destination in
+your own workspace and refuse an existing file. For the offer above:
+
+```python
+import os
+import struct
+if os.path.exists('received.bin'):
+    raise FileExistsError('received.bin')
+output = open('received.bin', 'wb')
+received = [0]
+def chunk(connection, event):
+    data = event.arguments[0]
+    output.write(data)
+    received[0] += len(data)
+    connection.send_bytes(struct.pack('!I', received[0]))  # DCC cumulative ACK
+def finished(connection, event):
+    output.close()
+r.add_global_handler('dccmsg', chunk)
+r.add_global_handler('dcc_disconnect', finished)
+# address/port are taken from the inspected offer, not an arbitrary host.
+d = r.dcc('raw').connect(irc.client.ip_numstr_to_quad('2130706433'), offered_port)
+r.process_once()  # continue polling on both sides
+```
+
+`dcc_connect` reports an accepted channel; `dccmsg` carries bytes in
+`event.arguments[0]`; `dcc_disconnect` reports closure. The sender must poll for
+ACKs and disconnect after the advertised byte count is acknowledged. For larger
+files, read chunks no larger than 64 KiB and send the next chunk after the previous
+one is acknowledged, as in the upstream [DCC example](https://github.com/jaraco/irc/blob/main/scripts/dccsend.py).
+Check the received length against the inspected offer before declaring success.
+Do not execute or extract received files automatically.
+
+Bytes travel through bounded in-memory channels, never DCC TCP sockets. The DCC-style
+address and port identify a worker-local channel, not an OS network endpoint; port
+values are opaque integers and may exceed the TCP port range. Agent connections are
+restricted to the exact channel offered by an authenticated sender to that recipient.
+Arbitrary addresses, unrelated identifiers and forwarded offers are refused.
+There is no public DCC listener or external-client/TUI file
+transfer support. This is a restricted raw-DCC subset; chat, passive DCC, resume and
+arbitrary Internet peers are not implemented. Defaults: 16 MiB each direction per
+connection, eight handles per agent, 256 per worker, bounded receive queues, and
+one-hour handles checked on operations. Each recipient queue holds at most 256 KiB
+and 64 events. A full queue raises `BufferError` without accepting the new bytes;
+poll the recipient and retry. Sending never blocks waiting for another agent.
+Close with `d.disconnect()`. The existing IRC server/TUI transport is unchanged.
+DCC state is in memory: reconnect and re-offer after a worker restart; only bytes
+explicitly saved to a workspace persist. It does not provide attachment storage,
+`file://` references, revocation, or the former attachment audit/grant API. Those
+custom methods are removed. Existing attachment blobs/database rows are left
+untouched, but are no longer exposed.
 
 Local trusted clients can discover host, port and the human PASS password through
 `WorkerClient(...).request('irc')` on the permission-restricted worker Unix socket,
